@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# Testing / typing / linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environment / secrets — NEVER commit real credentials
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

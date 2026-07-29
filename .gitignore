@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# Testing / typing / linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environment / secrets — NEVER commit real credentials
+.env
+.env.*
+!.env.example
+
+# Google service-account keys. A leaked key with domain-wide delegation can
+# impersonate mailboxes across the domain — keep these out of the repo entirely.
+*service-account*.json
+*service_account*.json
+*credentials*.json
+*-key.json
+*.pem
+*.p12
+secrets/
+
+# Local machine settings
+.claude/settings.local.json
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,53 @@
+{
+  "load_id": 2462934,
+  "billing_status": "BILLED",
+  "account_information": {
+    "company_name": "Idea Expedited, Inc",
+    "dot_number": "2363192",
+    "mc_number": null,
+    "address": "5858 W Addison St",
+    "city": "Chicago",
+    "state": "IL",
+    "zip": "60634",
+    "remit_to": { "send_payment_to": "self", "company_name": "Idea Expedited, Inc" }
+  },
+  "deductions": [],
+  "earnings": [
+    {
+      "title": "TRUCK ORDER NOT USED",
+      "amount": 150,
+      "payment_status": "Pending",
+      "settlement_id": null,
+      "estimated_payment_date": "2026-08-19",
+      "actual_payment_date": null,
+      "payment_method": null,
+      "check_number": null
+    },
+    {
+      "title": "Brokerage Line Haul",
+      "amount": 4500,
+      "payment_status": "Pending",
+      "settlement_id": null,
+      "estimated_payment_date": "2026-08-19",
+      "actual_payment_date": null,
+      "payment_method": null,
+      "check_number": null
+    }
+  ],
+  "shipment_information": {
+    "waypoints": [
+      {
+        "type": "Pickup",
+        "city": "Spokane",
+        "state": "Washington",
+        "date": { "timestamp": "2026-06-23T16:24:00Z", "timezone": "PDT" }
+      },
+      {
+        "type": "Delivery",
+        "city": "Lithia Springs",
+        "state": "Georgia",
+        "date": { "timestamp": "2026-06-29T16:00:00Z", "timezone": "EDT" }
+      }
+    ]
+  }
+}

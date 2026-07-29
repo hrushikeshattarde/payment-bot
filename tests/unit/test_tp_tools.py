@@ -1,0 +1,106 @@
+"""Unit tests for the Transport Pro tool wrappers (§4.3) and their grounding."""
+
+from __future__ import annotations
+
+from datetime import date
+from decimal import Decimal
+
+import pytest
+
+from payment_bot.clients import LoadFixture, MockTransportProClient
+from payment_bot.grounding import GroundingLedger
+from payment_bot.models import SettlementEntry, TransportProLoad
+from payment_bot.tools.base import ToolContext
+from payment_bot.tools.transport_pro import (
+    LoadIdInput,
+    TpGetDispatchHistory,
+    TpGetFileHistory,
+    TpGetLoadSummary,
+    TpGetNoaFactoring,
+    TpGetSettlementEntries,
+)
+
+
+@pytest.mark.unit
+def test_load_summary_normalizes_and_grounds(ctx: ToolContext) -> None:
+    out = TpGetLoadSummary().run(LoadIdInput(load_id="2462934"), ctx)
+
+    assert out.load_status == "BILLED"
+    assert out.total_payout == Decimal("4650")
+    assert len(out.earnings) == 2
+    assert out.remit_to_self is True
+    assert out.is_factoring is False
+    assert out.pickup_date == date(2026, 6, 23)
+    assert out.delivery_date == date(2026, 6, 29)
+
+    # Grounding: every amount and the estimated date are recorded.
+    assert {Decimal("150"), Decimal("4500"), Decimal("4650")} <= ctx.ledger.grounded_amounts
+    assert date(2026, 8, 19) in ctx.ledger.grounded_dates
+
+
+@pytest.mark.unit
+def test_dispatch_history_picks_delivered_row(ctx: ToolContext) -> None:
+    out = TpGetDispatchHistory().run(LoadIdInput(load_id="2462934"), ctx)
+
+    assert out.delivered_row is not None
+    assert out.delivered_row.carrier_name == "Idea Expedited, Inc"
+    assert Decimal("4650") in ctx.ledger.grounded_amounts
+
+
+@pytest.mark.unit
+def test_settlement_empty_flag(ctx: ToolContext) -> None:
+    out = TpGetSettlementEntries().run(LoadIdInput(load_id="2462934"), ctx)
+    assert out.empty is True
+    assert out.entries == []
+
+
+@pytest.mark.unit
+def test_settlement_with_entries_grounds_amounts() -> None:
+    load = TransportProLoad.model_validate({"load_id": 2400001, "earnings": []})
+    client = MockTransportProClient(
+        {
+            "2400001": LoadFixture(
+                load=load,
+                settlement=[
+                    SettlementEntry(
+                        amount=Decimal("2900"),
+                        carrier_name="Extra Trans Inc",
+                        pay_date=date(2026, 8, 20),
+                        check_or_ref="10231",
+                        line_type="settlement",
+                    )
+                ],
+            )
+        }
+    )
+    ctx = ToolContext(tp=client, ledger=GroundingLedger(), correlation_id="t")
+
+    out = TpGetSettlementEntries().run(LoadIdInput(load_id="2400001"), ctx)
+
+    assert out.empty is False
+    assert Decimal("2900") in ctx.ledger.grounded_amounts
+    assert date(2026, 8, 20) in ctx.ledger.grounded_dates
+
+
+@pytest.mark.unit
+def test_file_history_flags_and_matching(ctx: ToolContext) -> None:
+    out = TpGetFileHistory().run(LoadIdInput(load_id="2462934"), ctx)
+
+    assert out.has_carrier_invoice is True
+    assert out.has_bol_or_pod is True
+    assert out.has_cancel_confirmation is False
+    assert all(doc.matches_load for doc in out.documents)
+
+
+@pytest.mark.unit
+def test_load_summary_invoice_generated_from_billed_status(ctx: ToolContext) -> None:
+    out = TpGetLoadSummary().run(LoadIdInput(load_id="2462934"), ctx)
+    assert out.invoice_generated is True  # billing_status == BILLED
+
+
+@pytest.mark.unit
+def test_noa_factoring_read_only(ctx: ToolContext) -> None:
+    out = TpGetNoaFactoring().run(LoadIdInput(load_id="2462934"), ctx)
+    assert out.noa_on_file is False
+    assert out.factoring_company_on_file is None
+    assert out.details is not None

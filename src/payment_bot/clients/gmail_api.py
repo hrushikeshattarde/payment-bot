@@ -1,0 +1,340 @@
+"""Gmail API intake and draft creation via a service account (PRD §4.5 / §8.1.2).
+
+The production-shaped Gmail backend: a service account with domain-wide delegation
+impersonates ``paystatus@``, reads mail with ``messages.list`` / ``messages.get``, and saves
+replies with ``drafts.create``. This is the path to use when you hold service-account
+credentials rather than an account password.
+
+Three endpoints, nothing more:
+
+===========================  ============================================================
+Operation                    Gmail API call
+===========================  ============================================================
+``fetch_new``                ``GET  /gmail/v1/users/{user}/messages?q=…``  then
+                             ``GET  /gmail/v1/users/{user}/messages/{id}?format=RAW``
+``create_draft``             ``POST /gmail/v1/users/{user}/drafts``
+``send_reply``               *(never called — raises)*
+===========================  ============================================================
+
+``format=RAW`` returns the original RFC822 bytes, so the same battle-tested MIME parsing
+serves both this backend and IMAP (see :mod:`payment_bot.clients.mime`).
+
+**On the no-send guarantee.** Unlike the IMAP app-password backend, this credential *can*
+technically send: Google offers no draft-only scope, and ``gmail.compose`` — the narrowest
+scope allowing ``drafts.create`` — also permits ``messages.send``. So here the guarantee is
+enforced by our code rather than by the credential: :meth:`GmailApiClient.send_reply` raises,
+the pipeline never takes the send path, and the approval resolver never approves. Worth
+knowing, and worth not pretending otherwise.
+"""
+
+from __future__ import annotations
+
+import base64
+import email
+import json
+import urllib.parse
+from typing import Any
+
+from payment_bot.clients.gmail import DraftMessage, SentMessage
+from payment_bot.clients.google_auth import (
+    GMAIL_DRAFT_SCOPES,
+    ServiceAccountTokenSource,
+    load_service_account_info,
+)
+from payment_bot.clients.http import HttpTransport, UrllibTransport
+from payment_bot.clients.mime import build_reply, parse_inbound_email, reply_subject
+from payment_bot.config import Settings, get_settings
+from payment_bot.errors import ClientError
+from payment_bot.logging import get_logger
+from payment_bot.models import InboundEmail
+
+_log = get_logger("clients.gmail_api")
+
+GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1"
+
+
+class SendingDisabledError(ClientError):
+    """Raised when something tries to send mail in a draft-only run."""
+
+
+class GmailApiClient:
+    """Fetch + draft access to one mailbox through the Gmail API.
+
+    Args:
+        token_source: Supplies impersonated access tokens.
+        user: Mailbox to operate on. Defaults to the impersonated subject.
+        query: Gmail search query for intake, e.g. ``is:unread``. Gmail's own search
+            syntax, not IMAP's.
+        limit: Newest-N cap per fetch.
+        mark_read: Remove the ``UNREAD`` label after fetching. Off while iterating, so the
+            same mail can be reprocessed. Requires a scope permitting modify.
+        transport: Injectable HTTP seam.
+    """
+
+    def __init__(
+        self,
+        token_source: ServiceAccountTokenSource,
+        *,
+        user: str = "",
+        query: str = "is:unread",
+        limit: int = 10,
+        mark_read: bool = False,
+        transport: HttpTransport | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        self._tokens = token_source
+        self._user = user or token_source.subject
+        self._query = query
+        self._limit = max(1, limit)
+        self._mark_read = mark_read
+        self._transport: HttpTransport = transport or UrllibTransport()
+        self._timeout = timeout
+
+    @property
+    def user(self) -> str:
+        """The mailbox this client reads and drafts in."""
+
+        return self._user
+
+    # -- diagnostics ---------------------------------------------------------
+    def verify_access(self) -> dict[str, Any]:
+        """Confirm impersonation works, via the cheapest read-only call there is.
+
+        ``users.getProfile`` needs only ``gmail.readonly`` and touches no message, so it
+        separates *"delegation is working"* from *"the search matched nothing"* — two very
+        different problems that a plain fetch would conflate.
+
+        Returns the profile: ``emailAddress``, ``messagesTotal``, ``threadsTotal``.
+        """
+
+        return self._get(f"/users/{self._quoted_user()}/profile")
+
+    # -- GmailClient / DraftingGmailClient -----------------------------------
+    def fetch_new(self, since: str | None = None) -> list[InboundEmail]:
+        """Return up to ``limit`` matching messages.
+
+        Args:
+            since: Optional ``YYYY/MM/DD`` date, added as a Gmail ``after:`` term.
+        """
+
+        query = self._query
+        if since:
+            query = f"{query} after:{since}".strip()
+
+        listing = self._get(
+            f"/users/{self._quoted_user()}/messages",
+            {"q": query, "maxResults": str(self._limit)},
+        )
+        ids = [
+            str(item["id"])
+            for item in (listing.get("messages") or [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if not ids:
+            _log.info("gmail_api_no_matches", extra={"query": query})
+            return []
+
+        emails: list[InboundEmail] = []
+        for message_id in ids:
+            record = self._get(
+                f"/users/{self._quoted_user()}/messages/{urllib.parse.quote(message_id)}",
+                {"format": "RAW"},
+            )
+            raw = record.get("raw")
+            if not isinstance(raw, str):
+                _log.warning("gmail_api_message_without_raw", extra={"id": message_id})
+                continue
+            try:
+                decoded = base64.urlsafe_b64decode(_pad_base64(raw))
+            except (ValueError, TypeError) as exc:
+                _log.warning("gmail_api_undecodable_message", extra={"id": message_id, "error": str(exc)})
+                continue
+            emails.append(
+                parse_inbound_email(
+                    email.message_from_bytes(decoded),
+                    thread_id=str(record.get("threadId") or "") or None,
+                    labels=[str(label) for label in (record.get("labelIds") or [])],
+                )
+            )
+
+        _log.info("gmail_api_fetched", extra={"count": len(emails), "query": query})
+        return emails
+
+    def create_draft(
+        self,
+        email_message: InboundEmail,
+        body: str,
+        cc: tuple[str, ...] = (),
+    ) -> DraftMessage:
+        """Save a reply as a Gmail draft. **Never sends.**
+
+        ``drafts.create`` stores the message; delivery would require ``drafts.send`` or
+        ``messages.send``, neither of which this codebase calls. Passing ``threadId`` keeps
+        the draft in the carrier's existing conversation.
+        """
+
+        subject = reply_subject(email_message.subject)
+        mime = build_reply(
+            email_message,
+            body,
+            from_address=self._user,
+            cc=cc,
+            subject=subject,
+        )
+        payload: dict[str, Any] = {
+            "message": {"raw": base64.urlsafe_b64encode(mime.as_bytes()).decode("ascii")}
+        }
+        if email_message.thread_id:
+            payload["message"]["threadId"] = email_message.thread_id
+
+        created = self._post(f"/users/{self._quoted_user()}/drafts", payload)
+        draft_id = str(created.get("id") or "")
+        _log.info(
+            "gmail_api_draft_created",
+            extra={"draft_id": draft_id, "to": email_message.from_email, "cc": list(cc)},
+        )
+        return DraftMessage(
+            folder=f"Drafts (id {draft_id})" if draft_id else "Drafts",
+            to=email_message.from_email,
+            cc=cc,
+            subject=subject,
+            body=body,
+            in_reply_to=email_message.message_id or None,
+        )
+
+    def send_reply(
+        self,
+        thread_id: str,
+        message_id_in_reply_to: str,
+        body: str,
+        to: str,
+    ) -> SentMessage:
+        """Always raises — this client never sends, by policy.
+
+        The credential's ``gmail.compose`` scope would permit ``messages.send``; we simply do
+        not implement it. Drafts go to the mailbox for a human to send.
+        """
+
+        raise SendingDisabledError(
+            "sending is disabled: GmailApiClient is draft-only. The reply is saved in "
+            "Drafts — review it and press Send yourself."
+        )
+
+    # -- HTTP ----------------------------------------------------------------
+    def _quoted_user(self) -> str:
+        return urllib.parse.quote(self._user)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._tokens.token()}",
+            "Accept": "application/json",
+        }
+
+    def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+        url = f"{GMAIL_API_ROOT}{path}"
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        response = self._transport.request(
+            "GET", url, headers=self._headers(), timeout=self._timeout
+        )
+        return self._parse(response.status, response.body, path)
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._transport.request(
+            "POST",
+            f"{GMAIL_API_ROOT}{path}",
+            headers={**self._headers(), "Content-Type": "application/json"},
+            body=json.dumps(payload).encode(),
+            timeout=self._timeout,
+        )
+        return self._parse(response.status, response.body, path)
+
+    def _parse(self, status: int, body: bytes, path: str) -> dict[str, Any]:
+        text = body.decode("utf-8", "replace")
+        if status >= 400:
+            raise ClientError(self._explain(status, text, path))
+        try:
+            data = json.loads(text) if text else {}
+        except ValueError as exc:
+            raise ClientError(f"Gmail API {path} returned non-JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ClientError(f"Gmail API {path} returned a non-object response")
+        return data
+
+    def _explain(self, status: int, body: str, path: str) -> str:
+        """Turn Gmail's errors into something that names the fix."""
+
+        lowered = body.lower()
+        if status in {403, 404} and (
+            "accessnotconfigured" in lowered
+            or "has not been used in project" in lowered
+            or "gmail api has not been used" in lowered
+        ):
+            project = self._tokens.project_id or "<your project>"
+            return (
+                f"The Gmail API is not enabled in Google Cloud project {project!r} "
+                f"(HTTP {status}). This is common when the service account was created for "
+                "another API (Sheets, Drive…). Enable it at "
+                f"https://console.cloud.google.com/apis/library/gmail.googleapis.com?project={project} "
+                "then retry — it takes a minute to propagate."
+            )
+        if status == 403 and "insufficient" in lowered:
+            return (
+                f"Gmail API {path} refused: insufficient scope (HTTP 403). The delegation "
+                f"entry must include {', '.join(GMAIL_DRAFT_SCOPES)}. Adding a scope in the "
+                "Admin console requires no new key, but tokens must be re-minted."
+            )
+        if status in {401, 403}:
+            return (
+                f"Gmail API {path} refused (HTTP {status}). Check that domain-wide delegation "
+                f"is authorised for client id {self._tokens.client_id or '(see key)'} and that "
+                f"{self._user!r} is a real mailbox in the domain. Detail: {body[:200]}"
+            )
+        # Google spells this FAILED_PRECONDITION or failedPrecondition depending on the field.
+        if status == 400 and "failedprecondition" in lowered.replace("_", ""):
+            return (
+                f"Gmail API {path}: failed precondition (HTTP 400). Usually {self._user!r} has "
+                "no Gmail mailbox — the account exists but Gmail is not enabled for it."
+            )
+        if status == 404:
+            return f"Gmail API {path}: not found (HTTP 404). Is {self._user!r} the right mailbox?"
+        if status == 429:
+            return f"Gmail API {path}: rate limited (HTTP 429). Lower PAYBOT_GMAIL_FETCH_LIMIT."
+        return f"Gmail API {path} failed (HTTP {status}): {body[:250]}"
+
+
+def _pad_base64(value: str) -> str:
+    """Restore the ``=`` padding Gmail omits from base64url payloads."""
+
+    return value + "=" * (-len(value) % 4)
+
+
+def build_gmail_api_client(
+    settings: Settings | None = None,
+    transport: HttpTransport | None = None,
+) -> GmailApiClient:
+    """Build a :class:`GmailApiClient` from ``PAYBOT_GOOGLE_*`` / ``PAYBOT_GMAIL_*`` config."""
+
+    resolved = settings or get_settings()
+    info = load_service_account_info(
+        file_path=resolved.google_sa_file,
+        inline_json=resolved.google_sa_json.get_secret_value(),
+    )
+    subject = resolved.gmail_user or resolved.mailbox
+    scopes = GMAIL_DRAFT_SCOPES if resolved.gmail_create_draft else (GMAIL_DRAFT_SCOPES[0],)
+    tokens = ServiceAccountTokenSource(
+        info,
+        subject=subject,
+        scopes=scopes,
+        transport=transport,
+        timeout=resolved.google_timeout_seconds,
+    )
+    return GmailApiClient(
+        tokens,
+        user=subject,
+        query=resolved.gmail_query,
+        limit=resolved.gmail_fetch_limit,
+        mark_read=resolved.gmail_mark_seen,
+        transport=transport,
+        timeout=resolved.google_timeout_seconds,
+    )

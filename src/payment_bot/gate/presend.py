@@ -11,11 +11,14 @@ Checks (all must pass):
 1. **Authorization** — every disclosed load is ALLOW (FACTORING only if policy allows).
 2. **Fraud / sensitive change** — no bank / NOA-setup / contact-change signal.
 3. **Grounding** — every amount and date in the draft traces to the ledger.
-4. **Length routing** — every disclosed load is a valid 6/7-digit id.
-5. **Bulk** — the disclosed-load count is within the portal-fallback threshold.
+4. **Placeholders** — the draft contains no unfilled template markers.
+5. **Length routing** — every disclosed load is a valid 6/7-digit id.
+6. **Bulk** — the disclosed-load count is within the portal-fallback threshold.
 """
 
 from __future__ import annotations
+
+import re
 
 from pydantic import BaseModel
 
@@ -35,6 +38,37 @@ from payment_bot.tools.shared import (
 from payment_bot.tools.submit import SubmitDraftOutput
 
 _log = get_logger("gate")
+
+#: Markers that mean the model emitted the reply *template* instead of a finished reply.
+#:
+#: This exists because the grounding check cannot catch it. Grounding compares the amounts
+#: and dates in a draft against the ledger, so a draft that states no parseable figure at
+#: all — "our carrier rate is $XXX" — has nothing to verify and passes vacuously. Observed
+#: on live mail: a draft reading "$XXX … MATCHES/MISMATCHES … Yes/Not yet" passed all five
+#: original checks and was reported as ready for review.
+#:
+#: Deliberately narrow. A gate check that fires on a legitimate reply is worse than useless,
+#: so these match either the model's own stand-in text (``XXX``) or verbatim instruction
+#: fragments from the reply template in ``agent/skills.py`` — never general prose.
+_PLACEHOLDER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # The model's stand-in when it fails to substitute a figure: "$XXX", "XXX".
+    ("XXX", re.compile(r"\bX{3,}\b")),
+    # Unresolved alternations echoed from the template's own wording.
+    ("MATCHES/MISMATCHES", re.compile(r"matches\s*/\s*mismatches", re.IGNORECASE)),
+    ("Yes/Not yet", re.compile(r"\byes\s*/\s*not\s+yet\b", re.IGNORECASE)),
+    ("Yes/No", re.compile(r"\byes\s*/\s*no\b", re.IGNORECASE)),
+    ("TBD", re.compile(r"\bTBD\b")),
+    # Angle and brace placeholders. Both require a letter first and forbid "@", so an email
+    # address in angle brackets is not mistaken for a placeholder.
+    ("<placeholder>", re.compile(r"<[A-Za-z][A-Za-z _-]{1,38}>")),
+    ("{placeholder}", re.compile(r"\{\{[^{}\n]{1,40}\}\}|\{[A-Za-z][A-Za-z _.-]{0,38}\}")),
+)
+
+
+def _placeholder_hits(text: str) -> set[str]:
+    """Labels of every placeholder marker present in ``text``."""
+
+    return {label for label, pattern in _PLACEHOLDER_PATTERNS if pattern.search(text)}
 
 
 class GateCheck(BaseModel):
@@ -78,6 +112,7 @@ class PreSendGate:
             self._check_bulk(draft, ctx),
             self._check_authorization(draft, email, ctx),
             self._check_sensitive_change(email, ctx),
+            self._check_placeholders(draft),
             self._check_grounding(draft, ctx),
         ]
         allowed = all(c.passed for c in checks)
@@ -142,7 +177,11 @@ class PreSendGate:
                 decision is AuthDecision.FACTORING and self._allow_factoring
             )
             if not allowed:
-                denied.append(f"{load_id}={decision.value}")
+                # Carry the tool's reason. "2462934=DENY" alone tells a reviewer nothing;
+                # the reason distinguishes an unknown stranger from a factoring company whose
+                # domain simply has not been configured yet, and names the fix.
+                detail = f" ({outcome.reason})" if outcome.reason else ""
+                denied.append(f"{load_id}={decision.value}{detail}")
         if denied:
             return GateCheck(
                 name="authorization",
@@ -176,8 +215,40 @@ class PreSendGate:
             name="sensitive_change", passed=True, detail="no bank/NOA/contact change detected"
         )
 
+    def _check_placeholders(self, draft: SubmitDraftOutput) -> GateCheck:
+        """Block a draft that was never filled in.
+
+        Citations are scanned as well as the body. A citation reading ``XXX`` never reaches
+        the carrier — only the body is emailed — but it is direct evidence the model was
+        emitting the template rather than reporting tool results, which makes the whole
+        draft untrustworthy. Failing closed on it is the point of the gate.
+        """
+
+        body = _placeholder_hits(draft.reply_body)
+        citations: set[str] = set()
+        for citation in draft.citations:
+            citations |= _placeholder_hits(f"{citation.fact} {citation.value}")
+
+        if not body and not citations:
+            return GateCheck(
+                name="placeholders", passed=True, detail="no unfilled template markers"
+            )
+
+        problems: list[str] = []
+        if body:
+            problems.append(f"reply body {sorted(body)}")
+        if citations:
+            problems.append(f"citations {sorted(citations)}")
+        return GateCheck(
+            name="placeholders",
+            passed=False,
+            detail=f"draft was never filled in: {'; '.join(problems)}",
+        )
+
     def _check_grounding(self, draft: SubmitDraftOutput, ctx: ToolContext) -> GateCheck:
-        ungrounded_money = extract_money_tokens(draft.reply_body) - ctx.ledger.grounded_amounts
+        # Magnitudes on both sides — the ledger stores them that way, see record_amount.
+        stated_money = {abs(amount) for amount in extract_money_tokens(draft.reply_body)}
+        ungrounded_money = stated_money - ctx.ledger.grounded_amounts
         ungrounded_dates = extract_date_tokens(draft.reply_body) - ctx.ledger.grounded_dates
         problems: list[str] = []
         if ungrounded_money:

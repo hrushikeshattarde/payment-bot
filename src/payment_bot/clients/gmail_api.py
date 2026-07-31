@@ -16,15 +16,15 @@ Operation                    Gmail API call
 ``send_reply``               *(never called — raises)*
 ===========================  ============================================================
 
-``format=RAW`` returns the original RFC822 bytes, so the same battle-tested MIME parsing
-serves both this backend and IMAP (see :mod:`payment_bot.clients.mime`).
+``format=RAW`` returns the original RFC822 bytes, parsed by
+:mod:`payment_bot.clients.mime`.
 
-**On the no-send guarantee.** Unlike the IMAP app-password backend, this credential *can*
-technically send: Google offers no draft-only scope, and ``gmail.compose`` — the narrowest
-scope allowing ``drafts.create`` — also permits ``messages.send``. So here the guarantee is
-enforced by our code rather than by the credential: :meth:`GmailApiClient.send_reply` raises,
-the pipeline never takes the send path, and the approval resolver never approves. Worth
-knowing, and worth not pretending otherwise.
+**On the no-send guarantee.** This credential *can* technically send: Google offers no
+draft-only scope, and ``gmail.compose`` — the narrowest scope allowing ``drafts.create`` —
+also permits ``messages.send``. So the guarantee is enforced by our code rather than by the
+credential: :meth:`GmailApiClient.send_reply` raises, the pipeline never takes the send
+path, and the approval resolver never approves. Worth knowing, and worth not pretending
+otherwise.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ import base64
 import email
 import json
 import urllib.parse
+from email.utils import parseaddr
 from typing import Any
 
 from payment_bot.clients.gmail import DraftMessage, SentMessage
@@ -111,7 +112,15 @@ class GmailApiClient:
 
     # -- GmailClient / DraftingGmailClient -----------------------------------
     def fetch_new(self, since: str | None = None) -> list[InboundEmail]:
-        """Return up to ``limit`` matching messages.
+        """Return the messages in matching threads that still need a reply.
+
+        A Gmail query matches individual *messages*, which is the wrong unit of work here. On
+        live mail that meant answering conversations a colleague had already handled, and
+        producing a second draft for a thread that already had one — every re-run added
+        another, because ``mark_seen`` is off by design.
+
+        So the listing is collapsed to one candidate per thread and each is checked against
+        the thread itself. See :meth:`_thread_reply_target`.
 
         Args:
             since: Optional ``YYYY/MM/DD`` date, added as a Gmail ``after:`` term.
@@ -125,13 +134,39 @@ class GmailApiClient:
             f"/users/{self._quoted_user()}/messages",
             {"q": query, "maxResults": str(self._limit)},
         )
-        ids = [
-            str(item["id"])
+        matched = [
+            (str(item["id"]), str(item.get("threadId") or ""))
             for item in (listing.get("messages") or [])
             if isinstance(item, dict) and item.get("id")
         ]
-        if not ids:
+        if not matched:
             _log.info("gmail_api_no_matches", extra={"query": query})
+            return []
+
+        # Gmail lists newest first, so the first sighting of a thread is its newest match.
+        seen_threads: set[str] = set()
+        ids: list[str] = []
+        skipped = 0
+        for message_id, thread_id in matched:
+            if not thread_id:
+                ids.append(message_id)
+                continue
+            if thread_id in seen_threads:
+                continue
+            seen_threads.add(thread_id)
+            target = self._thread_reply_target(thread_id)
+            if target is None:
+                skipped += 1
+                continue
+            ids.append(target)
+
+        if skipped:
+            _log.info(
+                "gmail_api_threads_skipped",
+                extra={"skipped": skipped, "reason": "already answered or already drafted"},
+            )
+        if not ids:
+            _log.info("gmail_api_no_actionable_threads", extra={"query": query})
             return []
 
         emails: list[InboundEmail] = []
@@ -230,6 +265,58 @@ class GmailApiClient:
             "Accept": "application/json",
         }
 
+    def _thread_reply_target(self, thread_id: str) -> str | None:
+        """The id of the message to answer in this thread, or ``None`` if none needs it.
+
+        Three reasons a thread needs nothing:
+
+        * **A draft already exists in it.** Gmail keeps drafts in the thread, so this is what
+          stops a re-run adding a second draft to the same conversation.
+        * **The newest message is ours.** Somebody on our side has already replied — a
+          colleague answering by hand, or an earlier run that was sent.
+        * **The newest message is a reply we sent.** Same as above; ownership is decided by
+          the sender's domain, not by the mailbox being impersonated, because group mail
+          arrives from colleagues on the same domain.
+
+        Otherwise the answer is the thread's newest message, which may be *newer* than the one
+        the query matched — a carrier who followed up twice should get one reply to the latest.
+
+        A metadata-only thread read; it fetches no bodies.
+        """
+
+        thread = self._get(
+            f"/users/{self._quoted_user()}/threads/{urllib.parse.quote(thread_id)}",
+            {"format": "metadata", "metadataHeaders": "From"},
+        )
+        messages = [m for m in (thread.get("messages") or []) if isinstance(m, dict)]
+        if not messages:
+            return None
+
+        newest: dict[str, Any] | None = None
+        newest_at = -1
+        for message in messages:
+            if "DRAFT" in (message.get("labelIds") or []):
+                return None
+            try:
+                stamp = int(message.get("internalDate") or 0)
+            except (TypeError, ValueError):
+                stamp = 0
+            if stamp >= newest_at:
+                newest_at, newest = stamp, message
+        if newest is None:
+            return None
+
+        if self._is_ours(_header_value(newest, "From")):
+            return None
+        return str(newest.get("id") or "") or None
+
+    def _is_ours(self, from_header: str) -> bool:
+        """True when a message was sent from our own domain."""
+
+        _, address = parseaddr(from_header)
+        domain = self._user.rsplit("@", 1)[-1].lower()
+        return bool(domain) and address.lower().endswith(f"@{domain}")
+
     def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
         url = f"{GMAIL_API_ROOT}{path}"
         if params:
@@ -301,6 +388,17 @@ class GmailApiClient:
         if status == 429:
             return f"Gmail API {path}: rate limited (HTTP 429). Lower PAYBOT_GMAIL_FETCH_LIMIT."
         return f"Gmail API {path} failed (HTTP {status}): {body[:250]}"
+
+
+def _header_value(message: dict[str, Any], name: str) -> str:
+    """Read one header out of a ``format=metadata`` message, case-insensitively."""
+
+    headers = ((message.get("payload") or {}).get("headers")) or []
+    wanted = name.lower()
+    for header in headers:
+        if isinstance(header, dict) and str(header.get("name", "")).lower() == wanted:
+            return str(header.get("value") or "")
+    return ""
 
 
 def _pad_base64(value: str) -> str:

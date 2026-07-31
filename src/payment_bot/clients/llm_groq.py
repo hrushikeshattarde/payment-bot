@@ -27,6 +27,7 @@ Reliability notes for this provider:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from payment_bot.clients.http import (
@@ -59,6 +60,35 @@ DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 
+#: Groq states the exact wait in the 429 body: "Please try again in 28.645s".
+_RETRY_AFTER_RE = re.compile(r"try again in\s*([\d.]+)\s*s", re.IGNORECASE)
+
+#: Ceiling on one wait, however long Groq asks for. A rate window is a minute, so anything
+#: beyond this means something other than ordinary throttling and escalating is better than
+#: hanging.
+_MAX_RETRY_SLEEP_SECONDS = 65.0
+
+
+def _retry_delay(status: int, body: str, attempt: int) -> float:
+    """Seconds to wait before the next attempt.
+
+    Groq's token limits are per *minute*, so exponential backoff starting at 1s cannot clear
+    one. Measured on live mail: three consecutive runs were told to wait 28s, 19s and 19s,
+    waited 1s then 2s, and escalated with no draft. Every email that reached the agent failed
+    this way — not on any safety check.
+
+    So when Groq names the wait, honour it. Anything else keeps the old backoff.
+    """
+
+    if status == 429:
+        found = _RETRY_AFTER_RE.search(body)
+        if found is not None:
+            # A little over what was asked, so the window has definitely rolled over.
+            return min(float(found.group(1)) + 0.5, _MAX_RETRY_SLEEP_SECONDS)
+    # 2.0** rather than 1.0 * (2**…): int.__pow__ is typed as returning Any.
+    return 2.0**attempt
+
+
 #: finish_reason → our neutral stop_reason
 _STOP_REASONS = {
     "tool_calls": "tool_use",
@@ -89,6 +119,10 @@ def _to_wire_messages(messages: list[Message]) -> list[dict[str, Any]]:
             entry: dict[str, Any] = {"role": "assistant"}
             # The API requires the key even when the turn was pure tool calls.
             entry["content"] = "\n".join(texts) if texts else None
+            # Echo back whatever the provider asked us to carry (reasoning models need
+            # their own chain of thought or they forget the turn — see Message).
+            if message.provider_state:
+                entry.update(message.provider_state)
             if tool_uses:
                 entry["tool_calls"] = [
                     {
@@ -117,6 +151,25 @@ def _to_wire_messages(messages: list[Message]) -> list[dict[str, Any]]:
         if texts:
             wire.append({"role": "user", "content": "\n".join(texts)})
     return wire
+
+
+#: Assistant-message fields a provider expects echoed back verbatim on the next request.
+#:
+#: Reasoning models return a private chain of thought next to their tool call. It is not
+#: content and we never read it, but it has to go back or the model forgets its own turn:
+#: nvidia/nemotron-3-super via OpenRouter replied with prose naming a tool it had not called,
+#: looped, and burned the whole token budget. With these fields restored it called the next
+#: tool. Providers that send none of them are unaffected.
+_CARRIED_ASSISTANT_FIELDS = ("reasoning_details", "reasoning", "reasoning_content")
+
+
+def _provider_state(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Collect the fields that must be echoed back, or ``None`` if there are none."""
+
+    carried = {
+        key: message[key] for key in _CARRIED_ASSISTANT_FIELDS if message.get(key) is not None
+    }
+    return carried or None
 
 
 def _to_wire_tools(tools: list[ToolSpec]) -> list[dict[str, Any]]:
@@ -260,6 +313,7 @@ class GroqLlmClient:
             stop_reason=_STOP_REASONS.get(finish, finish),
             content=_from_wire_message(message),
             usage=usage,
+            provider_state=_provider_state(message),
         )
 
     # -- internals -----------------------------------------------------------
@@ -284,10 +338,13 @@ class GroqLlmClient:
                     raise ClientError("Groq returned a non-object response")
                 return data
 
-            last_status, last_body = response.status, response.text()[:400]
+            full_body = response.text()
+            last_status, last_body = response.status, full_body[:400]
             if response.status not in _RETRY_STATUSES or attempt == self._max_retries:
                 break
-            delay = 1.0 * (2**attempt)
+            # Parse the delay from the untruncated body — the wait Groq names sits past 250
+            # characters in, so reading it off `last_body` would be luck rather than logic.
+            delay = _retry_delay(response.status, full_body, attempt)
             _log.warning(
                 "groq_retrying",
                 extra={"status": response.status, "attempt": attempt + 1, "delay_s": delay},

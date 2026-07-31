@@ -113,7 +113,9 @@ def test_earnings_deductions_and_status_are_parsed() -> None:
     assert [e.title for e in load.earnings] == ["TRUCK ORDER NOT USED", "Brokerage Line Haul"]
     assert [e.amount for e in load.earnings] == [Decimal("150"), Decimal("4500")]
     assert load.earnings[0].estimated_payment_date is not None
-    assert load.earnings[0].estimated_payment_date.isoformat() == "2026-08-19"
+    # The raw payload says 2026-08-19; the client reports the date the Transport Pro
+    # application shows, one day later — see _app_pay_date (verified on load 2479097).
+    assert load.earnings[0].estimated_payment_date.isoformat() == "2026-08-20"
     assert load.deductions == []
     assert load.account_information is not None
     assert load.account_information.company_name == "Idea Expedited, Inc"
@@ -224,7 +226,8 @@ def test_settled_earning_line_becomes_a_settlement_entry() -> None:
     entry = entries[0]
     assert entry.amount == Decimal("4500")
     assert entry.carrier_name == "Idea Expedited, Inc"
-    assert entry.pay_date is not None and entry.pay_date.isoformat() == "2026-08-20"
+    # Raw actual_payment_date 2026-08-20 → app calendar 2026-08-21 (see _app_pay_date).
+    assert entry.pay_date is not None and entry.pay_date.isoformat() == "2026-08-21"
     assert entry.payment_method == "Check"
     assert entry.check_or_ref == "100482"
     assert entry.description == "Brokerage Line Haul"
@@ -232,13 +235,14 @@ def test_settled_earning_line_becomes_a_settlement_entry() -> None:
 
 # --- file history -----------------------------------------------------------
 @pytest.mark.unit
-def test_file_history_is_keyed_by_internal_record_id() -> None:
+def test_file_history_is_keyed_by_the_carrier_facing_load_number() -> None:
+    """Confirmed against the live tenant: recordId takes the number from the email."""
+
     transport = full_transport()
     docs = _client(transport).get_file_history("2462934")
 
     files_url = next(u for u in transport.data_urls() if "files/search" in u)
-    # 1302556 is the echoed internal id, NOT the 2462934 the carrier quoted.
-    assert "recordId=1302556" in files_url
+    assert "recordId=2462934" in files_url
     assert "recordType=loads" in files_url
 
     assert [d.file_type for d in docs] == ["Carrier Invoice", "Bill of Lading"]

@@ -54,6 +54,14 @@ ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock
 class Message:
     role: Role
     content: list[ContentBlock]
+    #: Opaque provider state that must be echoed back on the next request, or the model
+    #: loses track of its own turn. Reasoning models are the reason this exists: they return
+    #: a private chain of thought alongside their tool call, and dropping it makes them
+    #: forget what they just did. Measured on nvidia/nemotron-3-super via OpenRouter —
+    #: replaying a turn without it produced prose claiming a *different* tool had been
+    #: called, then looped until the token budget ran out; replaying with it produced the
+    #: next tool call. Never interpreted here, only carried.
+    provider_state: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +80,8 @@ class LlmResponse:
     stop_reason: str  # "tool_use" | "end_turn" | "max_tokens" | ...
     content: list[ContentBlock]
     usage: dict[str, int] = field(default_factory=dict)
+    #: Provider state to carry into the assistant message — see :class:`Message`.
+    provider_state: dict[str, Any] | None = None
 
     @property
     def text(self) -> str:

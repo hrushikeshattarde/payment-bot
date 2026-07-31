@@ -1,16 +1,16 @@
 """Local draft-only entrypoint (``payment-bot-local``).
 
-Reads real carrier mail from ``paystatus@`` over IMAP, answers it with **Groq** driving the
-tool-use loop against **live Transport Pro** data, runs the deterministic pre-send gate, and
-posts each gate-passing draft to Slack for review. **No email is ever sent**: you read the
-draft in Slack and send it yourself.
+Reads real carrier mail from ``paystatus@`` via the Gmail API, answers it with the local
+LLM driving the tool-use loop against **live Transport Pro** data, runs the deterministic
+pre-send gate, and saves each gate-passing reply to Gmail Drafts for review. **No email is
+ever sent**: you read the draft and send it yourself.
 
 Nothing is sent because three independent things all say so:
 
 1. ``PAYBOT_DRAFT_ONLY=true`` — the pipeline never takes the auto-send path.
 2. :class:`DeferredApprovalResolver` — approval is never granted in-process, so the run ends
    at ``Outcome.AWAITING_REVIEW``.
-3. :class:`~payment_bot.clients.gmail_imap.ImapGmailClient` — its ``send_reply`` raises.
+3. :class:`~payment_bot.clients.gmail_api.GmailApiClient` — its ``send_reply`` raises.
 
 Usage::
 
@@ -353,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="verify configuration and IMAP connectivity, then exit",
+        help="verify configuration and Gmail connectivity, then exit",
     )
     parser.add_argument("--log-level", default=None, help="DEBUG | INFO | WARNING | ERROR")
     args = parser.parse_args(argv)

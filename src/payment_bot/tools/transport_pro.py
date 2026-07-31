@@ -13,14 +13,27 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 from payment_bot.domain import compute_carrier_rate
+from payment_bot.domain.documents import DocCategory, assess_documents
 from payment_bot.models import Deduction, DispatchRow, Earning, SettlementEntry
 from payment_bot.tools.base import Tool, ToolContext
+from payment_bot.tools.shared import LoadIdStr
 
 _BILLED_STATUSES = frozenset({"billed"})
 
 
+#: Shared by every Transport Pro read. The description reaches the model as JSON Schema, and
+#: an undescribed argument is one the model guesses at — on live mail that cost three to seven
+#: failed calls per tool before it hit a working shape.
+LOAD_ID_FIELD = Field(
+    description=(
+        "The 6 or 7 digit load id on its own, digits only — e.g. 2462934. Not an MC number, "
+        "not an invoice number, no prefix."
+    )
+)
+
+
 class LoadIdInput(BaseModel):
-    load_id: str
+    load_id: LoadIdStr = LOAD_ID_FIELD
 
 
 # ---------------------------------------------------------------------------
@@ -164,18 +177,21 @@ class TpGetSettlementEntries(Tool):
 # ---------------------------------------------------------------------------
 # tp_get_file_history
 # ---------------------------------------------------------------------------
-class FileDocumentView(BaseModel):
-    file_type: str
-    index_date: date | None = None
-    upload_date: date | None = None
-    indexed_by: str | None = None
-    comments: str | None = None
-    matches_load: bool = False
+class CategoryCount(BaseModel):
+    category: str
+    count: int
+    latest: date | None = None
 
 
 class TpFileHistoryOutput(BaseModel):
     ok: bool = True
-    documents: list[FileDocumentView] = Field(default_factory=list)
+    load_id: str
+    document_count: int = 0
+    #: The question this tool exists to answer: required paperwork not on file.
+    missing_documents: list[str] = Field(default_factory=list)
+    all_required_present: bool = True
+    #: One row per document category, so a load with four rate agreements reads as one line.
+    on_file: list[CategoryCount] = Field(default_factory=list)
     has_carrier_invoice: bool = False
     has_bol_or_pod: bool = False
     has_rate_agreement: bool = False
@@ -183,47 +199,51 @@ class TpFileHistoryOutput(BaseModel):
 
 
 class TpGetFileHistory(Tool):
-    """File history — match docs to the load via Load Number in comments (§4.3)."""
+    """File history, reduced to *what is missing* (§4.3).
+
+    A busy load carries a dozen rows — several copies of the rate agreement, two invoices,
+    a billing packet. Handing all of that to the model invites it to eyeball the list and
+    guess. Instead this classifies each file by its ``fileTypeId`` and returns the answer
+    directly: which required documents are absent.
+    """
 
     name = "tp_get_file_history"
     description = (
-        "Return indexed documents for a load and whether a carrier invoice, BOL/POD, rate "
-        "agreement, or CANCEL LOAD confirmation is present. A cancel confirmation escalates."
+        "Return which required documents are MISSING for a load (carrier invoice, "
+        "proof of delivery/BOL, rate agreement), plus a per-category count of what is on "
+        "file and whether a CANCEL LOAD confirmation exists. Read `missing_documents` — "
+        "do not infer it yourself. A cancel confirmation escalates."
     )
     input_model = LoadIdInput
 
     def run(self, params: BaseModel, ctx: ToolContext) -> TpFileHistoryOutput:
         assert isinstance(params, LoadIdInput)
-        docs = ctx.tp.get_file_history(params.load_id)
         load_id = params.load_id.strip()
+        docs = ctx.tp.get_file_history(load_id)
 
-        views: list[FileDocumentView] = []
-        has_invoice = has_bol_pod = has_rate = has_cancel = False
-        for doc in docs:
-            comments = doc.comments or ""
-            file_type = doc.file_type.lower()
-            blob = f"{file_type} {comments.lower()}"
-            views.append(
-                FileDocumentView(
-                    file_type=doc.file_type,
-                    index_date=doc.index_date,
-                    upload_date=doc.upload_date,
-                    indexed_by=doc.indexed_by,
-                    comments=doc.comments,
-                    matches_load=load_id in comments,
-                )
-            )
-            has_invoice = has_invoice or "invoice" in file_type
-            has_bol_pod = has_bol_pod or any(k in blob for k in ("bill of lading", "bol", "pod"))
-            has_rate = has_rate or "rate agreement" in blob or "rate confirmation" in blob
-            has_cancel = has_cancel or "cancel load" in blob
+        status, _classified = assess_documents(
+            ((d.file_type, d.file_type_id, d.upload_date or d.index_date, d.comments) for d in docs),
+            load_id=load_id,
+        )
+        present = set(status.present)
+
+        # Ground the document categories so the reply may name them (§5).
+        for category in status.present:
+            ctx.ledger.record_text("document", category.value, self.name, load_id)
 
         return TpFileHistoryOutput(
-            documents=views,
-            has_carrier_invoice=has_invoice,
-            has_bol_or_pod=has_bol_pod,
-            has_rate_agreement=has_rate,
-            has_cancel_confirmation=has_cancel,
+            load_id=load_id,
+            document_count=status.document_count,
+            missing_documents=[c.value for c in status.missing],
+            all_required_present=status.is_complete,
+            on_file=[
+                CategoryCount(category=s.category.value, count=s.count, latest=s.latest)
+                for s in status.by_category
+            ],
+            has_carrier_invoice=DocCategory.CARRIER_INVOICE in present,
+            has_bol_or_pod=DocCategory.PROOF_OF_DELIVERY in present,
+            has_rate_agreement=DocCategory.RATE_AGREEMENT in present,
+            has_cancel_confirmation=status.has_cancel_confirmation,
         )
 
 

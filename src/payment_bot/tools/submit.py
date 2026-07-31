@@ -26,10 +26,24 @@ class Citation(BaseModel):
 
 
 class SubmitDraftInput(BaseModel):
-    reply_body: str
-    to: str
-    load_ids: list[str] = Field(default_factory=list)
-    citations: list[Citation] = Field(default_factory=list)
+    reply_body: str = Field(
+        description=(
+            "The finished reply to the carrier, plain text, ready to send. Two to four "
+            "sentences. Never a template or a placeholder — every figure filled in."
+        )
+    )
+    to: str = Field(description="The recipient's email address — the sender you are replying to.")
+    load_ids: list[str] = Field(
+        default_factory=list,
+        description="Every load id the reply discloses information about. Digits only.",
+    )
+    citations: list[Citation] = Field(
+        default_factory=list,
+        description=(
+            "One entry per amount and date stated in the reply, naming the tool that produced "
+            "it. The gate independently re-checks these against the tool results."
+        ),
+    )
 
 
 class SubmitDraftOutput(BaseModel):

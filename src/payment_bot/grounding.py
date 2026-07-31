@@ -100,10 +100,19 @@ class GroundingLedger:
     facts: list[GroundedFact] = field(default_factory=list)
     grounded_amounts: set[Decimal] = field(default_factory=set)
     grounded_dates: set[date] = field(default_factory=set)
-    scheduled_pay_dates: set[date] = field(default_factory=set)
 
     def record_amount(self, amount: Decimal, source_tool: str, load_id: str | None = None) -> None:
-        self.grounded_amounts.add(amount)
+        """Record a tool-produced amount, keyed by magnitude.
+
+        Sign is a presentation choice, not provenance. Transport Pro returns deductions as
+        negatives (``-11.25``), and a correct reply naturally writes "a deduction of $11.25" —
+        so a signed comparison blocked a draft whose every figure was genuinely grounded.
+        Storing the magnitude keeps the check answering the question it actually asks: did a
+        tool produce this number? It never claimed to police meaning, and could not — gross
+        and net are both grounded, and it cannot tell which belongs where.
+        """
+
+        self.grounded_amounts.add(abs(amount))
         self.facts.append(GroundedFact("amount", str(amount), source_tool, load_id))
 
     def record_date(
@@ -115,8 +124,6 @@ class GroundingLedger:
         kind: str = "date",
     ) -> None:
         self.grounded_dates.add(value)
-        if kind == "scheduled_pay_date":
-            self.scheduled_pay_dates.add(value)
         self.facts.append(GroundedFact(kind, value.isoformat(), source_tool, load_id))
 
     def record_text(

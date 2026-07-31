@@ -84,3 +84,42 @@ def test_decimal_precision_is_exact() -> None:
         deductions=None,
     )
     assert rate.gross_rate == Decimal("0.3")
+
+
+# --- Deduction sign ----------------------------------------------------------
+@pytest.mark.unit
+@pytest.mark.parametrize("deduction_amount", ["-11.25", "11.25"])
+def test_deductions_reduce_the_net_whichever_sign_the_api_uses(deduction_amount: str) -> None:
+    """Live load 2496737 returned a net of 236.25 against a gross of 225.
+
+    Transport Pro sends deductions as negatives, so `gross - total` added the deduction
+    instead of subtracting it — overstating what the carrier was owed by twice the deduction,
+    on every load that has one. The grounding check cannot catch it: the figure really did
+    come from a tool.
+    """
+
+    rate = compute_carrier_rate(
+        earnings=[Earning(title="Brokerage Line Haul", amount=Decimal("225"))],
+        deductions=[Deduction(title="Quick Pay Brokerage", amount=Decimal(deduction_amount))],
+    )
+
+    assert rate.gross_rate == Decimal("225")
+    assert rate.total_deductions == Decimal("11.25")
+    assert rate.net_rate == Decimal("213.75")
+
+
+@pytest.mark.unit
+def test_net_never_exceeds_gross_when_deductions_exist() -> None:
+    """The property that was violated. A deduction can only ever reduce the net."""
+
+    rate = compute_carrier_rate(
+        earnings=[Earning(title="Line Haul", amount=Decimal("1000"))],
+        deductions=[
+            Deduction(title="Advance", amount=Decimal("-250")),
+            Deduction(title="Lumper", amount=Decimal("-75.50")),
+        ],
+    )
+
+    assert rate.total_deductions == Decimal("325.50")
+    assert rate.net_rate == Decimal("674.50")
+    assert rate.net_rate < rate.gross_rate

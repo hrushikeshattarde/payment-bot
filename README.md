@@ -74,6 +74,9 @@ still calling Bedrock models for reasoning/drafting. `LlmClient` is a protocol:
   read `paystatus@` via a dedicated Google service account, draft with Groq against live
   Transport Pro, and save the reply to Gmail Drafts with you on Cc. No AWS, no Slack, and it
   cannot send email.**
+- [docs/ESCALATIONS.md](docs/ESCALATIONS.md) — why an email escalates instead of drafting:
+  every verification step in the order it runs, what each rejects, and the measured breakdown
+  over 80 real messages. Read this before concluding the bot refuses too much.
 - [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md) — install, configure, test, and the mocked /
   Bedrock run modes.
 - [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md) — production architecture on AWS, the

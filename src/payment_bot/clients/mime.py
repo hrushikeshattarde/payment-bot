@@ -1,9 +1,8 @@
-"""MIME parsing and reply building, shared by every Gmail backend.
+"""MIME parsing and reply building for the Gmail backend.
 
-Both Gmail backends deal in RFC822 bytes — IMAP hands them over from ``FETCH``, and the
-Gmail API returns them base64url-encoded from ``messages.get?format=RAW`` — so the parsing
-and reply construction live here rather than being duplicated (or, worse, diverging)
-between the two.
+The Gmail API deals in RFC822 bytes — returned base64url-encoded from
+``messages.get?format=RAW`` — so the parsing and reply construction live here rather than
+inline in the client.
 
 Parsing is deliberately lenient: a carrier's mail client is not our problem, and a missing
 or oddly-encoded header must never crash a run. Anything we cannot read becomes empty, and
@@ -109,8 +108,8 @@ def parse_inbound_email(
     Args:
         message: The parsed message.
         thread_id: The backend's own thread identifier, when it has one. The Gmail API
-            supplies a real ``threadId``; plain IMAP does not, so we fall back to the root
-            of the ``References`` chain.
+            supplies a real ``threadId``; without one we fall back to the root of the
+            ``References`` chain.
         labels: Backend labels, if available.
     """
 

@@ -33,6 +33,7 @@ _EXPECTED_TOOL_ORDER = [
     "classify_intent",
     "extract_identifiers",
     "detect_sensitive_change",
+    "check_authorization",  # intake pre-check; the gate re-runs it on the draft
     "tp_get_load_summary",
     "compute_scheduled_pay_date",
     "compute_scheduled_pay_date",
@@ -137,6 +138,36 @@ def test_bank_change_escalates_before_agent_runs() -> None:
 
 
 @pytest.mark.integration
+def test_unauthorized_sender_escalates_before_the_agent_runs() -> None:
+    """A sender authorized for no load stops at intake: the model is never invoked.
+
+    Before the pre-check, this email would burn a full agent run and then be blocked by
+    the gate's authorization check — same terminal outcome, 11-12 LLM requests later.
+    """
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(AutoApproveResolver(), gmail, slack, audit)
+
+    stranger = sample_payment_status_email().model_copy(
+        update={"message_id": "msg-stranger-1", "from_email": "billing@totally-unrelated.com"}
+    )
+    result = pipeline.process_email(stranger)
+
+    assert result.outcome is Outcome.ESCALATED
+    assert "not authorized for any load" in result.detail
+    assert gmail.sent == []
+    assert len(slack.escalations) == 1
+    # Intake stopped at the authorization pre-check; no model, no Transport Pro tools.
+    names = [e.tool_name for e in audit.for_correlation("msg-stranger-1")]
+    assert names == [
+        "classify_intent",
+        "extract_identifiers",
+        "detect_sensitive_change",
+        "check_authorization",
+    ]
+
+
+@pytest.mark.integration
 def test_phase2_single_load_auto_sends_without_approval() -> None:
     gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
     settings = Settings(rollout_phase=RolloutPhase.SELECTIVE_AUTOSEND)
@@ -154,3 +185,46 @@ def test_phase2_single_load_auto_sends_without_approval() -> None:
     assert result.outcome is Outcome.SENT
     assert len(gmail.sent) == 1
     assert slack.approvals == []  # auto-sent, no human approval posted
+
+
+# --- Combined intent ---------------------------------------------------------
+# "Confirm the rate and tell me when I get paid" used to be refused outright: §3.5 merging is
+# unwired, so _select_skill returned None. On live mail that was 5 of 20 emails, all of them
+# answerable. It now answers the more specific question rather than nothing.
+@pytest.mark.integration
+def test_combined_intent_without_a_figure_answers_payment_status() -> None:
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), gmail, slack, audit
+    )
+    email = sample_payment_status_email()
+    combined = email.model_copy(
+        update={
+            "subject": "Load 2462934 - verify the rate and payment status",
+            "body": "Please confirm the rate and let me know the pay date for load 2462934.",
+        }
+    )
+
+    result = pipeline.process_email(combined)
+
+    assert result.outcome is not Outcome.ESCALATED, result.detail
+    names = [e.tool_name for e in audit.for_correlation(combined.message_id)]
+    # The payment_status procedure, not a refusal.
+    assert "compute_scheduled_pay_date" in names
+
+
+@pytest.mark.integration
+def test_combined_intent_is_no_longer_escalated_as_unanswerable() -> None:
+    """The specific detail string that used to come back."""
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), gmail, slack, audit
+    )
+    combined = sample_payment_status_email().model_copy(
+        update={"body": "Verify the rate and give me the payment status for load 2462934."}
+    )
+
+    result = pipeline.process_email(combined)
+
+    assert "intent not answerable" not in (result.detail or "")

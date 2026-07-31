@@ -49,9 +49,8 @@ SCOPE_GMAIL_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
 #: is the narrowest scope that allows ``drafts.create``, and it *also* allows
 #: ``messages.send``. So with the Gmail API backend the credential is technically capable of
 #: sending, and the no-send guarantee rests on our code — the client's ``send_reply`` raises,
-#: the pipeline never takes the send path, and the resolver never approves. That is a real
-#: difference from the IMAP backend, where the app password could not send at all. It is
-#: called out in docs/LOCAL_RUN.md rather than glossed over.
+#: the pipeline never takes the send path, and the resolver never approves. It is called out
+#: in docs/LOCAL_RUN.md rather than glossed over.
 GMAIL_DRAFT_SCOPES: tuple[str, ...] = (SCOPE_GMAIL_READONLY, SCOPE_GMAIL_COMPOSE)
 
 #: Read-only: genuinely incapable of sending or drafting. Use when you only want intake.

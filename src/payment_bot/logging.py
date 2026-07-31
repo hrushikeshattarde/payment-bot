@@ -7,9 +7,8 @@ Two concerns live here:
 
 2. **Audit trail** — PRD §8.1 requires that *every* tool call and its result be
    logged "for audit and grounding checks". :class:`AuditSink` is the seam:
-   :class:`InMemoryAuditSink` is used by tests and the local demo;
-   :class:`LoggingAuditSink` emits structured log lines; production would add a
-   DynamoDB/S3-backed sink (§8.1.1) behind the same protocol.
+   :class:`InMemoryAuditSink` serves tests and the local runners; production would add
+   a DynamoDB/S3-backed sink (§8.1.1) behind the same protocol.
 """
 
 from __future__ import annotations
@@ -107,25 +106,4 @@ class InMemoryAuditSink:
         """Return all entries for one email/run, in call order."""
 
         return [e for e in self.entries if e.correlation_id == correlation_id]
-
-
-class LoggingAuditSink:
-    """Emits each audit record as a structured log line."""
-
-    def __init__(self) -> None:
-        self._log = get_logger("audit")
-
-    def record(self, entry: AuditRecord) -> None:
-        self._log.info(
-            "tool_call",
-            extra={
-                "correlation_id": entry.correlation_id,
-                "tool": entry.tool_name,
-                "ok": entry.ok,
-                "duration_ms": round(entry.duration_ms, 2),
-                "request": entry.request,
-                "response": entry.response,
-            },
-        )
-
 

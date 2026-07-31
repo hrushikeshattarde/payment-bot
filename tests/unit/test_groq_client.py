@@ -249,6 +249,77 @@ def test_rate_limit_is_retried_then_succeeds() -> None:
     assert len(transport.requests) == 2
 
 
+#: The real body Groq returns, trimmed only of the org id. The wait sits ~250 characters in,
+#: which is why the delay is parsed from the untruncated body.
+_RATE_LIMIT_BODY = {
+    "error": {
+        "message": (
+            "Rate limit reached for model `llama-3.3-70b-versatile` in organization "
+            "`org_test` service tier `on_demand` on tokens per minute (TPM): Limit 12000, "
+            "Used 9383, Requested 8346. Please try again in 28.645s. Need more tokens? "
+            "Upgrade to Dev Tier today at https://console.groq.com/settings/billing"
+        ),
+        "type": "tokens",
+        "code": "rate_limit_exceeded",
+    }
+}
+
+
+@pytest.mark.unit
+def test_rate_limit_wait_honours_the_delay_groq_asks_for() -> None:
+    """Groq's window is per minute; 1s of backoff cannot clear it.
+
+    Every live email that reached the agent failed this way — told to wait ~28s, waited 1s,
+    escalated with no draft.
+    """
+
+    slept: list[float] = []
+    transport = FakeGroq((429, _RATE_LIMIT_BODY), (200, _text_completion("done")))
+    client = GroqLlmClient(api_key="gsk_test", transport=transport, sleep=slept.append)
+
+    assert client.converse(system="", messages=[], tools=[]).text == "done"
+    assert slept == [pytest.approx(29.145)]  # 28.645 + a margin so the window has rolled
+
+
+@pytest.mark.unit
+def test_absurd_retry_delay_is_capped() -> None:
+    """A wait far beyond one rate window means something else is wrong; do not hang."""
+
+    slept: list[float] = []
+    body = {"error": {"message": "Please try again in 8000s."}}
+    transport = FakeGroq((429, body), (200, _text_completion("done")))
+    client = GroqLlmClient(api_key="gsk_test", transport=transport, sleep=slept.append)
+
+    client.converse(system="", messages=[], tools=[])
+    assert slept == [65.0]
+
+
+@pytest.mark.unit
+def test_rate_limit_without_a_stated_delay_falls_back_to_backoff() -> None:
+    slept: list[float] = []
+    transport = FakeGroq((429, {"error": "slow down"}), (200, _text_completion("done")))
+    client = GroqLlmClient(api_key="gsk_test", transport=transport, sleep=slept.append)
+
+    client.converse(system="", messages=[], tools=[])
+    assert slept == [1.0]
+
+
+@pytest.mark.unit
+def test_server_errors_still_use_exponential_backoff() -> None:
+    """Only 429 carries a stated wait. 5xx keeps the original 1s, 2s escalation."""
+
+    slept: list[float] = []
+    transport = FakeGroq(
+        (503, {"error": "unavailable"}),
+        (503, {"error": "unavailable"}),
+        (200, _text_completion("done")),
+    )
+    client = GroqLlmClient(api_key="gsk_test", transport=transport, sleep=slept.append)
+
+    client.converse(system="", messages=[], tools=[])
+    assert slept == [1.0, 2.0]
+
+
 @pytest.mark.unit
 def test_persistent_server_error_becomes_a_client_error() -> None:
     transport = FakeGroq(

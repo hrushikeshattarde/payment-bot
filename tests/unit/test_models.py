@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from payment_bot.models import TransportProLoad
 
@@ -58,3 +59,65 @@ def test_unknown_fields_are_ignored() -> None:
 @pytest.mark.unit
 def test_load_id_str_helper(load: TransportProLoad) -> None:
     assert load.load_id_str == "2462934"
+
+
+# --- Identifiers the API sends as numbers ------------------------------------
+@pytest.mark.unit
+def test_numeric_settlement_id_is_accepted() -> None:
+    """Live load 2508651 returned `settlement_id` as an int and became unreadable.
+
+    One int in one earning line failed validation for the whole payload, so
+    `check_authorization` could not resolve and the gate failed closed with
+    `2508651=ERROR(...)`. A reply that was otherwise fine was blocked by a type mismatch.
+    """
+
+    load = TransportProLoad.model_validate(
+        {
+            "load_id": 1301650,
+            "earnings": [
+                {"title": "Brokerage Line Haul", "amount": "833.00", "settlement_id": 1301650}
+            ],
+        }
+    )
+    assert load.earnings[0].settlement_id == "1301650"
+
+
+@pytest.mark.unit
+def test_string_settlement_id_still_works() -> None:
+    load = TransportProLoad.model_validate(
+        {
+            "load_id": 1,
+            "earnings": [{"title": "x", "amount": "1.00", "settlement_id": "SET-9"}],
+        }
+    )
+    assert load.earnings[0].settlement_id == "SET-9"
+
+
+@pytest.mark.unit
+def test_numeric_identifiers_are_accepted_across_the_payload() -> None:
+    """The same coercion covers every sibling identifier, not just the one that broke."""
+
+    load = TransportProLoad.model_validate(
+        {
+            "load_id": 1,
+            "earnings": [{"title": "x", "amount": "1.00", "check_number": 55021}],
+            "account_information": {"dot_number": 3210987, "mc_number": 1746601},
+        }
+    )
+    assert load.earnings[0].check_number == "55021"
+    assert load.account_information is not None
+    assert load.account_information.dot_number == "3210987"
+    assert load.account_information.mc_number == "1746601"
+
+
+@pytest.mark.unit
+def test_a_boolean_is_not_an_identifier() -> None:
+    """Coercing int must not quietly turn True into "True"."""
+
+    with pytest.raises(ValidationError):
+        TransportProLoad.model_validate(
+            {
+                "load_id": 1,
+                "earnings": [{"title": "x", "amount": "1.00", "settlement_id": True}],
+            }
+        )

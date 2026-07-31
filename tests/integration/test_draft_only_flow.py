@@ -64,7 +64,8 @@ def _groq_payment_status_script() -> list[dict[str, Any]]:
     lid = "2462934"
     return [
         _tool_turn("c1", "tp_get_load_summary", {"load_id": lid}),
-        _tool_turn("c2", "compute_scheduled_pay_date", {"estimated_payment_date": "2026-08-19", "load_id": lid}),
+        # The client reports pay dates in the app's calendar: raw 2026-08-19 → 2026-08-20.
+        _tool_turn("c2", "compute_scheduled_pay_date", {"estimated_payment_date": "2026-08-20", "load_id": lid}),
         _tool_turn("c3", "tp_get_dispatch_history", {"load_id": lid}),
         _tool_turn("c4", "carrier_cross_check", {"load_id": lid, "system": "transport_pro"}),
         _tool_turn("c5", "tp_get_settlement_entries", {"load_id": lid}),
@@ -170,7 +171,7 @@ def test_groq_drives_the_loop_and_the_draft_is_posted_not_sent() -> None:
 
     # The gate still ran in full and passed.
     assert result.gate_result is not None and result.gate_result.allowed
-    assert [c.passed for c in result.gate_result.checks] == [True] * 5
+    assert [c.passed for c in result.gate_result.checks] == [True] * 6
 
     # The draft reached Slack, with the reviewer on Cc.
     assert len(slack.approvals) == 1
@@ -187,6 +188,7 @@ def test_groq_drives_the_loop_and_the_draft_is_posted_not_sent() -> None:
         "classify_intent",
         "extract_identifiers",
         "detect_sensitive_change",
+        "check_authorization",  # intake pre-check; the gate re-runs it on the draft
         "tp_get_load_summary",
         "compute_scheduled_pay_date",
         "tp_get_dispatch_history",

@@ -12,8 +12,34 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+
+
+def _coerce_identifier(value: object) -> object:
+    """Accept an identifier that arrives as a JSON number rather than a string.
+
+    Transport Pro returns ``settlement_id`` as an int on some loads (``1301650``) and as a
+    string on others. Because the whole payload is parsed as one model, a single int made an
+    entire load unreadable — which surfaced as ``authorization: 2508651=ERROR(...)`` and
+    blocked the reply, since an unresolvable authorization fails closed. Observed on live
+    mail.
+
+    These are opaque identifiers, never arithmetic, so normalising to ``str`` keeps one type
+    for every consumer instead of spreading ``str | int`` through the codebase. ``bool`` is
+    passed through deliberately so pydantic still rejects it — ``True`` is not an id.
+    """
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    return value
+
+
+#: An identifier the API may send as either a string or a number.
+IdentifierStr = Annotated[str | None, BeforeValidator(_coerce_identifier)]
 
 
 class _TpModel(BaseModel):
@@ -41,8 +67,8 @@ class AccountInformation(_TpModel):
     """Carrier account block (§4.3.0)."""
 
     company_name: str | None = None
-    dot_number: str | None = None
-    mc_number: str | None = None
+    dot_number: IdentifierStr = None
+    mc_number: IdentifierStr = None
     address: str | None = None
     city: str | None = None
     state: str | None = None
@@ -56,11 +82,11 @@ class Earning(_TpModel):
     title: str
     amount: Decimal
     payment_status: str | None = None
-    settlement_id: str | None = None
+    settlement_id: IdentifierStr = None
     estimated_payment_date: date | None = None
     actual_payment_date: date | None = None
     payment_method: str | None = None
-    check_number: str | None = None
+    check_number: IdentifierStr = None
 
     @property
     def is_paid(self) -> bool:
@@ -173,7 +199,7 @@ class DispatchRow(_TpModel):
     """One row of the Dispatch History screen (§4.3 ``tp_get_dispatch_history``)."""
 
     carrier_name: str
-    mc_number: str | None = None
+    mc_number: IdentifierStr = None
     freight_bill: Decimal | None = None
     dispatch_status: str  # "Delivered" | "Canceled Customer Refused" | ...
     pickup: str | None = None
@@ -207,7 +233,10 @@ class SettlementEntry(_TpModel):
 class FileDocument(_TpModel):
     """One document from the File History screen (§4.3 ``tp_get_file_history``)."""
 
-    file_type: str  # "Carrier Invoice" | "Bill Of Lading" | "Carrier Rate Agreement" | ...
+    file_type: str  # "Carrier Invoice" | "Bill of Lading" | "Carrier Rate Agreement" | ...
+    #: The API's ``fileTypeId``. Stable per tenant, unlike the display name, so this is what
+    #: document classification keys on (see :mod:`payment_bot.domain.documents`).
+    file_type_id: int | None = None
     index_date: date | None = None
     upload_date: date | None = None
     indexed_by: str | None = None

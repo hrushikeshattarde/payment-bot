@@ -27,7 +27,11 @@ htmlcov/
 *service-account*.json
 *service_account*.json
 *credentials*.json
+*creds*.json
 *-key.json
+# The console downloads a key as `<project-id>-<12 hex chars>.json`, which none of the
+# names above match. Ignore that shape too — the key belongs outside the repo anyway.
+*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].json
 *.pem
 *.p12
 secrets/
@@ -41,3 +45,8 @@ secrets/
 *.swp
 .DS_Store
 Thumbs.db
+gsheets-*.json
+
+# Internal business data — this repo is public; keep these local.
+factoring_domains.json
+docs/ESCALATIONS.md

@@ -83,13 +83,18 @@ def test_settlement_with_entries_grounds_amounts() -> None:
 
 
 @pytest.mark.unit
-def test_file_history_flags_and_matching(ctx: ToolContext) -> None:
+def test_file_history_reports_a_complete_load_as_complete(ctx: ToolContext) -> None:
+    """The sample load has an invoice and a BOL, so only the rate agreement is missing."""
+
     out = TpGetFileHistory().run(LoadIdInput(load_id="2462934"), ctx)
 
     assert out.has_carrier_invoice is True
     assert out.has_bol_or_pod is True
     assert out.has_cancel_confirmation is False
-    assert all(doc.matches_load for doc in out.documents)
+    assert out.document_count == 2
+    assert out.missing_documents == ["rate_agreement"]
+    assert out.all_required_present is False
+    assert {c.category for c in out.on_file} == {"carrier_invoice", "proof_of_delivery"}
 
 
 @pytest.mark.unit

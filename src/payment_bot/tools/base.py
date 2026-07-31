@@ -146,8 +146,16 @@ class ToolRegistry:
             )
         )
         if not ok:
+            # Log the arguments, not just the error. A tool failing repeatedly is nearly always
+            # the model sending the wrong shape, and without the arguments the trail shows
+            # "[ERR] compute_scheduled_pay_date" seven times with no way to tell why.
             _log.warning(
                 "tool_failed",
-                extra={"tool": name, "correlation_id": ctx.correlation_id, "error": payload},
+                extra={
+                    "tool": name,
+                    "correlation_id": ctx.correlation_id,
+                    "error": payload,
+                    "arguments": raw_input,
+                },
             )
         return ToolOutcome(payload=payload, ok=ok)

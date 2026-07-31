@@ -52,7 +52,7 @@ import base64
 import json
 import urllib.parse
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from payment_bot.clients.http import HttpResponse, HttpTransport, UrllibTransport
@@ -248,6 +248,28 @@ class TransportProHttpClient:
         except Exception as exc:  # pydantic ValidationError → our error envelope
             raise ClientError(f"Transport Pro: unreadable load payload for {load_id!r}: {exc}") from exc
 
+        # Pay dates arrive one calendar day behind the Transport Pro application. The UI
+        # stores date-typed pay fields at midnight EDT; the Public API serialises them
+        # through a UTC-4 shift (midnight minus four hours = 20:00 the previous day) and
+        # then truncates to a date. Verified on load 2479097: the app's "Date To Pay" reads
+        # 2026-08-05, the API returns 2026-08-04. Add the day back here, at the live-API
+        # boundary, so every consumer — the grounding ledger, the Mon/Thu rule, the drafts —
+        # speaks the application's calendar. The mock client is untouched: sample data is
+        # authored in app-space already.
+        load = load.model_copy(
+            update={
+                "earnings": [
+                    e.model_copy(
+                        update={
+                            "estimated_payment_date": _app_pay_date(e.estimated_payment_date),
+                            "actual_payment_date": _app_pay_date(e.actual_payment_date),
+                        }
+                    )
+                    for e in load.earnings
+                ]
+            }
+        )
+
         if self._cache_loads:
             self._load_cache[key] = load
         return load
@@ -315,15 +337,31 @@ class TransportProHttpClient:
     def get_file_history(self, load_id: str) -> list[FileDocument]:
         """Indexed documents via ``/files/search?recordType=loads&recordId=``.
 
-        ``recordId`` is Transport Pro's **internal** load record id, which we take from the
-        ``payment_information`` response rather than from the carrier-facing number.
+        Which id ``recordId`` wants is tenant-dependent, and getting it wrong returns an
+        empty list rather than an error — a silent "no documents on file", which would make
+        the bot tell a carrier their paperwork is missing when it is not. So we try the
+        **carrier-facing load number first** (confirmed working against the live tenant),
+        and fall back to the internal record id echoed by ``payment_information``.
         """
 
-        load = self.get_load(load_id)
-        payload = self._get(
-            "/files/search",
-            {"recordType": "loads", "recordId": str(load.internal_record_id)},
-        )
+        requested = load_id.strip()
+        docs = self._file_search(requested)
+        if docs:
+            return docs
+
+        internal = str(self.get_load(load_id).internal_record_id)
+        if internal == requested:
+            return []
+        fallback = self._file_search(internal)
+        if fallback:
+            _log.info(
+                "files_found_under_internal_record_id",
+                extra={"requested": requested, "internal": internal},
+            )
+        return fallback
+
+    def _file_search(self, record_id: str) -> list[FileDocument]:
+        payload = self._get("/files/search", {"recordType": "loads", "recordId": record_id})
         docs: list[FileDocument] = []
         for row in self._results(payload, path="files/search"):
             file_type = _text(row.get("fileTypeName"))
@@ -331,9 +369,11 @@ class TransportProHttpClient:
                 continue
             created = _as_date(row.get("dateCreated"))
             uploader = row.get("uploadById")
+            type_id = row.get("fileTypeId")
             docs.append(
                 FileDocument(
                     file_type=file_type,
+                    file_type_id=int(type_id) if isinstance(type_id, int) else None,
                     index_date=created,
                     upload_date=created,
                     indexed_by=str(uploader) if uploader is not None else None,
@@ -444,6 +484,16 @@ def _text(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _app_pay_date(value: date | None) -> date | None:
+    """The pay date as the Transport Pro application displays it (EDT).
+
+    See the comment in :meth:`TransportProHttpClient.get_load` — the Public API reports
+    date-typed pay fields one calendar day early, verified against the app on load 2479097.
+    """
+
+    return value + timedelta(days=1) if value is not None else None
 
 
 def _dig(row: dict[str, Any], *keys: str) -> dict[str, Any] | None:

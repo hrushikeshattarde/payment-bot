@@ -9,7 +9,10 @@
     "city": "Chicago",
     "state": "IL",
     "zip": "60634",
-    "remit_to": { "send_payment_to": "self", "company_name": "Idea Expedited, Inc" }
+    "remit_to": {
+      "send_payment_to": "self",
+      "company_name": "Idea Expedited, Inc"
+    }
   },
   "deductions": [],
   "earnings": [
@@ -40,13 +43,19 @@
         "type": "Pickup",
         "city": "Spokane",
         "state": "Washington",
-        "date": { "timestamp": "2026-06-23T16:24:00Z", "timezone": "PDT" }
+        "date": {
+          "timestamp": "2026-06-23T16:24:00Z",
+          "timezone": "PDT"
+        }
       },
       {
         "type": "Delivery",
         "city": "Lithia Springs",
         "state": "Georgia",
-        "date": { "timestamp": "2026-06-29T16:00:00Z", "timezone": "EDT" }
+        "date": {
+          "timestamp": "2026-06-29T16:00:00Z",
+          "timezone": "EDT"
+        }
       }
     ]
   }

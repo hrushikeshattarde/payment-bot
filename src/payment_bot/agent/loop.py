@@ -31,6 +31,22 @@ from payment_bot.tools.submit import SubmitDraftOutput
 
 _log = get_logger("agent")
 
+#: Sent when the model answers in prose instead of calling the terminal tool.
+#:
+#: Observed repeatedly on live mail: the agent runs the whole procedure correctly — fourteen
+#: clean tool calls — then writes its answer as text and stops. The work is done; it is
+#: delivered to the wrong place. The reply must arrive through `submit_draft`, because that
+#: call is what carries the recipient, the disclosed load ids and the per-figure citations the
+#: pre-send gate checks. Prose carries none of them, so there is nothing to gate.
+#:
+#: A prompt instruction saying so did not settle it, hence enforcing it here.
+_SUBMIT_NUDGE = (
+    "That reply was not delivered — text outside a tool call is discarded, so the carrier "
+    "received nothing. Call `submit_draft` now with that same answer as `reply_body`, plus "
+    "`to`, `load_ids`, and one citation per amount and date you stated. Do not restate the "
+    "reply as text."
+)
+
 
 @dataclass(slots=True)
 class AgentResult:
@@ -53,11 +69,15 @@ class AgentLoop:
         *,
         max_iterations: int = 12,
         max_tokens: int = 1024,
+        max_submit_nudges: int = 2,
     ) -> None:
         self._llm = llm
         self._registry = registry
         self._max_iterations = max_iterations
         self._max_tokens = max_tokens
+        #: How many times to remind the model to deliver via `submit_draft` before giving up.
+        #: Bounded so a model that simply will not call the tool cannot spin.
+        self._max_submit_nudges = max(0, max_submit_nudges)
 
     def run(
         self,
@@ -70,19 +90,42 @@ class AgentLoop:
         allowed = set(allowed_tools)
         specs = [self._registry.get(name).spec() for name in allowed_tools]
         messages: list[Message] = [Message(Role.USER, [TextBlock(intake_prompt)])]
+        nudges = 0
 
         for iteration in range(1, self._max_iterations + 1):
             response = self._llm.converse(
                 system=system, messages=messages, tools=specs, max_tokens=self._max_tokens
             )
-            messages.append(Message(Role.ASSISTANT, response.content))
+            # provider_state carries anything the provider needs echoed back next turn —
+            # a reasoning model's chain of thought, without which it forgets this turn.
+            messages.append(
+                Message(Role.ASSISTANT, response.content, provider_state=response.provider_state)
+            )
 
             tool_uses = response.tool_uses
             if not tool_uses:
-                # Model answered with text and no tool call — nothing to send downstream.
+                # Answered in prose. The work may be complete but it was not delivered, so
+                # ask once (or twice) for the terminal tool call before giving up.
+                if nudges < self._max_submit_nudges:
+                    nudges += 1
+                    _log.info(
+                        "agent_submit_nudge",
+                        extra={
+                            "correlation_id": ctx.correlation_id,
+                            "iteration": iteration,
+                            "nudge": nudges,
+                        },
+                    )
+                    messages.append(Message(Role.USER, [TextBlock(_SUBMIT_NUDGE)]))
+                    continue
+
                 _log.info(
                     "agent_end_turn",
-                    extra={"correlation_id": ctx.correlation_id, "iteration": iteration},
+                    extra={
+                        "correlation_id": ctx.correlation_id,
+                        "iteration": iteration,
+                        "nudges": nudges,
+                    },
                 )
                 return AgentResult(
                     draft=None,

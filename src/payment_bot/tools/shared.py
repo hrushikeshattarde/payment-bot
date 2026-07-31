@@ -11,8 +11,9 @@ import re
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
 from payment_bot.domain import compute_carrier_rate as domain_carrier_rate
 from payment_bot.domain import compute_scheduled_pay_date as domain_scheduled_pay_date
@@ -36,7 +37,84 @@ _STOPWORDS = frozenset(
     }
 )  # fmt: skip
 
+#: Domains where an address proves nothing about organisation membership.
+#:
+#: Domain-level contact matching (see ``CheckAuthorization``) must never extend to these:
+#: a carrier whose contact on file is ``owner@gmail.com`` does not make every gmail.com
+#: sender an authorized party. Not hypothetical — probed on live loads, gmail.com,
+#: hotmail.com and bellsouth.net each appear as the *only* contact domain on real carrier
+#: records.
+_FREE_MAIL_DOMAINS = frozenset(
+    {
+        "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "rocketmail.com",
+        "hotmail.com", "outlook.com", "live.com", "msn.com", "aol.com", "icloud.com",
+        "me.com", "mac.com", "protonmail.com", "proton.me", "mail.com", "gmx.com",
+        "gmx.net", "zoho.com", "comcast.net", "att.net", "verizon.net", "sbcglobal.net",
+        "bellsouth.net", "cox.net", "charter.net", "earthlink.net",
+    }
+)  # fmt: skip
+
 _LOAD_ID_RE = re.compile(r"\b\d{6,7}\b")
+
+
+def _coerce_id_to_str(value: object) -> object:
+    """Accept a numeric id and stringify it.
+
+    Live models pass ``load_id`` as an integer despite the schema saying string — observed
+    burning three failed ``compute_scheduled_pay_date`` calls in one run before the model
+    stumbled onto quoting it. Pydantic v2 does not coerce int → str on its own, and a type
+    mismatch this trivial is not worth an agent iteration.
+    """
+
+    return str(value) if isinstance(value, int) else value
+
+
+#: A load id argument: string, but tolerant of the model sending a bare integer.
+LoadIdStr = Annotated[str, BeforeValidator(_coerce_id_to_str)]
+
+#: Labels that mean the following 6-7 digit number is NOT a load id.
+#:
+#: Carrier mail is full of 6-7 digit numbers that have nothing to do with loads. A live email
+#: titled "Payment Status: Load#2433209" escalated as a QuickBooks load because it also said
+#: "RTS Financial Service P.O. Box 840267" — the mailing address was read as a load, and one
+#: non-Transport-Pro id stops the whole email. MC numbers sit next to carrier names for the
+#: same reason.
+#:
+#: Deliberately excludes "ref"/"reference": factoring templates write the load itself as
+#: "Reference#: 2520504".
+_NOT_A_LOAD_LABEL_RE = re.compile(
+    r"(?:p\.?\s*o\.?\s*box|\bpob\b|\bbox|\bmc\b|\bmc[#-]|\bdot\b|\bsuite\b|\bste\b|\bphone\b"
+    r"|\btel\b|\bfax\b|\bext\b|\bzip\b)\W{0,4}$",
+    re.IGNORECASE,
+)
+
+#: Corporate suffixes that mean the PRECEDING number is a company registration, not a load.
+#:
+#: Numbered companies are everywhere in trucking, and their registration numbers are load-id
+#: shaped. Observed on live mail: "KARNAL FREIGHT SYSTEM O/B 9591699 CANADA INC. (USD)" put a
+#: phantom 7-digit "load" on an answerable email — the authorization pre-check then burned a
+#: Transport Pro call on it and got HTTP 400 — and "CARRIER 10422126 CANADA INC DBA …" is the
+#: same shape. The prefix labels above cannot catch these: the tell sits AFTER the number.
+_NOT_A_LOAD_SUFFIX_RE = re.compile(
+    r"^\W{0,4}(?:(?:canada|ontario|quebec|alberta|manitoba|saskatchewan|b\.?c\.?|usa)\s+)?"
+    r"(?:inc\b|incorporated\b|ltd\b|limited\b|llc\b|corp\b|corporation\b)",
+    re.IGNORECASE,
+)
+
+
+def _load_ids_in(text: str) -> list[str]:
+    """6-7 digit ids in ``text``, skipping ones a nearby label disqualifies."""
+
+    found: list[str] = []
+    for match in _LOAD_ID_RE.finditer(text):
+        before = text[max(0, match.start() - 24) : match.start()]
+        if _NOT_A_LOAD_LABEL_RE.search(before):
+            continue
+        after = text[match.end() : match.end() + 24]
+        if _NOT_A_LOAD_SUFFIX_RE.search(after):
+            continue
+        found.append(match.group())
+    return found
 _MONEY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?")
 _INVOICE_RE = re.compile(r"invoice\s*(?:no\.?|number|#)?\s*:?\s*(\d{3,})", re.IGNORECASE)
 _COMPANY_RE = re.compile(
@@ -45,6 +123,53 @@ _COMPANY_RE = re.compile(
 _COLUMN_HINT_RE = re.compile(
     r"reference\s*#|p\.?\s*o\.?\s*(?:number|#)|load\s*#|invoice\s*#|pro\s*#", re.IGNORECASE
 )
+
+
+#: Argument descriptions reach the model as JSON Schema, and an undescribed argument is one it
+#: has to guess. Measured on live mail: `compute_scheduled_pay_date` failed seven times and
+#: `carrier_cross_check` three, each burning an iteration, purely because the expected shape
+#: was never stated. Only 3 of 20 arguments carried a description.
+_LOAD_ID_FIELD = Field(
+    description=(
+        "The 6 or 7 digit load id on its own, digits only — e.g. 2462934. Not an MC number, "
+        "not an invoice number, no prefix."
+    )
+)
+_SYSTEM_FIELD = Field(
+    description=(
+        "Which system holds the load, taken from the routing map in the intake message: "
+        "'transport_pro' for 7-digit ids, 'quickbooks' for 6-digit."
+    )
+)
+
+
+def _sender_domain(sender_email: str) -> str:
+    """The registrable domain of an address, lowercased. Empty when there isn't one."""
+
+    return sender_email.rsplit("@", 1)[-1].strip().lower() if "@" in sender_email else ""
+
+
+def _is_configured_factor_domain(
+    factoring_company: str, sender_email: str, ctx: ToolContext
+) -> bool:
+    """True when the sender's domain is configured for this load's factoring company.
+
+    Matched on the whole domain, never a substring, and the configured factor name must be
+    contained in the company recorded on the load — so an entry for "rts financial" answers
+    for "RTS Financial Service, Inc" but not for an unrelated factor.
+    """
+
+    domain = _sender_domain(sender_email)
+    if not domain:
+        return False
+    on_file = factoring_company.strip().lower()
+    for configured_name, domains in ctx.settings.factoring_domains.items():
+        key = configured_name.strip().lower()
+        if not key or key not in on_file:
+            continue
+        if any(domain == str(d).strip().lower().lstrip("@") for d in domains):
+            return True
+    return False
 
 
 def company_tokens(name: str | None) -> set[str]:
@@ -56,11 +181,33 @@ def company_tokens(name: str | None) -> set[str]:
     return {t for t in tokens if len(t) >= 4 and t not in _STOPWORDS}
 
 
+#: Spelled-out date forms accepted in addition to ISO.
+#:
+#: Only formats whose month is a NAME. Every one of these is unambiguous, unlike "07/29/2026"
+#: — which could be July 29 or 29 July depending on locale, and where guessing wrong would
+#: silently move a payment date. Those stay rejected.
+#:
+#: This leniency exists because the skill prompt instructs the model to *write* dates as
+#: "Thursday, August 20, 2026", and on live mail it then passed that form back as a tool
+#: argument. Describing the schema helped but did not settle it: one run made six clean calls
+#: and the next failed seven times on the same email. Accepting what the model actually
+#: produces removes the failure mode instead of hoping it reads the schema.
+_SPELLED_DATE_FORMATS = (
+    "%A, %B %d, %Y",  # Thursday, August 20, 2026
+    "%A %B %d, %Y",  # Thursday August 20, 2026
+    "%B %d, %Y",  # August 20, 2026
+    "%b %d, %Y",  # Aug 20, 2026
+    "%d %B %Y",  # 20 August 2026
+    "%d %b %Y",  # 20 Aug 2026
+)
+
+
 def _parse_pay_date(value: str | None) -> date | None:
-    """Parse an API pay date into an EDT calendar date.
+    """Parse an API or model-supplied pay date into an EDT calendar date.
 
     Bare ``YYYY-MM-DD`` values are calendar dates (no shift). Full timestamps are
-    converted from their offset into EDT (fixed UTC-4) before the date is taken.
+    converted from their offset into EDT (fixed UTC-4) before the date is taken. Dates with a
+    named month are also accepted — see :data:`_SPELLED_DATE_FORMATS`.
     """
 
     if value is None or not value.strip():
@@ -73,8 +220,16 @@ def _parse_pay_date(value: str | None) -> date | None:
                 dt = dt.replace(tzinfo=UTC)
             return (dt.astimezone(UTC) - timedelta(hours=4)).date()
         return date.fromisoformat(text)
-    except ValueError as exc:
-        raise ToolError(f"invalid date {value!r}: {exc}") from exc
+    except ValueError as iso_error:
+        for fmt in _SPELLED_DATE_FORMATS:
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        raise ToolError(
+            f"invalid date {value!r}: {iso_error}. Use ISO YYYY-MM-DD, exactly as the load "
+            "summary returned it."
+        ) from iso_error
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +270,7 @@ class ExtractIdentifiers(Tool):
         assert isinstance(params, ExtractIdentifiersInput)
         text = "\n".join(p for p in (params.subject, params.body, params.thread_text) if p)
 
-        load_ids = _dedupe(_LOAD_ID_RE.findall(text))
+        load_ids = _dedupe(_load_ids_in(text))
         invoice_numbers = _dedupe(_INVOICE_RE.findall(text))
 
         stated_rates: list[StatedRate] = []
@@ -123,7 +278,7 @@ class ExtractIdentifiers(Tool):
             amounts = [_money(m) for m in _MONEY_RE.findall(line)]
             if not amounts:
                 continue
-            line_ids = _LOAD_ID_RE.findall(line)
+            line_ids = _load_ids_in(line)
             load_ref = line_ids[0] if len(line_ids) == 1 else None
             stated_rates.extend(StatedRate(load_id=load_ref, amount=a) for a in amounts)
 
@@ -159,7 +314,7 @@ class ExtractIdentifiers(Tool):
 # route_load
 # ---------------------------------------------------------------------------
 class RouteLoadInput(BaseModel):
-    load_id: str
+    load_id: LoadIdStr
 
 
 class RouteLoadOutput(BaseModel):
@@ -204,15 +359,101 @@ class DetectSensitiveChangeOutput(BaseModel):
 
 # Phrase → flag. NOA/factoring only escalates on an action verb (add/update/attach…),
 # so those are handled separately below rather than by bare keyword.
-_BANK_PHRASES = (
+#
+# These are split by whether the phrase is self-evidently a *request*. "update bank" is one
+# whatever surrounds it. "account number" is not — it appears in every remit-to footer and
+# every invoice. Escalating on the bare nouns meant a carrier asking only "what is the rate
+# on load X" got refused because the factor's standard payment block sat in the signature.
+#: Phrases that are a change request on their own.
+_BANK_REQUEST_PHRASES = (
     "bank change", "change bank", "update bank", "new bank", "banking information",
-    "routing number", "account number", "ach", "direct deposit", "void check",
-    "voided check", "remittance", "update payment info", "change payment",
+    "update payment info", "change payment", "void check", "voided check",
 )  # fmt: skip
+#: Payment-detail nouns. Only a request when a change word sits near them.
+#:
+#: Bare "bank" belongs here rather than in the request list: "update our bank account" must
+#: escalate, while "Bank Name: Fifth Third Bank" in a remit-to footer must not. Requiring a
+#: nearby change word is what separates those.
+_BANK_DETAIL_PHRASES = (
+    "routing number", "account number", "ach", "direct deposit", "remittance",
+    "payment method", "remit to", "remit-to", "bank", "bank account", "bank details",
+)  # fmt: skip
+#: Words that turn a payment-detail mention into an instruction aimed at us.
+_CHANGE_WORDS = (
+    "update", "updated", "change", "changed", "revise", "revised", "switch", "switched",
+    "correct", "corrected", "new", "different", "going forward", "effective", "instead",
+    "no longer", "replace", "redirect", "moving forward",
+    # "…to the account below" / "…as follows" mean details are being supplied in this email,
+    # which is the actual shape of a redirect. Kept narrow on purpose: adding a verb like
+    # "send" would re-catch ordinary asks such as "send us the remittance advice".
+    "below", "as follows", "following",
+)  # fmt: skip
+#: A change word within ~8 words of a payment detail, in either order.
+#:
+#: The ``\b`` anchors are load-bearing. Without them "ach" matched inside "e**ach**", so
+#: "the status of each load listed below" read as a request to redirect payment by ACH.
+_BANK_CHANGE_REQUEST_RE = re.compile(
+    r"(?:\b(?:{changes})\b\W(?:\w+\W){{0,8}}?\b(?:{details})\b"
+    r"|\b(?:{details})\b\W(?:\w+\W){{0,8}}?\b(?:{changes})\b)".format(
+        changes="|".join(re.escape(w) for w in _CHANGE_WORDS),
+        details="|".join(re.escape(d) for d in _BANK_DETAIL_PHRASES),
+    ),
+    re.IGNORECASE,
+)
 _CONTACT_PHRASES = (
     "change email", "update email", "new email address", "change our email",
     "update contact", "new contact email", "change of email",
 )  # fmt: skip
+
+
+def _phrase_pattern(phrase: str) -> re.Pattern[str]:
+    """Match ``phrase`` only as whole words.
+
+    Plain substring matching made short phrases catastrophically broad: ``"ach"`` matched
+    inside "att**ach**ed", "e**ach**" and "re**ach**", so "please see attached invoice"
+    escalated as a suspected bank-change request. Measured on live mail, that single phrase
+    accounted for a third of all escalations, four of them with no other signal present.
+    """
+
+    return re.compile(rf"\b{re.escape(phrase)}\b", re.IGNORECASE)
+
+
+#: Phrases paired with their whole-word patterns, so evidence still names the phrase.
+_BANK_REQUEST_PATTERNS = tuple((p, _phrase_pattern(p)) for p in _BANK_REQUEST_PHRASES)
+_CONTACT_PATTERNS = tuple((p, _phrase_pattern(p)) for p in _CONTACT_PHRASES)
+
+#: Start of a quoted reply / forwarded block. Everything from here on was written by someone
+#: else, earlier — usually us.
+_QUOTE_MARKERS = (
+    re.compile(r"^\s*>", re.MULTILINE),
+    re.compile(r"^\s*On .{0,120}\bwrote:\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^-+\s*Original Message\s*-+\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^-+\s*Forwarded message\s*-+\s*$", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^\s*From:.{0,80}Sent:", re.MULTILINE | re.IGNORECASE | re.DOTALL),
+)
+
+
+def strip_quoted(body: str) -> str:
+    """Return only the part of ``body`` the sender wrote in *this* message.
+
+    A change request lives in what someone just wrote, not in the thread they quoted. Two
+    live emails escalated on ``"direct deposit"`` that appeared solely inside our own earlier
+    reply, quoted back:
+
+        > Settle Date 07/20/2026
+        > Amount $427.50
+        > Payment Method Direct deposit
+
+    Nobody was requesting anything. Scanning quoted history means every mention of a payment
+    detail keeps re-escalating the thread for as long as it stays alive.
+    """
+
+    earliest = len(body)
+    for marker in _QUOTE_MARKERS:
+        found = marker.search(body)
+        if found is not None:
+            earliest = min(earliest, found.start())
+    return body[:earliest]
 _NOA_ACTION_RE = re.compile(
     r"(add|attach|update|change|set\s*up|setup|assign|register|remove|release)\D{0,30}"
     r"(noa|notice of assignment|factor)",
@@ -232,21 +473,28 @@ class DetectSensitiveChange(Tool):
 
     def run(self, params: BaseModel, ctx: ToolContext) -> DetectSensitiveChangeOutput:
         assert isinstance(params, DetectSensitiveChangeInput)
-        haystack = f"{params.subject}\n{params.body}".lower()
+        # Only what the sender wrote in this message, never the quoted thread below it.
+        written = f"{params.subject}\n{strip_quoted(params.body)}"
+        haystack = written.lower()
         flags: list[SensitiveFlag] = []
         evidence: list[str] = []
 
-        for phrase in _BANK_PHRASES:
-            if phrase in haystack:
+        for phrase, pattern in _BANK_REQUEST_PATTERNS:
+            if pattern.search(haystack):
                 _add(flags, SensitiveFlag.BANK_CHANGE)
                 evidence.append(f"bank: matched {phrase!r}")
 
-        for match in _NOA_ACTION_RE.finditer(f"{params.subject}\n{params.body}"):
+        # A payment-detail noun alone is not a request — a change word must sit near it.
+        for match in _BANK_CHANGE_REQUEST_RE.finditer(written):
+            _add(flags, SensitiveFlag.BANK_CHANGE)
+            evidence.append(f"bank: change requested — {' '.join(match.group(0).split())!r}")
+
+        for match in _NOA_ACTION_RE.finditer(written):
             _add(flags, SensitiveFlag.NOA_SETUP_CHANGE)
             evidence.append(f"noa_setup: matched {match.group(0).strip()!r}")
 
-        for phrase in _CONTACT_PHRASES:
-            if phrase in haystack:
+        for phrase, pattern in _CONTACT_PATTERNS:
+            if pattern.search(haystack):
                 _add(flags, SensitiveFlag.EMAIL_CONTACT_CHANGE)
                 evidence.append(f"contact: matched {phrase!r}")
 
@@ -272,15 +520,27 @@ class DetectSensitiveChange(Tool):
 # check_authorization
 # ---------------------------------------------------------------------------
 class CheckAuthorizationInput(BaseModel):
-    sender_email: str
-    sender_name: str | None = None
-    load_id: str
-    system: System
+    sender_email: str = Field(
+        description="The sender's email address exactly as it appeared in the From header."
+    )
+    sender_name: str | None = Field(
+        default=None, description="The sender's display name from the From header, if any."
+    )
+    load_id: LoadIdStr = _LOAD_ID_FIELD
+    system: System = _SYSTEM_FIELD
 
 
 class CheckAuthorizationOutput(BaseModel):
     ok: bool = True
     decision: AuthDecision
+    #: The policy-resolved verdict the agent acts on: true when this sender may receive
+    #: disclosure about this load — ALLOW, or FACTORING when configuration permits
+    #: answering the factoring company on file. The skill prompts key off this field, not
+    #: ``decision``, so the model never has to know the deployment's factoring policy.
+    #: Observed before this existed: a factoring sender the pipeline had authorized was
+    #: refused by the model ("unable to provide rate details due to authorization
+    #: restrictions") because the prompt said only ALLOW counts.
+    authorized: bool = False
     matched_party: str | None = None
     reason: str
 
@@ -309,30 +569,73 @@ class CheckAuthorization(Tool):
         if sender in {e.lower() for e in auth.authorized_emails}:
             return CheckAuthorizationOutput(
                 decision=AuthDecision.ALLOW,
+                authorized=True,
                 matched_party=auth.carrier_company,
                 reason="sender is an explicitly authorized contact for this load",
             )
         if sender in {e.lower() for e in auth.factoring_emails}:
             return CheckAuthorizationOutput(
                 decision=AuthDecision.FACTORING,
+                authorized=ctx.settings.allow_factoring,
                 matched_party=auth.factoring_company,
                 reason="sender is the factoring company on file",
+            )
+
+        # Same organisation as an explicitly authorized contact. Carriers write from several
+        # mailboxes at one domain — accounting@ asks about the load whose dispatch@ is on
+        # file — and requiring the exact address denied them (observed live: load 2480109,
+        # contact on file at sky-expressllc.com, payment question from accounting@ there).
+        # The domain must match exactly, and free-mail providers are excluded: an address at
+        # a shared provider proves nothing about who the sender works for.
+        sender_domain = _sender_domain(sender)
+        if sender_domain and sender_domain not in _FREE_MAIL_DOMAINS:
+            contact_domains = {_sender_domain(e) for e in auth.authorized_emails}
+            if sender_domain in contact_domains:
+                return CheckAuthorizationOutput(
+                    decision=AuthDecision.ALLOW,
+                    authorized=True,
+                    matched_party=auth.carrier_company,
+                    reason="sender's domain matches an authorized contact's domain on this load",
+                )
+
+        # A factoring sender the operator has explicitly vouched for. Two independent
+        # conditions: this load really is factored, and the sender's exact registrable domain
+        # is configured for *that* factor — so RTS cannot be answered about an OTR-factored
+        # load. This is the only path that yields FACTORING, because it is the only one that
+        # is safe to switch on via `allow_factoring`.
+        if auth.factoring_company and _is_configured_factor_domain(
+            auth.factoring_company, sender, ctx
+        ):
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.FACTORING,
+                authorized=ctx.settings.allow_factoring,
+                matched_party=auth.factoring_company,
+                reason="sender domain is configured for the factoring company on this load",
             )
 
         carrier_toks = company_tokens(auth.carrier_company)
         if any(tok in domain for tok in carrier_toks):
             return CheckAuthorizationOutput(
                 decision=AuthDecision.ALLOW,
+                authorized=True,
                 matched_party=auth.carrier_company,
                 reason="sender domain matches the carrier company on the load",
             )
 
+        # Name-only resemblance to the factor is NOT authorization. It used to return
+        # FACTORING, which meant any domain containing "finance" would have been disclosed to
+        # the moment `allow_factoring` was enabled. Say so in the reason so a human reviewing
+        # the escalation can add the domain to PAYBOT_FACTORING_DOMAINS if it is genuine.
         factor_toks = company_tokens(auth.factoring_company)
         if factor_toks and any(tok in domain for tok in factor_toks):
             return CheckAuthorizationOutput(
-                decision=AuthDecision.FACTORING,
-                matched_party=auth.factoring_company,
-                reason="sender domain matches the factoring company on file",
+                decision=AuthDecision.DENY,
+                matched_party=None,
+                reason=(
+                    f"sender resembles the factoring company on file "
+                    f"({auth.factoring_company!r}) but its domain is not configured; add it "
+                    "to PAYBOT_FACTORING_DOMAINS if it is genuine"
+                ),
             )
 
         return CheckAuthorizationOutput(
@@ -346,8 +649,8 @@ class CheckAuthorization(Tool):
 # carrier_cross_check
 # ---------------------------------------------------------------------------
 class CarrierCrossCheckInput(BaseModel):
-    load_id: str
-    system: System
+    load_id: LoadIdStr = _LOAD_ID_FIELD
+    system: System = _SYSTEM_FIELD
 
 
 class CarrierCrossCheckOutput(BaseModel):
@@ -416,10 +719,32 @@ class CarrierCrossCheck(Tool):
 # compute_scheduled_pay_date
 # ---------------------------------------------------------------------------
 class ComputeScheduledPayDateInput(BaseModel):
-    estimated_payment_date: str | None = None
-    actual_payment_date: str | None = None
-    tz: str = "EDT"
-    load_id: str | None = None
+    """Dates in, ISO only.
+
+    The descriptions are load-bearing, not documentation. This tool accepts ISO dates and
+    nothing else, and the skill prompt separately tells the model to *write* dates as
+    "Thursday, August 20, 2026" — so on live mail it passed that form as an argument and the
+    tool rejected it seven times in a row, burning most of the iteration budget before
+    stumbling onto a working call. The schema reaches the model; say the format in it.
+    """
+
+    estimated_payment_date: str | None = Field(
+        default=None,
+        description=(
+            "ISO date, YYYY-MM-DD (e.g. 2026-07-29). Copy it verbatim from the earning line "
+            "returned by tp_get_load_summary. Never a human-readable date."
+        ),
+    )
+    actual_payment_date: str | None = Field(
+        default=None,
+        description="ISO date, YYYY-MM-DD, when the line is already paid. Same format rule.",
+    )
+    tz: str = Field(
+        default="EDT", description="Timezone for the calendar date. Leave as the default."
+    )
+    load_id: LoadIdStr | None = Field(
+        default=None, description="The load id this earning line belongs to."
+    )
 
 
 class ComputeScheduledPayDateOutput(BaseModel):
@@ -435,8 +760,9 @@ class ComputeScheduledPayDate(Tool):
 
     name = "compute_scheduled_pay_date"
     description = (
-        "Given an earning line's estimated (and optional actual) payment date, return the "
-        "carrier-facing pay date via the Monday/Thursday rule. Never guess dates yourself; "
+        "Given an earning line's estimated (and optional actual) payment date as ISO "
+        "YYYY-MM-DD, return the carrier-facing pay date via the Monday/Thursday rule. Pass "
+        "the dates exactly as tp_get_load_summary returned them. Never guess dates yourself; "
         "always call this."
     )
     input_model = ComputeScheduledPayDateInput
@@ -445,6 +771,25 @@ class ComputeScheduledPayDate(Tool):
         assert isinstance(params, ComputeScheduledPayDateInput)
         estimated = _parse_pay_date(params.estimated_payment_date)
         actual = _parse_pay_date(params.actual_payment_date)
+
+        # Input dates must already be grounded (§5). This tool computes from model-supplied
+        # arguments and records its result in the ledger — which made an invented input the
+        # one way a fabrication could be laundered into "grounded". Observed live on load
+        # 2458141: Transport Pro said estimated 2026-08-23 and not paid; the model passed a
+        # fabricated actual date of 2026-06-13, and the draft's "Saturday, June 13, 2026"
+        # sailed through the gate's date check while its invented amounts were blocked.
+        # A legitimate call always passes this check, because tp_get_load_summary grounds
+        # every earning line's estimated and actual date as it reads the load.
+        for label, value in (
+            ("estimated_payment_date", estimated),
+            ("actual_payment_date", actual),
+        ):
+            if value is not None and value not in ctx.ledger.grounded_dates:
+                raise ToolError(
+                    f"{label} {value.isoformat()} does not match any date a tool returned "
+                    "in this run. Call tp_get_load_summary for this load first and copy the "
+                    "earning line's dates verbatim — never supply a date of your own."
+                )
         try:
             result = domain_scheduled_pay_date(
                 estimated_payment_date=estimated, actual_payment_date=actual
@@ -482,11 +827,17 @@ class ClassifyIntentOutput(BaseModel):
     secondary_asks: list[str]
 
 
+#: Phrases that mean "check our rate against yours".
+#:
+#: Bare "advance" used to be here, and it classified a *sign-off* as a rate request: "Thank
+#: you in Advance, ACDS TEAM" scored rate_verification at 0.9 confidence, so the bot asked a
+#: carrier chasing payment to supply a rate. "fees" and "claim" were the same shape — words
+#: that appear in ordinary payment chatter. Phrases only, and matched as whole words.
 _RATE_SIGNALS = (
     "rate verification", "verify the rate", "verify rate", "confirm the rate", "confirm rate",
-    "rate con", "rate confirmation", "rate agreement", "advance", "advances", "deduction",
-    "deductions", "chargeback", "charge back", "short pay", "short-pay", "shortpay", "fees",
-    "claim", "claims", "confirm noa", "notice of assignment", "factoring",
+    "rate con", "rate confirmation", "rate agreement", "advance payment", "payment advance",
+    "cash advance", "deduction", "deductions", "chargeback", "charge back", "short pay",
+    "short-pay", "shortpay", "confirm noa", "notice of assignment", "factoring",
 )  # fmt: skip
 _PAYMENT_SIGNALS = (
     "payment status", "when will i be paid", "when do i get paid", "get paid", "estimated payment",
@@ -495,6 +846,16 @@ _PAYMENT_SIGNALS = (
     "still waiting on payment", "when is payment",
 )  # fmt: skip
 _PAPERWORK_SIGNALS = ("pod", "bol", "proof of delivery", "bill of lading", "paperwork")
+
+
+def _matches_any(text: str, phrases: tuple[str, ...]) -> bool:
+    """True when any phrase appears as whole words.
+
+    Substring matching is what let "advance" fire from inside a sign-off. Word boundaries are
+    cheap and remove a whole class of misreads.
+    """
+
+    return any(re.search(rf"\b{re.escape(phrase)}\b", text) for phrase in phrases)
 
 
 class ClassifyIntent(Tool):
@@ -513,16 +874,24 @@ class ClassifyIntent(Tool):
 
     def run(self, params: BaseModel, ctx: ToolContext) -> ClassifyIntentOutput:
         assert isinstance(params, ClassifyIntentInput)
-        text = f"{params.email_subject}\n{params.email_body}\n{params.thread_text}".lower()
+        # What the sender wrote in this message. Quoted history describes an older ask, and a
+        # signature is not a request — both used to drive routing.
+        written = f"{params.email_subject}\n{strip_quoted(params.email_body)}"
+        text = written.lower()
 
-        has_rate = any(sig in text for sig in _RATE_SIGNALS)
-        has_payment = any(sig in text for sig in _PAYMENT_SIGNALS)
+        has_rate = _matches_any(text, _RATE_SIGNALS)
+        has_payment = _matches_any(text, _PAYMENT_SIGNALS)
 
         intents: list[Intent] = []
         if has_payment:
             intents.append(Intent.PAYMENT_STATUS)
         if has_rate:
             intents.append(Intent.RATE_VERIFICATION)
+        if not intents and _LOAD_ID_RE.search(written):
+            # Names a load but says nothing recognisable — "can anybody update this for me".
+            # This inbox exists to answer payment status, so that is the reading, and a human
+            # reviews the draft regardless. Escalating a plain question helps nobody.
+            intents.append(Intent.PAYMENT_STATUS)
         if not intents:
             intents.append(Intent.UNCERTAIN)
 
@@ -542,7 +911,7 @@ class ClassifyIntent(Tool):
 # compute_carrier_rate
 # ---------------------------------------------------------------------------
 class ComputeCarrierRateInput(BaseModel):
-    load_id: str
+    load_id: LoadIdStr = _LOAD_ID_FIELD
 
 
 class RateLine(BaseModel):

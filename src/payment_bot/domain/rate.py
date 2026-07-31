@@ -65,7 +65,14 @@ def compute_carrier_rate(
     deduction_lines = deductions or []
 
     gross = sum((e.amount for e in earnings), _ZERO)
-    total_deductions = sum((d.amount for d in deduction_lines), _ZERO)
+    # Transport Pro returns deductions as NEGATIVE amounts ("Quick Pay Brokerage": -11.25),
+    # so `gross - total` double-negated and *added* the deduction: load 2496737 came back as
+    # a net of 236.25 against a gross of 225, overstating what the carrier was owed by twice
+    # the deduction. Grounding cannot catch that — the figure genuinely came from a tool.
+    #
+    # Summing magnitudes makes the result correct whichever sign the API uses, so a later
+    # switch to positive deductions cannot silently flip it back.
+    total_deductions = sum((abs(d.amount) for d in deduction_lines), _ZERO)
 
     return CarrierRate(
         gross_rate=gross,

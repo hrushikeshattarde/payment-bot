@@ -12,10 +12,13 @@ and stay unit-testable.
 
 from __future__ import annotations
 
+import json
 from enum import IntEnum
 from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -67,6 +70,77 @@ class Settings(BaseSettings):
         """True when enough is set to build a live :class:`TransportProHttpClient`."""
 
         return bool(self.tp_base_url and self.tp_username and self.tp_password.get_secret_value())
+
+    #: Answer a factoring company that is the factor of record on the load.
+    #:
+    #: Factors are a large share of real inbound — RTS, OTR, Love's, Sound Finance, HaulPay
+    #: and others all write in — and a rate-verification request from the factor named on the
+    #: load's NOA is a legitimate question, not an attack. With this off, every one of them
+    #: escalates.
+    #:
+    #: Only ever reached via ``factoring_domains``: a sender is recognised as the factor when
+    #: its whole domain is configured for the factor recorded on that load. Name resemblance
+    #: alone returns DENY. So this switch cannot open the substring-matching hole that
+    #: existed before that list.
+    #:
+    #: Defaults to false — the safe default for a fresh checkout is to escalate. Turning it on
+    #: is a deliberate policy decision, and the draft still goes to a human either way.
+    allow_factoring: bool = False
+
+    #: Factoring companies whose senders may be recognised, mapped to the domains they mail
+    #: from — e.g. ``{"rts financial": ["rtsfinancial.com", "ryanrts.com"]}``.
+    #:
+    #: This exists because Transport Pro's API gives the factoring company's *name* and no
+    #: contact address. Checked on live data: neither ``/voiceai/load/{n}/payment_information``
+    #: nor ``GET /carrier/{id}`` returns the remit email the Transport Pro UI displays, so
+    #: ``factoring_emails`` is always empty and there is nothing to match a sender against.
+    #:
+    #: The only alternative is guessing from the company name, and that is not safe for an
+    #: authorization decision: the match is a substring test against the sender's flattened
+    #: domain, so a factor called "RTS" would be satisfied by ``imports-llc.com`` and one
+    #: called "… Financial" by any domain containing "finance". A curated map makes each
+    #: factor a deliberate, auditable entry instead of a string coincidence.
+    #:
+    #: Empty by default: no factoring sender is recognised until someone adds one.
+    factoring_domains: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+
+    #: Optional JSON file holding additional factoring domains, same shape as
+    #: ``factoring_domains``. Exists because the full roster (generated from the settlement
+    #: system's factoring-company export by ``scripts/generate_factoring_domains.py``) runs
+    #: to hundreds of entries — too much for one ``.env`` line. Inline entries win on a key
+    #: collision, so a hand-curated correction always beats the generated file.
+    factoring_domains_file: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_factoring_domains_file(cls, values: Any) -> Any:
+        """Load ``factoring_domains_file`` and merge it under the inline map.
+
+        Runs before validation because the model is frozen. A configured-but-unreadable
+        file raises rather than silently authorising nobody — ops must know the roster
+        did not load.
+        """
+
+        if not isinstance(values, dict):
+            return values
+        path_str = values.get("factoring_domains_file") or ""
+        if not path_str:
+            return values
+        path = Path(str(path_str))
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ValueError(f"factoring_domains_file {path_str!r} could not be read: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"factoring_domains_file {path_str!r} is not valid JSON: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError(f"factoring_domains_file {path_str!r} must hold a JSON object")
+
+        inline = values.get("factoring_domains") or {}
+        if isinstance(inline, str):  # env sources may hand the raw JSON string through
+            inline = json.loads(inline)
+        values["factoring_domains"] = {**loaded, **inline}
+        return values
 
     # --- Agent loop ----------------------------------------------------------
     agent_max_iterations: int = Field(default=12, ge=1, le=50)

@@ -279,11 +279,36 @@ def test_subject_is_required() -> None:
 
 
 # --- fetch ------------------------------------------------------------------
+def _thread(*messages: dict[str, Any]) -> dict[str, Any]:
+    """A `format=metadata` thread response."""
+
+    return {"messages": list(messages)}
+
+
+def _thread_message(
+    message_id: str,
+    from_address: str,
+    internal_date: str = "1000",
+    labels: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": message_id,
+        "internalDate": internal_date,
+        "labelIds": labels if labels is not None else ["INBOX"],
+        "payload": {"headers": [{"name": "From", "value": from_address}]},
+    }
+
+
+_CARRIER = "billing@ideaexpedited.com"
+_COLLEAGUE = "angelica.baracao@circledelivers.com"
+
+
 @pytest.mark.unit
 def test_fetch_lists_then_gets_raw_and_parses() -> None:
     http = FakeHttp(
         [
             ("/messages?", 200, {"messages": [{"id": "m1", "threadId": "t1"}]}),
+            ("/threads/t1", 200, _thread(_thread_message("m1", _CARRIER))),
             (
                 "/messages/m1",
                 200,
@@ -303,8 +328,116 @@ def test_fetch_lists_then_gets_raw_and_parses() -> None:
     assert inbound.labels == ["UNREAD", "INBOX"]
 
     assert "q=is%3Aunread" in http.requests[0]["url"]
-    assert "format=RAW" in http.requests[1]["url"]
+    assert "/threads/t1" in http.requests[1]["url"]
+    assert "format=RAW" in http.requests[2]["url"]
     assert http.requests[0]["headers"]["Authorization"] == "Bearer ya29.fake"
+
+
+# --- thread awareness -------------------------------------------------------
+# A Gmail query matches messages, not conversations. Answering per message meant replying to
+# threads a colleague had already handled, and adding a second draft to a thread on every
+# re-run (mark_seen is off by design, so the same mail keeps matching).
+@pytest.mark.unit
+def test_thread_whose_newest_message_is_ours_is_skipped() -> None:
+    """A colleague already replied — the carrier is waiting on nothing."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "m1", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    _thread_message("m1", _CARRIER, "1000"),
+                    _thread_message("m2", _COLLEAGUE, "2000"),
+                ),
+            ),
+        ]
+    )
+    assert _client(http).fetch_new() == []
+    # It never fetched a body.
+    assert not any("format=RAW" in r["url"] for r in http.requests)
+
+
+@pytest.mark.unit
+def test_thread_that_already_has_a_draft_is_skipped() -> None:
+    """This is what stops a re-run stacking duplicate drafts on one conversation."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "m1", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    _thread_message("m1", _CARRIER, "1000"),
+                    _thread_message("d1", _COLLEAGUE, "1500", labels=["DRAFT"]),
+                ),
+            ),
+        ]
+    )
+    assert _client(http).fetch_new() == []
+
+
+@pytest.mark.unit
+def test_the_newest_carrier_message_is_answered_not_the_matched_one() -> None:
+    """A carrier who chased twice gets one reply, to their latest message."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "m1", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    _thread_message("m1", _CARRIER, "1000"),
+                    _thread_message("m9", _CARRIER, "9000"),
+                ),
+            ),
+            (
+                "/messages/m9",
+                200,
+                {"id": "m9", "threadId": "t1", "labelIds": ["UNREAD"], "raw": _b64(RAW_INBOUND)},
+            ),
+        ]
+    )
+    assert len(_client(http).fetch_new()) == 1
+    assert any("/messages/m9" in r["url"] for r in http.requests)
+
+
+@pytest.mark.unit
+def test_several_messages_in_one_thread_produce_one_reply() -> None:
+    """Two matches, one conversation, one draft — not two."""
+
+    http = FakeHttp(
+        [
+            (
+                "/messages?",
+                200,
+                {"messages": [{"id": "m2", "threadId": "t1"}, {"id": "m1", "threadId": "t1"}]},
+            ),
+            ("/threads/t1", 200, _thread(_thread_message("m2", _CARRIER, "2000"))),
+            (
+                "/messages/m2",
+                200,
+                {"id": "m2", "threadId": "t1", "labelIds": ["UNREAD"], "raw": _b64(RAW_INBOUND)},
+            ),
+        ]
+    )
+    assert len(_client(http).fetch_new()) == 1
+    assert sum(1 for r in http.requests if "/threads/" in r["url"]) == 1
+
+
+@pytest.mark.unit
+def test_ownership_is_by_domain_not_by_the_impersonated_mailbox() -> None:
+    """Group mail arrives from colleagues, so any sender on our domain counts as answered."""
+
+    client = _client(FakeHttp([]))
+    assert client._is_ours("Angelica <angelica.baracao@circledelivers.com>") is True
+    assert client._is_ours("paystatus@circledelivers.com") is True
+    assert client._is_ours(f"Carrier <{_CARRIER}>") is False
+    # A lookalike domain must not read as ours.
+    assert client._is_ours("x@notcircledelivers.com") is False
 
 
 @pytest.mark.unit

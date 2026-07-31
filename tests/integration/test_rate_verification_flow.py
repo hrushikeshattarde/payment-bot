@@ -28,6 +28,7 @@ _EXPECTED_TOOL_ORDER = [
     "classify_intent",
     "extract_identifiers",
     "detect_sensitive_change",
+    "check_authorization",  # intake pre-check; the gate re-runs it on the draft
     "tp_get_load_summary",
     "compute_carrier_rate",
     "tp_get_dispatch_history",

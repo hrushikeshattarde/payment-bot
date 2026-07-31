@@ -8,7 +8,8 @@ This is where the pieces compose into the flow from the PRD architecture diagram
 The safety-critical steps run in code around the agent, never inside it:
 
 * **Shared intake & safety (§3.3)** runs first and can stop the run before the agent
-  ever sees the email (sensitive change, invalid length, bulk, unsupported system).
+  ever sees the email (sensitive change, invalid length, bulk, unsupported system,
+  sender authorized for no load).
 * **The pre-send gate (§5)** runs after the agent and is authoritative; a block escalates.
 * **Sending** happens only after the gate passes and (Phase 1) a human approves — and the
   gate is re-run on any human edit.
@@ -47,6 +48,7 @@ from payment_bot.logging import AuditSink, get_logger
 from payment_bot.models import InboundEmail, Intent, SensitiveAction, System
 from payment_bot.tools import ToolContext, ToolRegistry, build_default_registry
 from payment_bot.tools.shared import (
+    CheckAuthorizationOutput,
     ClassifyIntentOutput,
     DetectSensitiveChangeOutput,
     ExtractIdentifiersOutput,
@@ -54,6 +56,29 @@ from payment_bot.tools.shared import (
 from payment_bot.tools.submit import SubmitDraftOutput
 
 _log = get_logger("pipeline")
+
+#: Identifies the bulk reply in approval summaries and the audit trail. Not a real skill —
+#: no model runs — but `_is_auto_sendable` keys off the skill id, and this must never match
+#: PAYMENT_STATUS_SKILL.id, or a bulk reply could auto-send in Phase 2.
+_BULK_PORTAL_SKILL_ID = "bulk_portal"
+
+#: The §3.3 bulk reply. Deliberately contains no amount, date or load id — see
+#: `_bulk_portal_draft` for why that is what makes it safe.
+#:
+#: Kept short and plain on purpose. It also states no count of loads: naming back what the
+#: sender just told us reads as machine-generated, and it is one more number in a body whose
+#: safety rests on containing none.
+_BULK_PORTAL_BODY = """Hi,
+
+You can check all of these here:
+
+{portal_url}
+
+It's live, and shows the pay date and any deductions per load.
+
+If anything looks off, reply here and we'll sort it out.
+
+Thanks"""
 
 
 class Outcome(StrEnum):
@@ -94,7 +119,7 @@ class PaymentBotPipeline:
         settings: Settings | None = None,
         audit_sink: AuditSink | None = None,
         registry: ToolRegistry | None = None,
-        allow_factoring: bool = False,
+        allow_factoring: bool | None = None,
     ) -> None:
         self._tp = tp
         self._gmail = gmail
@@ -107,7 +132,22 @@ class PaymentBotPipeline:
             max_iterations=self._settings.agent_max_iterations,
             max_tokens=self._settings.agent_max_tokens,
         )
-        self._gate = PreSendGate(allow_factoring=allow_factoring)
+        # None means "whatever the configuration says". It used to default to False with no
+        # way to reach it: `local_runner` never passed the argument, so a factoring sender
+        # could not be answered however the deployment was configured.
+        #
+        # The resolved value is folded back into the settings object so every consumer in
+        # one run judges factoring identically: the gate, the intake pre-check, and the
+        # policy-resolved `authorized` flag check_authorization shows the model (it reads
+        # ctx.settings.allow_factoring). Diverging views here produced a live draft that
+        # refused a sender the pipeline had authorized.
+        self._allow_factoring = (
+            self._settings.allow_factoring if allow_factoring is None else allow_factoring
+        )
+        self._settings = self._settings.model_copy(
+            update={"allow_factoring": self._allow_factoring}
+        )
+        self._gate = PreSendGate(allow_factoring=self._allow_factoring)
         self._resolver = approval_resolver
 
     # -- public API ----------------------------------------------------------
@@ -183,13 +223,14 @@ class PaymentBotPipeline:
             )
 
         if len(load_ids) > self._settings.bulk_threshold:
-            # Portal fallback body is out of this slice; escalate so a human sends the link.
-            return self._escalate(
+            # §3.3 portal fallback: answer with the self-service link rather than escalating.
+            return self._finalize(
                 email,
-                "review",
-                f"bulk request ({len(load_ids)} loads) → use portal {self._settings.portal_url}",
-                tuple(load_ids),
+                self._bulk_portal_draft(email),
+                load_ids,
                 correlation_id,
+                ctx,
+                _BULK_PORTAL_SKILL_ID,
             )
 
         non_tp = [lid for lid, sys in routes.items() if sys is not System.TRANSPORT_PRO]
@@ -197,6 +238,50 @@ class PaymentBotPipeline:
             # 6-digit / QuickBooks path is not wired in this slice.
             return self._escalate(
                 email, "review", f"non-Transport-Pro loads {non_tp}", tuple(load_ids), correlation_id
+            )
+
+        # Authorization pre-check: the same `check_authorization` the gate re-runs (§5),
+        # brought forward to before the model is invoked. When NO load is authorized, no
+        # draft could disclose anything, so running the agent only spends the LLM budget on
+        # a reply the gate is certain to block — measured on 30 days of live mail, 16 of 29
+        # conversations stopped exactly that way. A *partially* authorized email proceeds:
+        # the skill prompt discloses only ALLOW loads, and a draft restricted to those can
+        # pass the gate honestly. The gate stays authoritative over what the draft actually
+        # discloses; this is an efficiency measure, not a replacement.
+        unauthorized: list[str] = []
+        for load_id in load_ids:
+            auth_out = self._registry.dispatch(
+                "check_authorization",
+                {
+                    "sender_email": email.from_email,
+                    "sender_name": email.from_name,
+                    "load_id": load_id,
+                    "system": routes[load_id].value,
+                },
+                ctx,
+            )
+            if not auth_out.ok:
+                # Cannot resolve authorization → treat as denied (fail closed, like the gate).
+                unauthorized.append(f"{load_id}=ERROR({auth_out.payload.get('error')})")
+                continue
+            auth = CheckAuthorizationOutput.model_validate(auth_out.payload)
+            if not auth.authorized:
+                # Carry the tool's reason — it names the fix (e.g. a factoring domain to
+                # add to PAYBOT_FACTORING_DOMAINS), which is what the reviewer acts on.
+                detail = f" ({auth.reason})" if auth.reason else ""
+                unauthorized.append(f"{load_id}={auth.decision.value}{detail}")
+        if len(unauthorized) == len(load_ids):
+            return self._escalate(
+                email,
+                "review",
+                f"sender not authorized for any load: {unauthorized}",
+                tuple(load_ids),
+                correlation_id,
+            )
+        if unauthorized:
+            _log.info(
+                "authorization_precheck_partial",
+                extra={"correlation_id": correlation_id, "unauthorized": unauthorized},
             )
 
         # 2. Select the skill by intent -------------------------------------
@@ -221,14 +306,38 @@ class PaymentBotPipeline:
             ctx=ctx,
         )
         if agent_result.draft is None:
+            # Include what the model wrote. Without it "produced no draft" is unactionable —
+            # it hides whether the answer was complete but delivered as prose, or never
+            # arrived at all.
+            wrote = " ".join(agent_result.final_text.split())
+            aside = f"; model wrote: {wrote[:300]!r}" if wrote else ""
             return self._escalate(
                 email,
                 "review",
-                f"agent produced no draft (stop_reason={agent_result.stop_reason})",
+                f"agent produced no draft (stop_reason={agent_result.stop_reason}){aside}",
                 tuple(load_ids),
                 correlation_id,
             )
         draft = agent_result.draft
+
+        return self._finalize(email, draft, load_ids, correlation_id, ctx, skill.id)
+
+    # -- gate → approval → send, shared by every draft path -------------------
+    def _finalize(
+        self,
+        email: InboundEmail,
+        draft: SubmitDraftOutput,
+        load_ids: list[str],
+        correlation_id: str,
+        ctx: ToolContext,
+        skill_id: str,
+    ) -> PipelineResult:
+        """Run the gate, then approval, then send or leave the draft for review.
+
+        Extracted so the deterministic bulk-portal reply takes the *same* route as an
+        agent-produced draft. There is no second path to a sent email, and no draft that
+        reaches a mailbox without passing §5.
+        """
 
         # 4. Pre-send gate (deterministic, §5) ------------------------------
         gate_result = self._gate.evaluate(draft=draft, email=email, ctx=ctx)
@@ -244,12 +353,12 @@ class PaymentBotPipeline:
             )
 
         # 5. Approval (Phase 1) or selective auto-send (Phase 2, §8.5) ------
-        if self._is_auto_sendable(skill.id, load_ids):
+        if self._is_auto_sendable(skill_id, load_ids):
             return self._send(email, draft, draft.reply_body, correlation_id, gate_result)
 
         summary = ApprovalSummary(
             from_=email.from_email,
-            intents=(skill.id,),
+            intents=(skill_id,),
             load_ids=tuple(load_ids),
             key_facts=(f"loads={load_ids}", f"gate=passed({len(gate_result.checks)} checks)"),
             cc=self._settings.reply_cc,
@@ -314,8 +423,31 @@ class PaymentBotPipeline:
         has_rate = Intent.RATE_VERIFICATION in classification.intents
 
         if has_payment and has_rate:
-            # §3.5 combined intent (run both, merge into one reply) is not yet wired.
-            return None
+            # §3.5 proper handling is "run both skills and merge", which is not wired. Until
+            # it is, answer the more specific of the two rather than refusing: on live mail
+            # this was the largest single cause of escalation, 5 of 20 emails, and every one
+            # of them was answerable.
+            #
+            # A quoted figure is the tell. Someone who wrote an amount wants it checked; with
+            # no amount the ask is almost always "where is my money". Either way the reply
+            # covers only one of the two questions, so it stays a human-reviewed draft.
+            chosen = RATE_VERIFICATION_SKILL if identifiers.stated_rates else PAYMENT_STATUS_SKILL
+            _log.info(
+                "combined_intent_narrowed",
+                extra={
+                    "chosen_skill": chosen.id,
+                    "stated_rates": len(identifiers.stated_rates),
+                },
+            )
+            if chosen is RATE_VERIFICATION_SKILL:
+                return chosen, build_rate_verification_intake(
+                    email,
+                    load_ids,
+                    routes_map,
+                    identifiers.stated_rates,
+                    identifiers.factoring_company,
+                )
+            return chosen, build_payment_status_intake(email, load_ids, routes_map)
         if has_rate:
             intake = build_rate_verification_intake(
                 email, load_ids, routes_map, identifiers.stated_rates, identifiers.factoring_company
@@ -324,6 +456,25 @@ class PaymentBotPipeline:
         if has_payment:
             return PAYMENT_STATUS_SKILL, build_payment_status_intake(email, load_ids, routes_map)
         return None  # uncertain / neither
+
+    def _bulk_portal_draft(self, email: InboundEmail) -> SubmitDraftOutput:
+        """Build the §3.3 bulk reply: point the sender at the self-service portal.
+
+        Written in code, not by the model, because there is nothing to reason about — and
+        because it deliberately states **no** load data. That is what lets it pass the gate
+        honestly rather than by exemption: ``load_ids`` is empty, so the authorization,
+        bulk and length checks have nothing to authorize or route, and the body carries no
+        amount or date for grounding to object to. A bulk reply discloses nothing, so the
+        gate's own "no loads disclosed" branch applies.
+        """
+
+        body = _BULK_PORTAL_BODY.format(portal_url=self._settings.portal_url)
+        return SubmitDraftOutput(
+            reply_body=body,
+            to=email.from_email,
+            load_ids=[],  # nothing about any load is disclosed — see the docstring
+            citations=[],
+        )
 
     def _is_auto_sendable(self, skill_id: str, load_ids: list[str]) -> bool:
         """Phase 2 (§8.5): only a clean single-load payment_status may skip approval.

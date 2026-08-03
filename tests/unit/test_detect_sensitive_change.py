@@ -290,6 +290,29 @@ def test_a_void_check_attachment_stays_hard(ctx: ToolContext) -> None:
         ctx,
     )
     assert out.hard is True
+    assert out.paperwork is True
+    assert out.noa_attachment is False
+
+
+@pytest.mark.unit
+def test_an_noa_attachment_is_its_own_signal_not_paperwork(ctx: ToolContext) -> None:
+    """The England Carrier Services shape: a routine rate verification with the NOA
+    attached as part of the standard pre-funding packet. Hard evidence, escalates by
+    default — but reported as ``noa_attachment`` so ``noa_attachment_replies`` can
+    draft past it, unlike a void check.
+    """
+
+    out = _run(
+        ctx,
+        subject="PLEASE REPLY Rate Verification Carrier Reuben and Gilbert Trucking LLC",
+        body="Are you showing England Carrier Services as the factoring company?",
+        attachments_metadata=[AttachmentMeta(filename="NOA - Reuben and Gilbert Trucking.pdf")],
+    )
+    assert out.action is SensitiveAction.ESCALATE
+    assert SensitiveFlag.NOA_SETUP_CHANGE in out.flags
+    assert out.noa_attachment is True
+    assert out.paperwork is False
+    assert out.hard is True
 
 
 @pytest.mark.unit

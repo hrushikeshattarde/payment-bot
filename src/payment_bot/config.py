@@ -189,11 +189,21 @@ class Settings(BaseSettings):
 
     #: The NOA counterpart of ``sensitive_bank_replies``: draft status replies past NOA
     #: action WORDING ("we've updated the factoring", "please add our NOA") for authorized
-    #: senders with an answerable ask. An actual NOA **attachment** always escalates — a
-    #: Notice of Assignment is a legal document someone must verify and file, which no
-    #: status reply can do. Gate check #9 forbids the reply from acknowledging or acting
-    #: on the setup request either way.
+    #: senders with an answerable ask. An actual NOA **attachment** is governed separately
+    #: by ``noa_attachment_replies`` — a Notice of Assignment is a legal document someone
+    #: must verify and file, which no status reply can do. Gate check #9 forbids the reply
+    #: from acknowledging or acting on the setup request either way.
     sensitive_noa_replies: bool = False
+
+    #: Draft replies past an attached NOA / notice-of-assignment file. Pre-funding factors
+    #: attach their NOA to routine rate verifications as part of the standard packet —
+    #: England Carrier Services' template does exactly this — and with this off every one
+    #: of them escalates unanswered. What it does NOT change: the NOA still needs a human
+    #: to verify and file (the draft cannot do either, and the change_acknowledgment gate
+    #: check forbids the reply from claiming it was filed); disclosure is still gated by
+    #: authorization; and void-check / direct-deposit attachments and contact changes
+    #: escalate in every configuration. Defaults to the strict behaviour.
+    noa_attachment_replies: bool = False
 
     #: Answer a roster-verified factoring company about a load that shows NO factor on
     #: file — the pre-funding flow: factors verify rates BEFORE their NOA reaches us, so

@@ -218,26 +218,34 @@ class PaymentBotPipeline:
         )
         sensitive = DetectSensitiveChangeOutput.model_validate(det_out.payload)
         if sensitive.action is SensitiveAction.ESCALATE:
-            # Three tiers (§7 + the sensitive_bank_replies policy):
-            #   * paperwork/identity actions (NOA, void-check/DD attachments, contact
-            #     change) — ALWAYS escalate; there is something to file or verify.
-            #   * hard bank WORDING with an answerable ask — escalates unless the
-            #     deployment explicitly opted in to answering past it.
+            # Three tiers (§7 + the sensitive_*_replies policies):
+            #   * paperwork/identity actions (void-check/DD attachments, contact change) —
+            #     ALWAYS escalate; there is something to file or an identity to verify.
+            #   * hard bank/NOA WORDING or an attached NOA, with an answerable ask —
+            #     escalates unless the deployment explicitly opted in to answering past it
+            #     (sensitive_bank_replies / sensitive_noa_replies / noa_attachment_replies).
             #   * soft boilerplate with an answerable ask — proceeds.
             # A change instruction with no real question escalates in every tier, and the
             # gate's change_acknowledgment check enforces that no reply ever confirms or
             # acts on the instruction it is ignoring.
-            wording_allowed = (
-                not sensitive.hard_bank or self._settings.sensitive_bank_replies
-            ) and (not sensitive.hard_noa or self._settings.sensitive_noa_replies)
-            if sensitive.paperwork or not classification.keyword_grounded or not wording_allowed:
+            allowed_by_policy = (
+                (not sensitive.hard_bank or self._settings.sensitive_bank_replies)
+                and (not sensitive.hard_noa or self._settings.sensitive_noa_replies)
+                and (not sensitive.noa_attachment or self._settings.noa_attachment_replies)
+            )
+            if (
+                sensitive.paperwork
+                or not classification.keyword_grounded
+                or not allowed_by_policy
+            ):
                 flags = [f.value for f in sensitive.flags]
                 return self._escalate(
                     email, "security", f"sensitive change {flags}", tuple(load_ids), correlation_id
                 )
-            if sensitive.hard_bank or sensitive.hard_noa:
-                # Proceeding past explicit change wording is a policy decision; make the
-                # audit trail shout about it — a human still has to action the request.
+            if sensitive.hard_bank or sensitive.hard_noa or sensitive.noa_attachment:
+                # Proceeding past explicit change evidence is a policy decision; make the
+                # audit trail shout about it — a human still has to action the request
+                # (file the attached NOA, action the bank change).
                 _log.warning(
                     "bank_change_language_allowed_by_policy",
                     extra={"correlation_id": correlation_id, "evidence": sensitive.evidence},

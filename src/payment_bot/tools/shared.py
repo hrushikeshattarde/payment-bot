@@ -437,10 +437,16 @@ class DetectSensitiveChangeOutput(BaseModel):
     hard_bank: bool = False
     hard_noa: bool = False
     #: True when the email carries an ARTIFACT or identity action rather than language:
-    #: a void-check / direct-deposit / NOA attachment, or a contact change. These always
+    #: a void-check / direct-deposit attachment, or a contact change. These always
     #: escalate — there is paperwork to file or an identity to re-verify, and a status
     #: reply cannot do either — regardless of any wording policy.
     paperwork: bool = False
+    #: True when an NOA / notice-of-assignment file is attached. Split from ``paperwork``
+    #: because pre-funding factors routinely attach their NOA to a routine rate
+    #: verification — it is part of their standard packet, not a change instruction.
+    #: ``noa_attachment_replies`` may draft past it; the attachment itself still needs a
+    #: human to verify and file either way.
+    noa_attachment: bool = False
 
 
 # Phrase → flag. NOA/factoring only escalates on an action verb (add/update/attach…),
@@ -650,6 +656,7 @@ class DetectSensitiveChange(Tool):
                 evidence.append(f"contact: matched {phrase!r}")
                 paperwork = True
 
+        noa_attachment = False
         for att in params.attachments_metadata:
             lower = att.filename.lower()
             if any(k in lower for k in ("voidcheck", "void_check", "void-check", "directdeposit")):
@@ -659,7 +666,7 @@ class DetectSensitiveChange(Tool):
             if "noa" in lower or "assignment" in lower:
                 _add(flags, SensitiveFlag.NOA_SETUP_CHANGE)
                 evidence.append(f"noa_setup: attachment {att.filename!r}")
-                paperwork = True
+                noa_attachment = True
 
         if not flags:
             flags.append(SensitiveFlag.NONE)
@@ -671,10 +678,11 @@ class DetectSensitiveChange(Tool):
             flags=flags,
             evidence=evidence,
             action=action,
-            hard=hard_bank or hard_noa or paperwork,
+            hard=hard_bank or hard_noa or paperwork or noa_attachment,
             hard_bank=hard_bank,
             hard_noa=hard_noa,
             paperwork=paperwork,
+            noa_attachment=noa_attachment,
         )
 
 

@@ -152,8 +152,9 @@ def test_noa_wording_drafts_when_the_policy_allows_it() -> None:
 
 
 @pytest.mark.integration
-def test_an_noa_attachment_still_escalates_with_every_policy_on() -> None:
-    """Paperwork beats policy: the attached NOA must be verified and filed by a person."""
+def test_an_noa_attachment_still_escalates_without_its_own_policy() -> None:
+    """The wording switches do not cover an attached NOA — that file must be verified and
+    filed by a person, so it takes its own explicit opt-in (``noa_attachment_replies``)."""
 
     from payment_bot.models import EmailAttachment
 
@@ -173,3 +174,63 @@ def test_an_noa_attachment_still_escalates_with_every_policy_on() -> None:
 
     assert result.outcome is Outcome.ESCALATED
     assert "noa_setup_change" in result.detail
+
+
+@pytest.mark.integration
+def test_an_noa_attachment_drafts_when_the_policy_allows_it() -> None:
+    """PAYBOT_NOA_ATTACHMENT_REPLIES: the England Carrier Services shape — a pre-funding
+    factor attaches its NOA to a routine rate verification. The answerable question is
+    answered; filing the NOA still needs a human."""
+
+    from payment_bot.models import EmailAttachment
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    settings = Settings(noa_attachment_replies=True)
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)),
+        gmail,
+        slack,
+        audit,
+        settings=settings,
+    )
+    noa_email = InboundEmail(
+        message_id="msg-noa-policy-4",
+        thread_id="t",
+        from_email=SAMPLE_SENDER_EMAIL,
+        subject="Rate Verification - Load 2462934",
+        body="Please verify the rate shows $4,650.",
+        attachments=[EmailAttachment(filename="NOA - Trucking LLC.pdf", mime_type="application/pdf")],
+    )
+
+    result = pipeline.process_email(noa_email)
+
+    assert result.outcome is Outcome.SENT, result.detail
+    assert slack.escalations == []
+
+
+@pytest.mark.integration
+def test_a_void_check_attachment_escalates_with_every_policy_on() -> None:
+    """Paperwork beats every policy switch: a void check is a bank-identity artifact."""
+
+    from payment_bot.models import EmailAttachment
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    settings = Settings(
+        sensitive_noa_replies=True,
+        sensitive_bank_replies=True,
+        noa_attachment_replies=True,
+    )
+    pipeline = _build(AutoApproveResolver(), gmail, slack, audit, settings=settings)
+    email = InboundEmail(
+        message_id="msg-voidcheck-policy-1",
+        thread_id="t",
+        from_email=SAMPLE_SENDER_EMAIL,
+        subject="Rate Verification - Load 2462934",
+        body="Please verify the rate shows $4,650.",
+        attachments=[EmailAttachment(filename="VoidCheck_2026.pdf", mime_type="application/pdf")],
+    )
+
+    result = pipeline.process_email(email)
+
+    assert result.outcome is Outcome.ESCALATED
+    assert "bank_change" in result.detail

@@ -18,6 +18,8 @@ Checks (all must pass):
 8. **Coverage** — the draft addresses every load the agent was asked to answer.
 9. **Change acknowledgment** — the reply never confirms or acts on a remittance/bank/NOA
    instruction (the §7 compensating control behind the boilerplate narrowing).
+10. **NOA request** — the reply asks the sender for an NOA only when the intake's pre-NOA
+    instruction said to; a draft must never invent a paperwork chore.
 """
 
 from __future__ import annotations
@@ -84,6 +86,23 @@ def _placeholder_hits(text: str) -> set[str]:
     return {label for label, pattern in _PLACEHOLDER_PATTERNS if pattern.search(text)}
 
 
+#: A draft asking the sender to supply an NOA — request verb near the noun, either order.
+#:
+#: This must catch requests only, never reports: "no NOA is on file" and "WEX Fleet One is
+#: on file as the factoring company" are statements the rate skill is required to make.
+#: "email"/"send" (the verbs the prompts prescribe for paperwork asks) plus their nearby
+#: NOA noun is the request shape. Observed live: a payment-status draft told a carrier
+#: whose factor and NOA were already on file to "please email your Notice of Assignment
+#: and billing paperwork" — the model invented the ask; no tool and no intake said so.
+_NOA_REQUEST_RE = re.compile(
+    r"\b(?:email|send|provide|submit|forward|resend)\b\W(?:\w+\W){0,8}?"
+    r"\b(?:noa|notice\s+of\s+assignment)\b"
+    r"|\b(?:noa|notice\s+of\s+assignment)\b\W(?:\w+\W){0,8}?"
+    r"\b(?:email|send|provide|submit|forward|resend)\b",
+    re.IGNORECASE,
+)
+
+
 class GateCheck(BaseModel):
     """Outcome of one named gate check."""
 
@@ -120,6 +139,7 @@ class PreSendGate:
         email: InboundEmail,
         ctx: ToolContext,
         expected_load_ids: tuple[str, ...] | None = None,
+        noa_request_expected: bool = False,
     ) -> GateResult:
         """Run all checks.
 
@@ -127,6 +147,8 @@ class PreSendGate:
             expected_load_ids: The loads the agent was asked to answer, when a specific
                 set exists. ``None`` for code-authored replies (the bulk portal draft),
                 which deliberately name no load.
+            noa_request_expected: True when the intake instructed the agent to ask the
+                sender for an NOA (the pre-NOA flow). Only then may the draft request one.
         """
 
         checks = [
@@ -139,6 +161,7 @@ class PreSendGate:
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
             self._check_change_acknowledgment(draft),
+            self._check_noa_request(draft, noa_request_expected),
         ]
         allowed = all(c.passed for c in checks)
         result = GateResult(allowed=allowed, checks=checks)
@@ -234,6 +257,7 @@ class PreSendGate:
             outcome.paperwork
             or (outcome.hard_bank and not ctx.settings.sensitive_bank_replies)
             or (outcome.hard_noa and not ctx.settings.sensitive_noa_replies)
+            or (outcome.noa_attachment and not ctx.settings.noa_attachment_replies)
         )
         if flags and blocked:
             return GateCheck(
@@ -285,6 +309,31 @@ class PreSendGate:
             passed=True,
             detail="reply acknowledges no remittance/bank/NOA instruction",
         )
+
+    def _check_noa_request(self, draft: SubmitDraftOutput, expected: bool) -> GateCheck:
+        """The draft may ask the sender for an NOA only when the intake said to.
+
+        The pre-NOA flow is the one legitimate source of that ask, and the pipeline knows
+        when it fired. Observed live: a draft told a carrier whose factor and NOA were
+        already on file to email their Notice of Assignment — inventing paperwork chores
+        for senders erodes exactly the trust these replies exist to build.
+        """
+
+        match = _NOA_REQUEST_RE.search(draft.reply_body)
+        if match and not expected:
+            return GateCheck(
+                name="noa_request",
+                passed=False,
+                detail=(
+                    "draft asks the sender for an NOA but the intake did not instruct it "
+                    f"— {' '.join(match.group(0).split())!r}"
+                ),
+            )
+        if match:
+            return GateCheck(
+                name="noa_request", passed=True, detail="NOA request present, per the intake"
+            )
+        return GateCheck(name="noa_request", passed=True, detail="no NOA request in the reply")
 
     def _check_placeholders(self, draft: SubmitDraftOutput) -> GateCheck:
         """Block a draft that was never filled in.

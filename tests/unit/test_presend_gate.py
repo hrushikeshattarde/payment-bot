@@ -602,3 +602,53 @@ def test_soft_boilerplate_email_passes_the_gate_with_a_clean_draft(
     result = PreSendGate().evaluate(draft=_draft(), email=boilerplate, ctx=grounded_ctx)
     assert result.allowed, result.reasons
     assert _checks(result)["sensitive_change"] is True
+
+
+# --- check #10: NOA requests need the intake's say-so -------------------------
+_NOA_ASK = (
+    " Since this is a factoring arrangement, please email your Notice of Assignment "
+    "and billing paperwork to freightpay@circledelivers.com."
+)
+
+
+@pytest.mark.unit
+def test_an_uninstructed_noa_request_is_blocked(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Observed live: the factor and NOA were already on file, yet the draft asked the
+    sender to email their NOA. Only the intake's pre-NOA instruction legitimises that ask."""
+
+    result = PreSendGate().evaluate(
+        draft=_draft(body=_GOOD_BODY + _NOA_ASK), email=sample_email, ctx=grounded_ctx
+    )
+    assert not result.allowed
+    assert _checks(result)["noa_request"] is False
+
+
+@pytest.mark.unit
+def test_an_instructed_noa_request_passes(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    result = PreSendGate().evaluate(
+        draft=_draft(body=_GOOD_BODY + _NOA_ASK),
+        email=sample_email,
+        ctx=grounded_ctx,
+        noa_request_expected=True,
+    )
+    assert result.allowed, result.reasons
+    assert _checks(result)["noa_request"] is True
+
+
+@pytest.mark.unit
+def test_reporting_noa_facts_is_not_a_request(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The rate skill must state what is on file; statements are not paperwork asks."""
+
+    body = (
+        _GOOD_BODY + " WEX Fleet One is on file as the factoring company and a notice "
+        "of assignment is on file."
+    )
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=sample_email, ctx=grounded_ctx)
+    assert result.allowed, result.reasons
+    assert _checks(result)["noa_request"] is True

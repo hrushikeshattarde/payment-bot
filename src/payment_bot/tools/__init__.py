@@ -36,6 +36,7 @@ PAYMENT_STATUS_TOOLS: tuple[str, ...] = (
     TpGetDispatchHistory.name,
     TpGetSettlementEntries.name,
     TpGetFileHistory.name,
+    TpGetNoaFactoring.name,
     ComputeScheduledPayDate.name,
     CarrierCrossCheck.name,
     CheckAuthorization.name,

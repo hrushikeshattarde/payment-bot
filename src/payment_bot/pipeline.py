@@ -388,7 +388,15 @@ class PaymentBotPipeline:
             )
         draft = agent_result.draft
 
-        return self._finalize(email, draft, load_ids, correlation_id, ctx, skill.id)
+        return self._finalize(
+            email,
+            draft,
+            load_ids,
+            correlation_id,
+            ctx,
+            skill.id,
+            noa_request_expected=bool(prenoa_loads),
+        )
 
     # -- gate → approval → send, shared by every draft path -------------------
     def _finalize(
@@ -399,6 +407,7 @@ class PaymentBotPipeline:
         correlation_id: str,
         ctx: ToolContext,
         skill_id: str,
+        noa_request_expected: bool = False,
     ) -> PipelineResult:
         """Run the gate, then approval, then send or leave the draft for review.
 
@@ -413,7 +422,11 @@ class PaymentBotPipeline:
         # intake handed it.
         expected = None if skill_id == _BULK_PORTAL_SKILL_ID else tuple(load_ids)
         gate_result = self._gate.evaluate(
-            draft=draft, email=email, ctx=ctx, expected_load_ids=expected
+            draft=draft,
+            email=email,
+            ctx=ctx,
+            expected_load_ids=expected,
+            noa_request_expected=noa_request_expected,
         )
         if not gate_result.allowed:
             return self._escalate(

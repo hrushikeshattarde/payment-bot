@@ -204,6 +204,18 @@ class Settings(BaseSettings):
     #: factored to a DIFFERENT company is unaffected — that always stays per-load bound.
     factoring_prenoa_replies: bool = False
 
+    #: Which document categories a draft may report as missing and request from the
+    #: sender. Values are :class:`payment_bot.domain.documents.DocCategory` names, e.g.
+    #: carrier_invoice, proof_of_delivery, rate_agreement. Config so the business can
+    #: tune WHAT gets chased without a code change — and the single edit point for when
+    #: the authoritative ``GET /load/missing_documents`` source lands (see
+    #: docs/MISSING_DOCUMENTS_CACHE.md): the tool keeps this same output shape either way.
+    required_documents: tuple[str, ...] = (
+        "carrier_invoice",
+        "proof_of_delivery",
+        "rate_agreement",
+    )
+
     # --- Amazon Bedrock (§8.1) — the deployed LLM provider -------------------
     aws_region: str = "us-east-1"
     #: Bedrock model / inference-profile id used to drive the agent loop in AWS.

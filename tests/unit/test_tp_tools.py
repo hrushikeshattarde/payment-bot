@@ -109,3 +109,43 @@ def test_noa_factoring_read_only(ctx: ToolContext) -> None:
     assert out.noa_on_file is False
     assert out.factoring_company_on_file is None
     assert out.details is not None
+
+
+@pytest.mark.unit
+def test_required_documents_come_from_configuration(ctx: ToolContext) -> None:
+    """PAYBOT_REQUIRED_DOCUMENTS decides which documents drafts chase — a config edit,
+    and the single seam for the future GET /load/missing_documents source."""
+
+    from payment_bot.config import Settings
+    from payment_bot.grounding import GroundingLedger
+    from payment_bot.tools.base import ToolContext as Ctx
+    from payment_bot.tools.transport_pro import LoadIdInput, TpGetFileHistory
+
+    narrow = Ctx(
+        tp=ctx.tp,
+        ledger=GroundingLedger(),
+        correlation_id="t",
+        settings=Settings(required_documents=("carrier_invoice",)),
+    )
+    out = TpGetFileHistory().run(LoadIdInput(load_id="2462934"), narrow)
+    # The sample load is missing its rate agreement, but with only the carrier invoice
+    # required, nothing on the narrowed list is missing.
+    assert "rate_agreement" not in out.missing_documents
+
+
+@pytest.mark.unit
+def test_an_unknown_required_document_fails_loudly(ctx: ToolContext) -> None:
+    from payment_bot.config import Settings
+    from payment_bot.errors import ToolError
+    from payment_bot.grounding import GroundingLedger
+    from payment_bot.tools.base import ToolContext as Ctx
+    from payment_bot.tools.transport_pro import LoadIdInput, TpGetFileHistory
+
+    bad = Ctx(
+        tp=ctx.tp,
+        ledger=GroundingLedger(),
+        correlation_id="t",
+        settings=Settings(required_documents=("notarized_selfie",)),
+    )
+    with pytest.raises(ToolError, match="unknown document category"):
+        TpGetFileHistory().run(LoadIdInput(load_id="2462934"), bad)

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from payment_bot.domain import compute_carrier_rate
 from payment_bot.domain.documents import DocCategory, assess_documents
+from payment_bot.errors import ToolError
 from payment_bot.models import Deduction, DispatchRow, Earning, SettlementEntry
 from payment_bot.tools.base import Tool, ToolContext
 from payment_bot.tools.shared import LoadIdStr
@@ -221,9 +222,22 @@ class TpGetFileHistory(Tool):
         load_id = params.load_id.strip()
         docs = ctx.tp.get_file_history(load_id)
 
+        # The required set comes from configuration (PAYBOT_REQUIRED_DOCUMENTS), so which
+        # documents drafts chase is a config edit. This call is also the seam for the
+        # authoritative missing-documents source: when the GET /load/missing_documents
+        # request shape is settled (docs/MISSING_DOCUMENTS_CACHE.md), swap the derivation
+        # here — the output shape, and therefore every draft, stays identical.
+        try:
+            required = tuple(DocCategory(v) for v in ctx.settings.required_documents)
+        except ValueError as exc:
+            raise ToolError(
+                f"PAYBOT_REQUIRED_DOCUMENTS contains an unknown document category: {exc}. "
+                f"Valid values: {[c.value for c in DocCategory]}"
+            ) from exc
         status, _classified = assess_documents(
             ((d.file_type, d.file_type_id, d.upload_date or d.index_date, d.comments) for d in docs),
             load_id=load_id,
+            required=required,
         )
         present = set(status.present)
 

@@ -57,6 +57,9 @@ REPLY
 - If `tp_get_file_history` reports required paperwork missing, name each missing
   document and ask the sender to email it to the documents address in the intake
   message. A missing carrier invoice is usually why a payment is not yet scheduled.
+- If the intake notes a factoring sender with no NOA on file, answer normally and
+  ask them to email the NOA and billing paperwork to the documents address. Use the
+  word "email", never "attach".
 - Write as a human teammate would. Never mention tools, checks, authorization or internal
   rules — no "you are authorized", no rule mechanics like "(Tuesday → Thursday same week)".
   State the date; never explain how it was computed.
@@ -82,7 +85,7 @@ NEVER
 
 PAYMENT_STATUS_SKILL = Skill(
     id="payment_status",
-    version="1.6.0",
+    version="1.7.0",
     system_prompt=_PAYMENT_STATUS_PROMPT,
     allowed_tools=PAYMENT_STATUS_TOOLS,
 )
@@ -118,6 +121,9 @@ REPLY
 - If `tp_get_file_history` reports required paperwork missing, name each missing
   document and ask the sender to email it to the documents address in the intake
   message.
+- If the intake notes a factoring sender with no NOA on file, answer normally and
+  ask them to email the NOA and billing paperwork to the documents address. Use the
+  word "email", never "attach".
 - Write as a human teammate would. Never mention tools, checks, authorization or internal
   rules — no "you are authorized", no rule mechanics. State facts; never explain how they
   were verified.
@@ -147,7 +153,7 @@ NEVER
 
 RATE_VERIFICATION_SKILL = Skill(
     id="rate_verification",
-    version="1.5.0",
+    version="1.6.0",
     system_prompt=_RATE_VERIFICATION_PROMPT,
     allowed_tools=RATE_VERIFICATION_TOOLS,
 )
@@ -159,6 +165,7 @@ def build_payment_status_intake(
     routes: dict[str, str],
     signature: str = "Circle Delivers Payments",
     documents_email: str = "freightpay@circledelivers.com",
+    prenoa_loads: list[str] | None = None,
 ) -> str:
     """Compose the first user turn: the email plus the deterministic intake results."""
 
@@ -175,6 +182,15 @@ def build_payment_status_intake(
             f"- Routing: {routes}",
             f"- Sign the reply exactly as: {signature}",
             f"- Missing paperwork should be emailed to: {documents_email}",
+            *(
+                [
+                    "- The sender is a roster-verified factoring company but no NOA is on "
+                    f"file for load(s) {', '.join(prenoa_loads)}. In the reply, ask them to "
+                    f"email the NOA and billing paperwork to {documents_email}."
+                ]
+                if prenoa_loads
+                else []
+            ),
             "",
             "Run the payment_status procedure for the load id(s) above and submit a grounded draft.",
         ]
@@ -189,6 +205,7 @@ def build_rate_verification_intake(
     factoring_company: str | None,
     signature: str = "Circle Delivers Payments",
     documents_email: str = "freightpay@circledelivers.com",
+    prenoa_loads: list[str] | None = None,
 ) -> str:
     """Compose the first user turn for rate verification, including the stated amount(s)."""
 
@@ -214,6 +231,15 @@ def build_rate_verification_intake(
             f"- Factoring company named by sender: {factoring_company or 'none'}",
             f"- Sign the reply exactly as: {signature}",
             f"- Missing paperwork should be emailed to: {documents_email}",
+            *(
+                [
+                    "- The sender is a roster-verified factoring company but no NOA is on "
+                    f"file for load(s) {', '.join(prenoa_loads)}. In the reply, ask them to "
+                    f"email the NOA and billing paperwork to {documents_email}."
+                ]
+                if prenoa_loads
+                else []
+            ),
             "",
             "Run the rate_verification procedure for the load id(s) above and submit a grounded "
             "draft that states match/mismatch vs the stated amount.",

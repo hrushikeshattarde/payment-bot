@@ -219,6 +219,19 @@ def _is_configured_factor_domain(
     return False
 
 
+def _roster_entry_for_domain(sender_domain: str, ctx: ToolContext) -> str | None:
+    """The roster entry (configured factor name) that owns ``sender_domain``, if any.
+
+    Membership only — no per-load factor comparison. Used by the pre-NOA path, where the
+    load has no factor on file to compare against.
+    """
+
+    for configured_name, domains in ctx.settings.factoring_domains.items():
+        if any(sender_domain == str(d).strip().lower().lstrip("@") for d in domains):
+            return configured_name
+    return None
+
+
 def company_tokens(name: str | None) -> set[str]:
     """Distinctive lowercase tokens of a company name (len ≥ 4, minus generic words)."""
 
@@ -690,6 +703,11 @@ class CheckAuthorizationOutput(BaseModel):
     #: refused by the model ("unable to provide rate details due to authorization
     #: restrictions") because the prompt said only ALLOW counts.
     authorized: bool = False
+    #: True when the sender is a roster-verified factoring company asking about a load
+    #: that shows NO factor on file — the standard pre-funding flow where a factor
+    #: verifies the rate BEFORE its NOA reaches us. The reply must then request the NOA
+    #: and billing paperwork be emailed to the documents address.
+    pre_noa: bool = False
     matched_party: str | None = None
     reason: str
 
@@ -761,6 +779,31 @@ class CheckAuthorization(Tool):
                 matched_party=auth.factoring_company,
                 reason="sender domain is configured for the factoring company on this load",
             )
+
+        # Pre-NOA (policy): a roster-verified factor asking about a load that shows NO
+        # factor on file — the standard pre-funding flow, where the factor verifies the
+        # rate BEFORE its NOA reaches us and Transport Pro still says remit-to self. The
+        # reply answers the rate question and requests the NOA + billing paperwork. A load
+        # already factored to a DIFFERENT company never reaches this branch (the check
+        # above owns that case), so one factor is still never told about another's load.
+        if (
+            ctx.settings.factoring_prenoa_replies
+            and not auth.factoring_company
+            and sender_domain
+            and sender_domain not in _FREE_MAIL_DOMAINS
+        ):
+            roster_name = _roster_entry_for_domain(sender_domain, ctx)
+            if roster_name is not None:
+                return CheckAuthorizationOutput(
+                    decision=AuthDecision.FACTORING,
+                    authorized=ctx.settings.allow_factoring,
+                    pre_noa=True,
+                    matched_party=roster_name,
+                    reason=(
+                        "roster-verified factoring company; no factor on file for this "
+                        "load — the reply should request the NOA and billing paperwork"
+                    ),
+                )
 
         carrier_toks = company_tokens(auth.carrier_company)
         if any(tok in domain for tok in carrier_toks):

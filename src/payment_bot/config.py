@@ -195,6 +195,15 @@ class Settings(BaseSettings):
     #: on the setup request either way.
     sensitive_noa_replies: bool = False
 
+    #: Answer a roster-verified factoring company about a load that shows NO factor on
+    #: file — the pre-funding flow: factors verify rates BEFORE their NOA reaches us, so
+    #: Transport Pro still says remit-to self and the per-load factor match cannot fire.
+    #: The reply answers the rate/status question and asks for the NOA and billing
+    #: paperwork at ``documents_email``. Verification is roster membership (the domains
+    #: generated from the settlement export + hand-verified inline patches). A load
+    #: factored to a DIFFERENT company is unaffected — that always stays per-load bound.
+    factoring_prenoa_replies: bool = False
+
     # --- Amazon Bedrock (§8.1) — the deployed LLM provider -------------------
     aws_region: str = "us-east-1"
     #: Bedrock model / inference-profile id used to drive the agent loop in AWS.

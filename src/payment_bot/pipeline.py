@@ -305,6 +305,7 @@ class PaymentBotPipeline:
         # discloses; this is an efficiency measure, not a replacement.
         unauthorized: list[str] = []
         authorized_loads: list[str] = []
+        prenoa_loads: list[str] = []
         for load_id in load_ids:
             auth_out = self._registry.dispatch(
                 "check_authorization",
@@ -328,6 +329,8 @@ class PaymentBotPipeline:
                 unauthorized.append(f"{load_id}={auth.decision.value}{detail}")
                 continue
             authorized_loads.append(load_id)
+            if auth.pre_noa:
+                prenoa_loads.append(load_id)
         if not authorized_loads:
             return self._escalate(
                 email,
@@ -352,7 +355,7 @@ class PaymentBotPipeline:
         # reappear in the intake prompt.
         routes_map = {lid: routes[lid].value for lid in load_ids}
         skill, intake = self._select_skill(
-            email, classification, identifiers, load_ids, routes_map
+            email, classification, identifiers, load_ids, routes_map, prenoa_loads
         )
 
         # 3. Agent tool-use loop --------------------------------------------
@@ -477,6 +480,7 @@ class PaymentBotPipeline:
         identifiers: ExtractIdentifiersOutput,
         load_ids: list[str],
         routes_map: dict[str, str],
+        prenoa_loads: list[str],
     ) -> tuple[Skill, str]:
         """Pick the skill + build its intake from the classified intent.
 
@@ -508,6 +512,7 @@ class PaymentBotPipeline:
             reply_kw = {
                 "signature": self._settings.reply_signature,
                 "documents_email": self._settings.documents_email,
+                "prenoa_loads": prenoa_loads,
             }
             if chosen is RATE_VERIFICATION_SKILL:
                 return chosen, build_rate_verification_intake(
@@ -522,6 +527,7 @@ class PaymentBotPipeline:
         reply_kw = {
             "signature": self._settings.reply_signature,
             "documents_email": self._settings.documents_email,
+            "prenoa_loads": prenoa_loads,
         }
         if has_rate:
             intake = build_rate_verification_intake(

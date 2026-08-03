@@ -142,3 +142,22 @@ def test_a_load_id_before_an_unrelated_company_name_is_kept(ctx: ToolContext) ->
 
     out = _run(ctx, body="Load 2477822 - KARNAL FREIGHT SYSTEM INC is waiting on payment.")
     assert out.load_ids == ["2477822"], out.load_ids
+
+
+@pytest.mark.unit
+def test_numbers_inside_urls_are_not_load_ids(ctx: ToolContext) -> None:
+    """Verbatim from live mail: iThrive's signature links their LinkedIn company page,
+    and its 7-digit id became a phantom load that Transport Pro 400'd on — on every
+    email they ever sent."""
+
+    out = _run(
+        ctx,
+        subject="VERIFICATION REQUEST: Load #2515153",
+        body=(
+            "Please verify the rate.\n"
+            "[cid:2e6605ee] <https://www.linkedin.com/company/6425192>\n"
+            "Refer A Friend, Earn $200! Click Here<http://www.ithrive.com/refer?id=9988776>\n"
+            "www.tracking.example/track/1234567\n"
+        ),
+    )
+    assert out.load_ids == ["2515153"], out.load_ids

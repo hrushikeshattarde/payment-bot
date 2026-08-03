@@ -102,9 +102,16 @@ _NOT_A_LOAD_SUFFIX_RE = re.compile(
 )
 
 
+#: A URL, to be blanked before id scanning. Numbers inside links are never loads —
+#: observed live: iThrive's signature carries ``linkedin.com/company/6425192`` and every
+#: email they sent grew a phantom 7-digit "load" that Transport Pro 400'd on.
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+
+
 def _load_ids_in(text: str) -> list[str]:
     """6-7 digit ids in ``text``, skipping ones a nearby label disqualifies."""
 
+    text = _URL_RE.sub(" ", text)
     found: list[str] = []
     for match in _LOAD_ID_RE.finditer(text):
         before = text[max(0, match.start() - 24) : match.start()]
@@ -149,23 +156,63 @@ def _sender_domain(sender_email: str) -> str:
     return sender_email.rsplit("@", 1)[-1].strip().lower() if "@" in sender_email else ""
 
 
+#: Tokens generic to the factoring industry's names. An overlap on one of these links
+#: nothing: "Apex Capital" and "Alta Capital" share "capital" and are different companies,
+#: and answering one about the other's load is exactly the disclosure the authorization
+#: check exists to prevent. Kept separate from ``_STOPWORDS`` because the carrier-name
+#: match may tolerate these words while a factor-name LINK must not.
+_FACTOR_GENERIC_TOKENS = frozenset(
+    {
+        "factoring", "factors", "factor", "financial", "finance", "funding", "funds",
+        "capital", "credit", "bank", "banking", "solutions", "partners", "partner",
+        "commercial", "business", "payment", "payments", "national", "american",
+        "united", "trust", "advance",
+    }
+)  # fmt: skip
+
+
+def _factor_names_match(configured_name: str, on_file: str) -> bool:
+    """Does a configured factor entry name the factor recorded on the load?
+
+    The roster is generated from the settlement export's ``payName`` while the load
+    carries the remit-to company name, and the two spell the same factor differently —
+    "BUSBOT INCORPORATED DBA AXLE" in the export is "Axle Payments" on the load. A strict
+    substring test missed those, so a curated, correct domain entry still escalated.
+
+    Accepted links: containment in either direction, or overlap on a distinctive name
+    token. Industry-generic tokens (capital, financial, funding…) never link on their
+    own. The sender's domain equality stays exact regardless — this only decides which
+    roster entries are eligible to vouch for that domain.
+    """
+
+    key = configured_name.strip().lower()
+    name = on_file.strip().lower()
+    if not key or not name:
+        return False
+    if key in name or name in key:
+        return True
+    return bool(
+        (company_tokens(key) - _FACTOR_GENERIC_TOKENS)
+        & (company_tokens(name) - _FACTOR_GENERIC_TOKENS)
+    )
+
+
 def _is_configured_factor_domain(
     factoring_company: str, sender_email: str, ctx: ToolContext
 ) -> bool:
     """True when the sender's domain is configured for this load's factoring company.
 
-    Matched on the whole domain, never a substring, and the configured factor name must be
-    contained in the company recorded on the load — so an entry for "rts financial" answers
-    for "RTS Financial Service, Inc" but not for an unrelated factor.
+    Matched on the whole domain, never a substring, and the configured factor name must
+    match the company recorded on the load (see :func:`_factor_names_match`) — so an
+    entry for "rts financial" answers for "RTS Financial Service, Inc" but not for an
+    unrelated factor.
     """
 
     domain = _sender_domain(sender_email)
     if not domain:
         return False
-    on_file = factoring_company.strip().lower()
     for configured_name, domains in ctx.settings.factoring_domains.items():
-        key = configured_name.strip().lower()
-        if not key or key not in on_file:
+        if not _factor_names_match(configured_name, factoring_company):
             continue
         if any(domain == str(d).strip().lower().lstrip("@") for d in domains):
             return True

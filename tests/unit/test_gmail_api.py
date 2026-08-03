@@ -468,10 +468,15 @@ def test_since_adds_a_gmail_after_term() -> None:
 
 
 @pytest.mark.unit
-def test_limit_is_passed_as_max_results() -> None:
+def test_listing_window_is_wider_than_the_processing_limit() -> None:
+    """The limit caps how many emails a run PROCESSES, never how many messages are
+    listed. Sizing the listing to the limit starved fresh mail: with mark_seen off,
+    unread messages in already-answered threads keep matching the query forever, and ten
+    of them filled the whole window while a new carrier email sat unfetched (live)."""
+
     http = FakeHttp([("/messages?", 200, {})])
     _client(http, limit=3).fetch_new()
-    assert "maxResults=3" in http.requests[0]["url"]
+    assert "maxResults=100" in http.requests[0]["url"]
 
 
 # --- draft ------------------------------------------------------------------

@@ -53,6 +53,12 @@ _log = get_logger("clients.gmail_api")
 
 GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1"
 
+#: How many matching MESSAGES to list before thread filtering. Deliberately much larger
+#: than any per-run processing limit: with ``mark_seen`` off, unread messages in threads
+#: we already answered keep matching the intake query forever, and a listing window sized
+#: to the processing limit starves fresh mail behind them (observed live — see fetch_new).
+_LISTING_WINDOW = 100
+
 
 class SendingDisabledError(ClientError):
     """Raised when something tries to send mail in a draft-only run."""
@@ -137,9 +143,15 @@ class GmailApiClient:
         if since:
             query = f"{query} after:{since}".strip()
 
+        # List WIDE, filter, then apply the processing limit. The limit used to cap the
+        # listing itself, and because ``mark_seen`` is off, unread messages in threads we
+        # already answered accumulate and keep matching the query forever — observed live:
+        # ten newer vendor replies in answered threads filled the entire window and a fresh
+        # carrier email an hour old was never fetched, on every run. ``self._limit`` now
+        # means what it says: how many emails one run may PROCESS.
         listing = self._get(
             f"/users/{self._quoted_user()}/messages",
-            {"q": query, "maxResults": str(self._limit)},
+            {"q": query, "maxResults": str(_LISTING_WINDOW)},
         )
         matched = [
             (str(item["id"]), str(item.get("threadId") or ""))
@@ -172,6 +184,12 @@ class GmailApiClient:
                 "gmail_api_threads_skipped",
                 extra={"skipped": skipped, "reason": "already answered or already drafted"},
             )
+        if len(ids) > self._limit:
+            _log.warning(
+                "gmail_api_backlog",
+                extra={"actionable": len(ids), "processing": self._limit},
+            )
+            ids = ids[: self._limit]
         if not ids:
             _log.info("gmail_api_no_actionable_threads", extra={"query": query})
             return []

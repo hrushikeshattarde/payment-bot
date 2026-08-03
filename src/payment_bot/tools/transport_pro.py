@@ -213,7 +213,8 @@ class TpGetFileHistory(Tool):
         "Return which required documents are MISSING for a load (carrier invoice, "
         "proof of delivery/BOL, rate agreement), plus a per-category count of what is on "
         "file and whether a CANCEL LOAD confirmation exists. Read `missing_documents` — "
-        "do not infer it yourself. A cancel confirmation escalates."
+        "do not infer it yourself. A driver_upload row is a driver-app photo, not the "
+        "signed BOL: it never satisfies proof of delivery. A cancel confirmation escalates."
     )
     input_model = LoadIdInput
 

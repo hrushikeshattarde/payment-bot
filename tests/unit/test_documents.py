@@ -3,6 +3,10 @@
 The primary fixture is the **real** ``files/search`` response for load 2436795 — eleven
 rows, four of them duplicate rate agreements, and no proof of delivery anywhere. That load
 was flagged as "BOL missing" in Transport Pro, so it is the case this code exists to answer.
+
+The second fixture is load 2524781: two "Driver Supplied BOL" photos and a rate agreement.
+The live draft for that load chased only the invoice because the driver photos matched the
+``\\bbol\\b`` name fallback — the reply should have asked for the signed BOL too.
 """
 
 from __future__ import annotations
@@ -72,6 +76,26 @@ FILES_2436795: dict[str, Any] = {
 }
 
 
+# Verbatim from the live tenant: GET /files/search?recordType=loads&recordId=2524781
+FILES_2524781: dict[str, Any] = {
+    "pagination": {"totalRecords": 3, "perPage": 200, "currentPage": 0, "totalPages": 1},
+    "results": [
+        {"id": 30499089, "dateCreated": "2026-07-31T12:41:16Z", "uploadById": 3982,
+         "fileName": "30499089_23.pdf", "mimeType": "application/pdf",
+         "comments": "Rate and Dispatch Confirmation for load - 2524781",
+         "fileTypeId": 23, "fileTypeName": "Carrier Rate Agreement"},
+        {"id": 30516893, "dateCreated": "2026-08-01T02:01:16Z", "uploadById": 1,
+         "fileName": "30516893_363.pdf", "mimeType": "application/pdf",
+         "comments": "Driver Supplied Image - 2524781",
+         "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL"},
+        {"id": 30516894, "dateCreated": "2026-08-01T02:01:18Z", "uploadById": 1,
+         "fileName": "30516894_363.pdf", "mimeType": "application/pdf",
+         "comments": "Driver Supplied Image - 2524781",
+         "fileTypeId": 363, "fileTypeName": "Driver Supplied BOL"},
+    ],
+}
+
+
 def _rows(payload: dict[str, Any]) -> list[tuple[str, int | None, date | None, str | None]]:
     out = []
     for r in payload["results"]:
@@ -135,6 +159,20 @@ def test_adding_a_bol_clears_the_missing_list() -> None:
     assert status.is_complete is True
 
 
+# --- the driver-photo load ---------------------------------------------------
+@pytest.mark.unit
+def test_load_2524781_driver_photos_do_not_satisfy_proof_of_delivery() -> None:
+    """Two driver-app BOL photos on file, and the signed BOL is still owed."""
+
+    status, _ = assess_documents(_rows(FILES_2524781), load_id="2524781")
+
+    assert status.missing == [DocCategory.CARRIER_INVOICE, DocCategory.PROOF_OF_DELIVERY]
+    assert status.is_complete is False
+    assert DocCategory.RATE_AGREEMENT in status.present
+    counts = {s.category: s.count for s in status.by_category}
+    assert counts[DocCategory.DRIVER_UPLOAD] == 2
+
+
 # --- classification robustness ----------------------------------------------
 @pytest.mark.unit
 def test_classification_keys_on_the_stable_type_id() -> None:
@@ -155,6 +193,26 @@ def test_bol_and_pod_are_not_matched_as_substrings(name: str) -> None:
     """The old substring test reported delivery proof for 'symbolic' and 'podium'."""
 
     assert classify(name, None) is not DocCategory.PROOF_OF_DELIVERY
+
+
+@pytest.mark.unit
+def test_driver_supplied_bol_is_a_driver_upload_not_delivery_proof() -> None:
+    """By id, and by name when the id is uncatalogued — 'BOL' in the name must not win."""
+
+    assert classify("Driver Supplied BOL", 363) is DocCategory.DRIVER_UPLOAD
+    assert classify("Driver Supplied BOL", None) is DocCategory.DRIVER_UPLOAD
+
+
+@pytest.mark.unit
+def test_proof_of_delivery_type_id_is_catalogued() -> None:
+    assert classify("Proof of Delivery", 360) is DocCategory.PROOF_OF_DELIVERY
+
+
+@pytest.mark.unit
+def test_repair_invoice_is_not_a_carrier_invoice() -> None:
+    """The generic 'invoice' name fallback must not fire for the catalogued repair type."""
+
+    assert classify("Maintenance / Repair Invoice", 310) is DocCategory.OTHER
 
 
 @pytest.mark.unit

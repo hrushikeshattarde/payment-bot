@@ -11,6 +11,12 @@ Classification keys on ``fileTypeId`` because it is stable; ``fileTypeName`` is 
 fallback for ids we have not catalogued, and it is matched on word boundaries. That detail
 matters: a substring test for ``"bol"`` also fires on "symbolic" and "bollard", which would
 silently report proof of delivery that does not exist.
+
+A "Driver Supplied BOL" (id 363) is a raw photo pushed from the driver app — unindexed and
+unverified. It does not satisfy the proof-of-delivery requirement: the carrier still owes the
+signed BOL with their invoice, so those uploads get their own category. On live mail this
+mattered — load 2524781 carried two driver-supplied images and no signed BOL, and the draft
+chased only the invoice.
 """
 
 from __future__ import annotations
@@ -29,6 +35,8 @@ class DocCategory(StrEnum):
     CARRIER_INVOICE = "carrier_invoice"
     #: BOL or any delivery receipt — the PRD treats these as one "did it deliver" signal.
     PROOF_OF_DELIVERY = "proof_of_delivery"
+    #: Driver-app photo uploads ("Driver Supplied BOL"). Never counts as proof of delivery.
+    DRIVER_UPLOAD = "driver_upload"
     RATE_AGREEMENT = "rate_agreement"
     FREIGHT_BILL = "freight_bill"
     BILLING_PACKET = "billing_packet"
@@ -46,8 +54,10 @@ TYPE_ID_TO_CATEGORY: dict[int, DocCategory] = {
     103: DocCategory.CARRIER_INVOICE,
     12: DocCategory.PROOF_OF_DELIVERY,   # Bill of Lading
     335: DocCategory.PROOF_OF_DELIVERY,  # International BOL
+    360: DocCategory.PROOF_OF_DELIVERY,  # Proof of Delivery
     20: DocCategory.PROOF_OF_DELIVERY,   # Carrier Delivery Receipt
     53: DocCategory.PROOF_OF_DELIVERY,   # Delivery Receipt
+    363: DocCategory.DRIVER_UPLOAD,      # Driver Supplied BOL — not the signed BOL
     23: DocCategory.RATE_AGREEMENT,      # Carrier Rate Agreement
     81: DocCategory.FREIGHT_BILL,
     319: DocCategory.BILLING_PACKET,
@@ -57,11 +67,14 @@ TYPE_ID_TO_CATEGORY: dict[int, DocCategory] = {
     77: DocCategory.SETTLEMENT,          # Final Settlement
     315: DocCategory.REMITTANCE,         # Check Remittance
     16: DocCategory.REMITTANCE,          # Cancelled Check
+    310: DocCategory.OTHER,              # Maintenance / Repair Invoice — not a carrier invoice
     123: DocCategory.OTHER,
 }
 
 #: Word-boundary name patterns, used only when the id is unknown to us.
 _NAME_PATTERNS: tuple[tuple[re.Pattern[str], DocCategory], ...] = (
+    # Before the BOL/POD pattern: "Driver Supplied BOL" must not read as delivery proof.
+    (re.compile(r"\bdriver\s+supplied\b", re.I), DocCategory.DRIVER_UPLOAD),
     (re.compile(r"\bcarrier\s+invoice\b", re.I), DocCategory.CARRIER_INVOICE),
     (re.compile(r"\bbill\s+of\s+lading\b|\bbol\b|\bpod\b|\bproof\s+of\s+delivery\b"
                 r"|\bdelivery\s+receipt\b", re.I), DocCategory.PROOF_OF_DELIVERY),

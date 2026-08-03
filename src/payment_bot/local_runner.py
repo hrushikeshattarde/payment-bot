@@ -342,6 +342,13 @@ def check_configuration(settings: Settings | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A Windows console defaults to cp1252, and drafts routinely carry characters outside
+    # it (an em dash was enough). One unencodable character must degrade to '?' in the
+    # report, not kill the run mid-inbox with drafts left unwritten.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
     parser = argparse.ArgumentParser(
         prog="payment-bot-local",
         description="Draft carrier replies locally from the paystatus inbox. Never sends email.",

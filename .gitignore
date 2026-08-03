@@ -52,3 +52,4 @@ factoring_domains.json
 docs/ESCALATIONS.md
 # Settlements exports (factor remit emails) — internal data, repo is public.
 data-*.csv
+logs/

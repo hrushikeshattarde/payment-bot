@@ -32,15 +32,25 @@ def reply_subject(subject: str) -> str:
     return cleaned if cleaned.lower().startswith("re:") else f"Re: {cleaned}"
 
 
+_FOLDED_HEADER_RE = re.compile(r"\s*[\r\n]+\s*")
+
+
 def decode_header_value(value: str | None) -> str:
-    """Decode RFC 2047 encoded-words (``=?utf-8?B?…?=``) into plain text."""
+    """Decode RFC 2047 encoded-words (``=?utf-8?B?…?=``) into plain text, unfolded.
+
+    Long headers arrive folded across lines (RFC 5322 §2.2.3) and Python hands the
+    newlines through. They must not survive: a folded Subject fed back into a reply
+    crashed draft creation with "Header values may not contain linefeed" — observed live
+    on an OTR Solutions rate verification whose subject wrapped after the carrier name.
+    """
 
     if not value:
         return ""
     try:
-        return str(make_header(decode_header(value))).strip()
+        decoded = str(make_header(decode_header(value)))
     except (UnicodeDecodeError, LookupError, ValueError):
-        return value.strip()
+        decoded = value
+    return _FOLDED_HEADER_RE.sub(" ", decoded).strip()
 
 
 def body_text(message: EmailMessage) -> tuple[str, str | None]:
@@ -77,8 +87,79 @@ def body_text(message: EmailMessage) -> tuple[str, str | None]:
     return "", None
 
 
+#: Cap on text pulled from one attachment. A statement never needs more; a pathological
+#: file must not balloon the intake prompt or the audit trail.
+_MAX_ATTACHMENT_TEXT = 100_000
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+
+def _xlsx_text(payload: bytes) -> str:
+    """Cell values of every worksheet, tab-separated per row. Stdlib only, never raises.
+
+    Carriers and factors send load lists as spreadsheets; the load ids live here and
+    nowhere in the body. Formulas are skipped (cached values are read), shared strings
+    resolved. Anything unreadable yields "" — lenient, like the rest of this module.
+    """
+
+    import contextlib
+    import io
+    import zipfile
+    from xml.etree import ElementTree
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in archive.namelist():
+                root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+                shared = [
+                    "".join(t.text or "" for t in si.iter(f"{_XLSX_NS}t"))
+                    for si in root.iter(f"{_XLSX_NS}si")
+                ]
+            lines: list[str] = []
+            sheets = sorted(n for n in archive.namelist() if n.startswith("xl/worksheets/sheet"))
+            for name in sheets:
+                sheet = ElementTree.fromstring(archive.read(name))
+                for row in sheet.iter(f"{_XLSX_NS}row"):
+                    cells: list[str] = []
+                    for cell in row.iter(f"{_XLSX_NS}c"):
+                        value = cell.find(f"{_XLSX_NS}v")
+                        text = value.text if value is not None and value.text else ""
+                        if cell.get("t") == "s" and text:
+                            with contextlib.suppress(ValueError, IndexError):
+                                text = shared[int(text)]
+                        cells.append(text)
+                    if any(cells):
+                        lines.append("\t".join(cells))
+                    if sum(len(line) for line in lines) > _MAX_ATTACHMENT_TEXT:
+                        return "\n".join(lines)[:_MAX_ATTACHMENT_TEXT]
+            return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _attachment_text(content_type: str, filename: str, payload: bytes) -> str:
+    """Extract searchable text from spreadsheet attachments; "" for everything else.
+
+    Only spreadsheet types: they are where statement load ids live, they parse with the
+    stdlib, and their content is data rather than prose. PDFs and images are out of
+    scope — no parser dependency, and OCR territory.
+    """
+
+    lower_name = filename.lower()
+    if content_type == _XLSX_MIME or lower_name.endswith(".xlsx"):
+        return _xlsx_text(payload)
+    if content_type in {"text/csv", "application/csv"} or lower_name.endswith(".csv"):
+        try:
+            return payload.decode("utf-8", errors="replace")[:_MAX_ATTACHMENT_TEXT]
+        except Exception:
+            return ""
+    return ""
+
+
 def attachments(message: EmailMessage) -> list[EmailAttachment]:
-    """Attachment **metadata** only — enough for ``detect_sensitive_change`` (§4.2)."""
+    """Attachment metadata, plus extracted text for spreadsheet types (§4.2)."""
 
     out: list[EmailAttachment] = []
     for part in message.walk():
@@ -87,11 +168,19 @@ def attachments(message: EmailMessage) -> list[EmailAttachment]:
             continue
         payload = part.get_payload(decode=True)
         size = len(payload) if isinstance(payload, bytes | bytearray) else None
+        decoded_name = decode_header_value(filename)
+        content_type = part.get_content_type()
+        extracted = (
+            _attachment_text(content_type, decoded_name, bytes(payload))
+            if isinstance(payload, bytes | bytearray)
+            else ""
+        )
         out.append(
             EmailAttachment(
-                filename=decode_header_value(filename),
-                mime_type=part.get_content_type(),
+                filename=decoded_name,
+                mime_type=content_type,
                 size_bytes=size,
+                extracted_text=extracted,
             )
         )
     return out
@@ -102,6 +191,7 @@ def parse_inbound_email(
     *,
     thread_id: str | None = None,
     labels: list[str] | None = None,
+    group_address: str | None = None,
 ) -> InboundEmail:
     """Normalise a parsed MIME message into our :class:`InboundEmail`.
 
@@ -111,12 +201,29 @@ def parse_inbound_email(
             supplies a real ``threadId``; without one we fall back to the root of the
             ``References`` chain.
         labels: Backend labels, if available.
+        group_address: The monitored group's own address. When From equals it, the real
+            sender was rewritten away by Google Groups (DMARC) and is recovered from the
+            headers the rewrite leaves behind.
     """
 
     message_id = decode_header_value(message.get("Message-ID")) or decode_header_value(
         message.get("Message-Id")
     )
     from_name, from_email = parseaddr(decode_header_value(message.get("From")))
+
+    # Google Groups rewrites DMARC-strict senders: "teamamy via Payment Status
+    # <paystatus@…>". Authorization must judge the *real* sender — otherwise the group's
+    # own address is what gets checked, and it matches nothing. The rewrite preserves the
+    # original in X-Original-Sender / X-Original-From / Reply-To (verified live on an OTR
+    # Solutions message carrying all three).
+    if group_address and from_email.lower() == group_address.strip().lower():
+        for header in ("X-Original-Sender", "X-Original-From", "Reply-To"):
+            original_name, original_email = parseaddr(decode_header_value(message.get(header)))
+            if original_email and original_email.lower() != group_address.strip().lower():
+                from_email = original_email
+                # "teamamy via Payment Status" → keep the sender part of the display name.
+                from_name = original_name or (from_name.split(" via ")[0] if from_name else "")
+                break
 
     if thread_id is None:
         references = decode_header_value(message.get("References")).split()

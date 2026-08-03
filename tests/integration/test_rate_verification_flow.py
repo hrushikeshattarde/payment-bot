@@ -120,3 +120,56 @@ def test_rate_verification_never_auto_sends_even_in_phase2() -> None:
     assert result.outcome is Outcome.REJECTED  # approval was required, then rejected
     assert gmail.sent == []
     assert len(slack.approvals) == 1  # it WAS posted for human approval, not auto-sent
+
+
+@pytest.mark.integration
+def test_noa_wording_drafts_when_the_policy_allows_it() -> None:
+    """PAYBOT_SENSITIVE_NOA_REPLIES: NOA action WORDING no longer blocks an authorized
+    sender's answerable rate question. The setup request itself is never acknowledged
+    (gate check #9) and still needs a human to action."""
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    settings = Settings(sensitive_noa_replies=True)
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)),
+        gmail,
+        slack,
+        audit,
+        settings=settings,
+    )
+    noa_email = InboundEmail(
+        message_id="msg-noa-policy-2",
+        thread_id="t",
+        from_email=SAMPLE_SENDER_EMAIL,
+        subject="Rate Verification - Load 2462934",
+        body="Please add our NOA and set up factoring, then verify the rate shows $4,650.",
+    )
+
+    result = pipeline.process_email(noa_email)
+
+    assert result.outcome is Outcome.SENT, result.detail
+    assert slack.escalations == []
+
+
+@pytest.mark.integration
+def test_an_noa_attachment_still_escalates_with_every_policy_on() -> None:
+    """Paperwork beats policy: the attached NOA must be verified and filed by a person."""
+
+    from payment_bot.models import EmailAttachment
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    settings = Settings(sensitive_noa_replies=True, sensitive_bank_replies=True)
+    pipeline = _build(AutoApproveResolver(), gmail, slack, audit, settings=settings)
+    noa_email = InboundEmail(
+        message_id="msg-noa-policy-3",
+        thread_id="t",
+        from_email=SAMPLE_SENDER_EMAIL,
+        subject="Rate Verification - Load 2462934",
+        body="Please verify the rate shows $4,650.",
+        attachments=[EmailAttachment(filename="Notice_Of_Assignment.pdf", mime_type="application/pdf")],
+    )
+
+    result = pipeline.process_email(noa_email)
+
+    assert result.outcome is Outcome.ESCALATED
+    assert "noa_setup_change" in result.detail

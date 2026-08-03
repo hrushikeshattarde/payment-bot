@@ -208,3 +208,108 @@ def test_genuine_bank_change_still_escalates_after_the_fix(ctx: ToolContext) -> 
     )
     assert out.action is SensitiveAction.ESCALATE
     assert SensitiveFlag.BANK_CHANGE in out.flags
+
+
+# --- NOA word boundaries -------------------------------------------------------
+@pytest.mark.unit
+def test_a_factors_own_name_is_not_an_noa_action(ctx: ToolContext) -> None:
+    """Verbatim from live mail: "Aladdin Factoring" matched `add…Factor` by substring.
+
+    A rate-verification request signed with the factor's name escalated as an NOA setup
+    change — and would have re-escalated on every email that company ever sent.
+    """
+
+    out = _run(
+        ctx,
+        subject="Verification - 2524681",
+        body=(
+            "Hello,\nCan you please verify the rate on the below load and confirm if any "
+            "advances or deductions have been taken?\n\nLoad: 2524681\nNet Pay: $1,550.00\n\n"
+            "Thank you,\nAladdin Factoring"
+        ),
+    )
+    assert SensitiveFlag.NOA_SETUP_CHANGE not in out.flags
+    assert out.action is SensitiveAction.CONTINUE
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Please add our NOA and set up factoring for these loads.",
+        "Attached is a copy of our notice of assignment.",
+        "We have updated the factoring on this account.",
+        "Kindly register the attached NOA.",
+    ],
+)
+def test_genuine_noa_actions_still_escalate(ctx: ToolContext, body: str) -> None:
+    out = _run(ctx, body=body)
+    assert SensitiveFlag.NOA_SETUP_CHANGE in out.flags
+
+
+# --- §7 hard/soft evidence -------------------------------------------------------
+_OTR_TEMPLATE = (
+    "Hello, Please review the information below, if correct CLICK HERE to confirm.\n"
+    "Please advise if the load has delivered without incident and carrier is in good "
+    "standing.\nPlease ensure remittance is updated to OTR Solutions or advise if a "
+    "Notice of Assignment is required.\n\nCarrier Name: G & A Trucking LLC (MC-1207945)"
+)
+
+
+@pytest.mark.unit
+def test_factoring_template_boilerplate_is_soft(ctx: ToolContext) -> None:
+    """The OTR rate-verification template, verbatim from live mail (§7's 5-of-6 case)."""
+
+    out = _run(ctx, subject="Rate Verification - Load #2516049", body=_OTR_TEMPLATE)
+    assert SensitiveFlag.BANK_CHANGE in out.flags
+    assert out.hard is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("subject", "body"),
+    [
+        ("", "Please confirm that the payment remit address has been updated."),
+        ("Update banking information", "New details below."),
+        ("", "Please add our NOA and set up factoring."),
+    ],
+)
+def test_explicit_signals_stay_hard(ctx: ToolContext, subject: str, body: str) -> None:
+    out = _run(ctx, subject=subject, body=body)
+    assert out.hard is True
+
+
+@pytest.mark.unit
+def test_a_void_check_attachment_stays_hard(ctx: ToolContext) -> None:
+    out = DetectSensitiveChange().run(
+        DetectSensitiveChangeInput(
+            subject="Rate verification",
+            body="Verify the rate please.",
+            attachments_metadata=[AttachmentMeta(filename="voidcheck.pdf")],
+        ),
+        ctx,
+    )
+    assert out.hard is True
+
+
+@pytest.mark.unit
+def test_confirming_existing_payment_details_is_not_a_change(ctx: ToolContext) -> None:
+    """WEX's payment-inquiry template, verbatim from live mail.
+
+    Asking us to CONFIRM payment went to their existing remit address is verification —
+    the most common factor template shape — not a ratify-the-change ask. An earlier
+    confirm-pattern (confirm + any payment noun) escalated every email WEX ever sent.
+    """
+
+    out = _run(
+        ctx,
+        subject="Payment Inquiry CIRCLE LOGISTICS, INC (IN) (7 DIGIT LOAD#S)",
+        body=(
+            "If payment has been issued to WEX please also provide the below items in order "
+            "to expedite the payment processing.\nPlease confirm the following payment "
+            "information:\nConfirm payment going to Wex Bank P.O. Box 94565 Cleveland Ohio "
+            "44101\nCheck number\nDate issued/Date Mailed\nCheck Amount\nCopy of cleared "
+            "check, if the check has been cashed."
+        ),
+    )
+    assert out.hard is False

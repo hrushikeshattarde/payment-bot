@@ -14,6 +14,10 @@ Checks (all must pass):
 4. **Placeholders** — the draft contains no unfilled template markers.
 5. **Length routing** — every disclosed load is a valid 6/7-digit id.
 6. **Bulk** — the disclosed-load count is within the portal-fallback threshold.
+7. **Tool mentions** — the reply body names no internal tool.
+8. **Coverage** — the draft addresses every load the agent was asked to answer.
+9. **Change acknowledgment** — the reply never confirms or acts on a remittance/bank/NOA
+   instruction (the §7 compensating control behind the boilerplate narrowing).
 """
 
 from __future__ import annotations
@@ -29,13 +33,22 @@ from payment_bot.logging import get_logger
 from payment_bot.models import AuthDecision, InboundEmail, SensitiveFlag, System
 from payment_bot.tools.base import ToolContext
 from payment_bot.tools.shared import (
+    _BANK_CHANGE_REQUEST_RE as _BANK_CHANGE_REQUEST_RE_GATE,
+)
+from payment_bot.tools.shared import (
+    _BANK_REQUEST_PATTERNS as _BANK_REQUEST_PATTERNS_GATE,
+)
+from payment_bot.tools.shared import (
+    _NOA_ACTION_RE as _NOA_ACTION_RE_GATE,
+)
+from payment_bot.tools.shared import (
     AttachmentMeta,
     CheckAuthorization,
     CheckAuthorizationInput,
     DetectSensitiveChange,
     DetectSensitiveChangeInput,
 )
-from payment_bot.tools.submit import SubmitDraftOutput
+from payment_bot.tools.submit import TOOL_NAMES, SubmitDraftOutput
 
 _log = get_logger("gate")
 
@@ -106,7 +119,16 @@ class PreSendGate:
         draft: SubmitDraftOutput,
         email: InboundEmail,
         ctx: ToolContext,
+        expected_load_ids: tuple[str, ...] | None = None,
     ) -> GateResult:
+        """Run all checks.
+
+        Args:
+            expected_load_ids: The loads the agent was asked to answer, when a specific
+                set exists. ``None`` for code-authored replies (the bulk portal draft),
+                which deliberately name no load.
+        """
+
         checks = [
             self._check_length_routing(draft),
             self._check_bulk(draft, ctx),
@@ -114,6 +136,9 @@ class PreSendGate:
             self._check_sensitive_change(email, ctx),
             self._check_placeholders(draft),
             self._check_grounding(draft, ctx),
+            self._check_tool_mentions(draft),
+            self._check_coverage(draft, expected_load_ids),
+            self._check_change_acknowledgment(draft),
         ]
         allowed = all(c.passed for c in checks)
         result = GateResult(allowed=allowed, checks=checks)
@@ -205,14 +230,60 @@ class PreSendGate:
             ctx,
         )
         flags = [f for f in outcome.flags if f is not SensitiveFlag.NONE]
-        if flags:
+        blocked = (
+            outcome.paperwork
+            or (outcome.hard_bank and not ctx.settings.sensitive_bank_replies)
+            or (outcome.hard_noa and not ctx.settings.sensitive_noa_replies)
+        )
+        if flags and blocked:
             return GateCheck(
                 name="sensitive_change",
                 passed=False,
                 detail=f"sensitive change detected: {[f.value for f in flags]}",
             )
+        if flags:
+            # Boilerplate (§7) or bank wording admitted by the sensitive_bank_replies
+            # policy: what the gate enforces instead is that the DRAFT acknowledges
+            # nothing — see change_acknowledgment, which runs on every draft.
+            return GateCheck(
+                name="sensitive_change",
+                passed=True,
+                detail="change wording present; draft checked for acknowledgment instead",
+            )
         return GateCheck(
             name="sensitive_change", passed=True, detail="no bank/NOA/contact change detected"
+        )
+
+    def _check_change_acknowledgment(self, draft: SubmitDraftOutput) -> GateCheck:
+        """The reply must never acknowledge or act on a remittance/bank/NOA instruction.
+
+        This is the §7 compensating control that makes the boilerplate narrowing safe: the
+        bot cannot change remittance, so the only real risk was a reply that *reads as if
+        it did*. The draft body is scanned with the same patterns the email scan uses — a
+        change word near a payment noun, an explicit request phrase, an NOA action.
+        """
+
+        body = draft.reply_body
+        problems: list[str] = []
+        for phrase, pattern in _BANK_REQUEST_PATTERNS_GATE:
+            if pattern.search(body.lower()):
+                problems.append(f"bank phrase {phrase!r}")
+        match = _BANK_CHANGE_REQUEST_RE_GATE.search(body)
+        if match:
+            problems.append(f"change wording {' '.join(match.group(0).split())!r}")
+        noa = _NOA_ACTION_RE_GATE.search(body)
+        if noa:
+            problems.append(f"NOA action {noa.group(0).strip()!r}")
+        if problems:
+            return GateCheck(
+                name="change_acknowledgment",
+                passed=False,
+                detail=f"draft acknowledges a payment-change instruction: {problems}",
+            )
+        return GateCheck(
+            name="change_acknowledgment",
+            passed=True,
+            detail="reply acknowledges no remittance/bank/NOA instruction",
         )
 
     def _check_placeholders(self, draft: SubmitDraftOutput) -> GateCheck:
@@ -243,6 +314,54 @@ class PreSendGate:
             name="placeholders",
             passed=False,
             detail=f"draft was never filled in: {'; '.join(problems)}",
+        )
+
+    def _check_tool_mentions(self, draft: SubmitDraftOutput) -> GateCheck:
+        """No internal tool name in the carrier-facing text.
+
+        ``submit_draft`` already strips these mechanically, so through the normal path
+        this cannot fail — it guards the other routes to the gate (human edits, future
+        code-authored drafts) and any future tool the sanitizer misses. Observed live
+        before the sanitizer existed: "[tp_get_load_summary]" in a reply body.
+        """
+
+        mentioned = sorted(name for name in TOOL_NAMES if name in draft.reply_body)
+        if mentioned:
+            return GateCheck(
+                name="tool_mentions",
+                passed=False,
+                detail=f"reply body names internal tools: {mentioned}",
+            )
+        return GateCheck(name="tool_mentions", passed=True, detail="no tool names in the reply")
+
+    def _check_coverage(
+        self, draft: SubmitDraftOutput, expected_load_ids: tuple[str, ...] | None
+    ) -> GateCheck:
+        """Every load the agent was asked about must be addressed in the reply.
+
+        Observed live: a carrier asked about two loads and the draft silently answered
+        one — a reviewer skimming the draft would not know the second was dropped. A load
+        counts as addressed when it appears in ``load_ids`` (disclosed) or is named in the
+        body (e.g. a hold reply: "load 2520677 is under review").
+        """
+
+        if expected_load_ids is None:
+            return GateCheck(
+                name="coverage", passed=True, detail="code-authored reply; no expected loads"
+            )
+        missing = [
+            lid
+            for lid in expected_load_ids
+            if lid not in draft.load_ids and lid not in draft.reply_body
+        ]
+        if missing:
+            return GateCheck(
+                name="coverage",
+                passed=False,
+                detail=f"draft does not address load(s) {missing}",
+            )
+        return GateCheck(
+            name="coverage", passed=True, detail="every requested load is addressed"
         )
 
     def _check_grounding(self, draft: SubmitDraftOutput, ctx: ToolContext) -> GateCheck:

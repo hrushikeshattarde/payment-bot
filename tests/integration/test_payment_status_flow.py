@@ -168,6 +168,126 @@ def test_unauthorized_sender_escalates_before_the_agent_runs() -> None:
 
 
 @pytest.mark.integration
+def test_a_stray_6_digit_number_does_not_block_a_valid_load() -> None:
+    """A mixed email proceeds with its 7-digit loads instead of escalating whole.
+
+    Observed live: "Re: 2476340 - Need payment status" carried a stray '107430' in the
+    body, and one non-Transport-Pro id used to stop the whole email.
+    """
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), gmail, slack, audit
+    )
+    mixed = sample_payment_status_email().model_copy(
+        update={
+            "message_id": "msg-mixed-1",
+            "body": "Need payment status for load 2462934. Our reference 107430.",
+        }
+    )
+
+    result = pipeline.process_email(mixed)
+
+    assert result.outcome is Outcome.SENT, result.detail
+    assert "non-Transport-Pro" not in (result.detail or "")
+    assert slack.escalations == []
+
+
+@pytest.mark.integration
+def test_an_unresolvable_load_is_dropped_not_fatal() -> None:
+    """A phantom id the API errors on must not reach the agent or block the email.
+
+    Observed live: an email naming a real load plus an id Transport Pro 400s on made the
+    agent burn all 12 iterations retrying the phantom, producing no draft.
+    """
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), gmail, slack, audit
+    )
+    phantom = sample_payment_status_email().model_copy(
+        update={
+            "message_id": "msg-phantom-1",
+            "body": "Payment status for 2462934 and 9999998 please.",
+        }
+    )
+
+    result = pipeline.process_email(phantom)
+
+    assert result.outcome is Outcome.SENT, result.detail
+    assert slack.escalations == []
+    # The intake pre-check tried both loads; the phantom errored and was dropped.
+    intake_auth = [
+        e
+        for e in audit.for_correlation("msg-phantom-1")
+        if e.tool_name == "check_authorization" and e.request.get("load_id") == "9999998"
+    ]
+    assert intake_auth and not intake_auth[0].ok
+
+
+@pytest.mark.integration
+def test_loads_found_only_in_an_attachment_are_answered() -> None:
+    """A statement email whose load ids live in the spreadsheet, not the body."""
+
+    from payment_bot.models import EmailAttachment
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), gmail, slack, audit
+    )
+    statement = sample_payment_status_email().model_copy(
+        update={
+            "message_id": "msg-att-1",
+            "body": "Hello, please see the attached statement.",
+            "attachments": [
+                EmailAttachment(
+                    filename="statement.xlsx",
+                    mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    extracted_text="Load #\tAmount\n2462934\t4650.00",
+                )
+            ],
+        }
+    )
+
+    result = pipeline.process_email(statement)
+
+    assert result.outcome is Outcome.SENT, result.detail
+    assert slack.escalations == []
+
+
+@pytest.mark.integration
+def test_bulk_attachment_loads_get_the_portal_reply() -> None:
+    """More attachment loads than the threshold → the self-service portal link."""
+
+    from payment_bot.models import EmailAttachment
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), gmail, slack, audit
+    )
+    rows = "\n".join(f"25200{n:02d}" for n in range(1, 8))  # seven 7-digit ids
+    bulk = sample_payment_status_email().model_copy(
+        update={
+            "message_id": "msg-att-bulk-1",
+            "body": "Payment status for the attached loads please.",
+            "attachments": [
+                EmailAttachment(
+                    filename="loads.xlsx",
+                    mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    extracted_text=rows,
+                )
+            ],
+        }
+    )
+
+    result = pipeline.process_email(bulk)
+
+    assert result.outcome is Outcome.SENT, result.detail
+    assert "payment-status-lookup" in gmail.sent[0].body  # the portal link
+    assert slack.escalations == []
+
+
+@pytest.mark.integration
 def test_phase2_single_load_auto_sends_without_approval() -> None:
     gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
     settings = Settings(rollout_phase=RolloutPhase.SELECTIVE_AUTOSEND)
@@ -228,3 +348,81 @@ def test_combined_intent_is_no_longer_escalated_as_unanswerable() -> None:
     result = pipeline.process_email(combined)
 
     assert "intent not answerable" not in (result.detail or "")
+
+
+@pytest.mark.integration
+def test_bank_wording_drafts_when_the_policy_allows_it() -> None:
+    """PAYBOT_SENSITIVE_BANK_REPLIES: an authorized sender's status question is answered
+    even when the email also asks to switch payment method. The instruction itself is
+    ignored (prompt rule) and can never be acknowledged (gate check #9)."""
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    settings = Settings(sensitive_bank_replies=True)
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)),
+        gmail,
+        slack,
+        audit,
+        settings=settings,
+    )
+    email = sample_payment_status_email().model_copy(
+        update={
+            "message_id": "msg-achswitch-1",
+            "body": (
+                "Payment status for load 2462934 please. Also, can we please be switched "
+                "to ACH pay and not checks? USPS is extremely slow."
+            ),
+        }
+    )
+
+    result = pipeline.process_email(email)
+
+    assert result.outcome is Outcome.SENT, result.detail
+    assert slack.escalations == []
+
+
+@pytest.mark.integration
+def test_bank_wording_still_escalates_by_default() -> None:
+    """The strict default is unchanged: same email, no policy switch, security escalation."""
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(AutoApproveResolver(), gmail, slack, audit)
+    email = sample_payment_status_email().model_copy(
+        update={
+            "message_id": "msg-achswitch-2",
+            "body": (
+                "Payment status for load 2462934 please. Also, can we please be switched "
+                "to ACH pay and not checks?"
+            ),
+        }
+    )
+
+    result = pipeline.process_email(email)
+
+    assert result.outcome is Outcome.ESCALATED
+    assert "sensitive change" in result.detail
+
+
+@pytest.mark.integration
+def test_noa_attachment_still_escalates_despite_the_bank_policy() -> None:
+    """Paperwork is not wording: an NOA attachment escalates whatever the policy says."""
+
+    from payment_bot.models import EmailAttachment
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    settings = Settings(sensitive_bank_replies=True)
+    pipeline = _build(AutoApproveResolver(), gmail, slack, audit, settings=settings)
+    email = sample_payment_status_email().model_copy(
+        update={
+            "message_id": "msg-noa-policy-1",
+            "body": "Payment status for load 2462934 please.",
+            "attachments": [
+                EmailAttachment(filename="ACME_NOA.pdf", mime_type="application/pdf")
+            ],
+        }
+    )
+
+    result = pipeline.process_email(email)
+
+    assert result.outcome is Outcome.ESCALATED
+    assert "noa_setup_change" in result.detail

@@ -171,7 +171,7 @@ def test_groq_drives_the_loop_and_the_draft_is_posted_not_sent() -> None:
 
     # The gate still ran in full and passed.
     assert result.gate_result is not None and result.gate_result.allowed
-    assert [c.passed for c in result.gate_result.checks] == [True] * 6
+    assert all(c.passed for c in result.gate_result.checks)
 
     # The draft reached Slack, with the reviewer on Cc.
     assert len(slack.approvals) == 1

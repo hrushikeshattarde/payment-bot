@@ -62,7 +62,7 @@ def test_payment_status_passes_the_gate_on_live_api_shapes() -> None:
 
     assert result.outcome is Outcome.SENT, result.detail
     assert result.gate_result is not None and result.gate_result.allowed
-    assert [c.passed for c in result.gate_result.checks] == [True] * 6
+    assert all(c.passed for c in result.gate_result.checks)
     assert len(gmail.sent) == 1
     assert gmail.sent[0].body == PAYMENT_STATUS_DRAFT_BODY
     assert gmail.sent[0].to == SAMPLE_SENDER_EMAIL

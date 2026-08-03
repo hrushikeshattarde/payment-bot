@@ -57,3 +57,35 @@ def test_missing_file_fails_loudly(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_no_file_configured_changes_nothing() -> None:
     assert Settings().factoring_domains == {}
+
+
+@pytest.mark.unit
+def test_reply_signature_reaches_the_intake_prompt() -> None:
+    """The sign-off is config, not model choice — a live draft once signed as the carrier."""
+
+    from payment_bot.agent.skills import build_payment_status_intake
+    from payment_bot.sample_data import sample_payment_status_email
+
+    intake = build_payment_status_intake(
+        sample_payment_status_email(),
+        ["2462934"],
+        {"2462934": "transport_pro"},
+        signature="Hrushikesh Attarde, Circle Delivers Payments",
+    )
+    assert "Sign the reply exactly as: Hrushikesh Attarde, Circle Delivers Payments" in intake
+
+
+@pytest.mark.unit
+def test_documents_email_reaches_the_intake_prompt() -> None:
+    """Missing-paperwork replies must name where to send documents — from config."""
+
+    from payment_bot.agent.skills import build_payment_status_intake
+    from payment_bot.sample_data import sample_payment_status_email
+
+    intake = build_payment_status_intake(
+        sample_payment_status_email(),
+        ["2462934"],
+        {"2462934": "transport_pro"},
+        documents_email="freightpay@circledelivers.com",
+    )
+    assert "Missing paperwork should be emailed to: freightpay@circledelivers.com" in intake

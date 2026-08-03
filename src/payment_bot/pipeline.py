@@ -186,7 +186,15 @@ class PaymentBotPipeline:
 
         ident_out = self._registry.dispatch(
             "extract_identifiers",
-            {"subject": email.subject, "body": email.body, "thread_text": email.thread_text},
+            {
+                "subject": email.subject,
+                "body": email.body,
+                "thread_text": email.thread_text,
+                # Spreadsheet statements carry their load ids here and nowhere in the body.
+                "attachments_text": "\n".join(
+                    a.extracted_text for a in email.attachments if a.extracted_text
+                ),
+            },
             ctx,
         )
         identifiers = ExtractIdentifiersOutput.model_validate(ident_out.payload)
@@ -210,10 +218,35 @@ class PaymentBotPipeline:
         )
         sensitive = DetectSensitiveChangeOutput.model_validate(det_out.payload)
         if sensitive.action is SensitiveAction.ESCALATE:
-            flags = [f.value for f in sensitive.flags]
-            return self._escalate(
-                email, "security", f"sensitive change {flags}", tuple(load_ids), correlation_id
-            )
+            # Three tiers (§7 + the sensitive_bank_replies policy):
+            #   * paperwork/identity actions (NOA, void-check/DD attachments, contact
+            #     change) — ALWAYS escalate; there is something to file or verify.
+            #   * hard bank WORDING with an answerable ask — escalates unless the
+            #     deployment explicitly opted in to answering past it.
+            #   * soft boilerplate with an answerable ask — proceeds.
+            # A change instruction with no real question escalates in every tier, and the
+            # gate's change_acknowledgment check enforces that no reply ever confirms or
+            # acts on the instruction it is ignoring.
+            wording_allowed = (
+                not sensitive.hard_bank or self._settings.sensitive_bank_replies
+            ) and (not sensitive.hard_noa or self._settings.sensitive_noa_replies)
+            if sensitive.paperwork or not classification.keyword_grounded or not wording_allowed:
+                flags = [f.value for f in sensitive.flags]
+                return self._escalate(
+                    email, "security", f"sensitive change {flags}", tuple(load_ids), correlation_id
+                )
+            if sensitive.hard_bank or sensitive.hard_noa:
+                # Proceeding past explicit change wording is a policy decision; make the
+                # audit trail shout about it — a human still has to action the request.
+                _log.warning(
+                    "bank_change_language_allowed_by_policy",
+                    extra={"correlation_id": correlation_id, "evidence": sensitive.evidence},
+                )
+            else:
+                _log.info(
+                    "sensitive_boilerplate_narrowed",
+                    extra={"correlation_id": correlation_id, "evidence": sensitive.evidence},
+                )
 
         routes = {lid: route_load(lid).system for lid in load_ids}
         invalid = [lid for lid, sys in routes.items() if sys is System.INVALID]
@@ -235,20 +268,43 @@ class PaymentBotPipeline:
 
         non_tp = [lid for lid, sys in routes.items() if sys is not System.TRANSPORT_PRO]
         if non_tp:
-            # 6-digit / QuickBooks path is not wired in this slice.
-            return self._escalate(
-                email, "review", f"non-Transport-Pro loads {non_tp}", tuple(load_ids), correlation_id
+            tp_loads = [lid for lid, sys in routes.items() if sys is System.TRANSPORT_PRO]
+            if not tp_loads:
+                # 6-digit / QuickBooks path is not wired in this slice.
+                return self._escalate(
+                    email,
+                    "review",
+                    f"non-Transport-Pro loads {non_tp}",
+                    tuple(load_ids),
+                    correlation_id,
+                )
+            # A mixed email proceeds with its answerable loads. One stray 6-digit number
+            # used to stop the whole email — observed live: "Re: 2476340 - Need payment
+            # status" carried '107430' in the body and the answerable 7-digit load
+            # escalated with it. The dropped ids are logged; a human reviewing the draft
+            # sees the full ask in the thread.
+            _log.info(
+                "non_tp_loads_dropped",
+                extra={
+                    "correlation_id": correlation_id,
+                    "dropped": non_tp,
+                    "proceeding_with": tp_loads,
+                },
             )
+            load_ids = tp_loads
 
         # Authorization pre-check: the same `check_authorization` the gate re-runs (§5),
         # brought forward to before the model is invoked. When NO load is authorized, no
         # draft could disclose anything, so running the agent only spends the LLM budget on
         # a reply the gate is certain to block — measured on 30 days of live mail, 16 of 29
-        # conversations stopped exactly that way. A *partially* authorized email proceeds:
-        # the skill prompt discloses only ALLOW loads, and a draft restricted to those can
-        # pass the gate honestly. The gate stays authoritative over what the draft actually
+        # conversations stopped exactly that way. A *partially* authorized email proceeds
+        # with only its authorized loads: handing the agent a denied or unresolvable load
+        # just burns iterations re-discovering the verdict — observed live, one email with
+        # a phantom id that Transport Pro 400s on ate all 12 iterations retrying it and
+        # produced no draft. The gate stays authoritative over what the draft actually
         # discloses; this is an efficiency measure, not a replacement.
         unauthorized: list[str] = []
+        authorized_loads: list[str] = []
         for load_id in load_ids:
             auth_out = self._registry.dispatch(
                 "check_authorization",
@@ -270,7 +326,9 @@ class PaymentBotPipeline:
                 # add to PAYBOT_FACTORING_DOMAINS), which is what the reviewer acts on.
                 detail = f" ({auth.reason})" if auth.reason else ""
                 unauthorized.append(f"{load_id}={auth.decision.value}{detail}")
-        if len(unauthorized) == len(load_ids):
+                continue
+            authorized_loads.append(load_id)
+        if not authorized_loads:
             return self._escalate(
                 email,
                 "review",
@@ -281,22 +339,21 @@ class PaymentBotPipeline:
         if unauthorized:
             _log.info(
                 "authorization_precheck_partial",
-                extra={"correlation_id": correlation_id, "unauthorized": unauthorized},
+                extra={
+                    "correlation_id": correlation_id,
+                    "unauthorized": unauthorized,
+                    "proceeding_with": authorized_loads,
+                },
             )
+            load_ids = authorized_loads
 
         # 2. Select the skill by intent -------------------------------------
-        routes_map = {lid: sys.value for lid, sys in routes.items()}
-        selected = self._select_skill(email, classification, identifiers, load_ids, routes_map)
-        if selected is None:
-            intents = [i.value for i in classification.intents]
-            return self._escalate(
-                email,
-                "review",
-                f"intent not answerable in this slice: {intents}",
-                tuple(load_ids),
-                correlation_id,
-            )
-        skill, intake = selected
+        # Built from load_ids, not routes: dropped loads (non-TP, unauthorized) must not
+        # reappear in the intake prompt.
+        routes_map = {lid: routes[lid].value for lid in load_ids}
+        skill, intake = self._select_skill(
+            email, classification, identifiers, load_ids, routes_map
+        )
 
         # 3. Agent tool-use loop --------------------------------------------
         agent_result = self._loop.run(
@@ -340,7 +397,13 @@ class PaymentBotPipeline:
         """
 
         # 4. Pre-send gate (deterministic, §5) ------------------------------
-        gate_result = self._gate.evaluate(draft=draft, email=email, ctx=ctx)
+        # The bulk portal reply is code-authored and deliberately names no load, so it
+        # carries no expected-coverage list; an agent draft must address every load the
+        # intake handed it.
+        expected = None if skill_id == _BULK_PORTAL_SKILL_ID else tuple(load_ids)
+        gate_result = self._gate.evaluate(
+            draft=draft, email=email, ctx=ctx, expected_load_ids=expected
+        )
         if not gate_result.allowed:
             return self._escalate(
                 email,
@@ -389,7 +452,9 @@ class PaymentBotPipeline:
             body = decision.edited_text
             # Re-run the gate on the human's edit — approval does not bypass grounding/auth.
             edited = draft.model_copy(update={"reply_body": body})
-            regate = self._gate.evaluate(draft=edited, email=email, ctx=ctx)
+            regate = self._gate.evaluate(
+                draft=edited, email=email, ctx=ctx, expected_load_ids=expected
+            )
             if not regate.allowed:
                 return self._escalate(
                     email,
@@ -412,11 +477,12 @@ class PaymentBotPipeline:
         identifiers: ExtractIdentifiersOutput,
         load_ids: list[str],
         routes_map: dict[str, str],
-    ) -> tuple[Skill, str] | None:
+    ) -> tuple[Skill, str]:
         """Pick the skill + build its intake from the classified intent.
 
-        Returns ``None`` when the email is not answerable in this slice (combined
-        payment+rate intent, or unclear) — the caller escalates.
+        Always answers: by the time this runs the email has at least one valid,
+        authorized Transport Pro load, and an unclear ask about a real load defaults to
+        payment status — a human reviews the draft regardless.
         """
 
         has_payment = Intent.PAYMENT_STATUS in classification.intents
@@ -439,6 +505,10 @@ class PaymentBotPipeline:
                     "stated_rates": len(identifiers.stated_rates),
                 },
             )
+            reply_kw = {
+                "signature": self._settings.reply_signature,
+                "documents_email": self._settings.documents_email,
+            }
             if chosen is RATE_VERIFICATION_SKILL:
                 return chosen, build_rate_verification_intake(
                     email,
@@ -446,16 +516,38 @@ class PaymentBotPipeline:
                     routes_map,
                     identifiers.stated_rates,
                     identifiers.factoring_company,
+                    **reply_kw,
                 )
-            return chosen, build_payment_status_intake(email, load_ids, routes_map)
+            return chosen, build_payment_status_intake(email, load_ids, routes_map, **reply_kw)
+        reply_kw = {
+            "signature": self._settings.reply_signature,
+            "documents_email": self._settings.documents_email,
+        }
         if has_rate:
             intake = build_rate_verification_intake(
-                email, load_ids, routes_map, identifiers.stated_rates, identifiers.factoring_company
+                email,
+                load_ids,
+                routes_map,
+                identifiers.stated_rates,
+                identifiers.factoring_company,
+                **reply_kw,
             )
             return RATE_VERIFICATION_SKILL, intake
         if has_payment:
-            return PAYMENT_STATUS_SKILL, build_payment_status_intake(email, load_ids, routes_map)
-        return None  # uncertain / neither
+            return PAYMENT_STATUS_SKILL, build_payment_status_intake(
+                email, load_ids, routes_map, **reply_kw
+            )
+        # Uncertain intent but the email names loads (possibly only inside an attached
+        # statement — "please see attached" carries no keyword). Same reasoning as the
+        # classifier's own fallback: this inbox exists to answer payment status, and a
+        # human reviews the draft regardless.
+        _log.info(
+            "intent_defaulted_payment_status",
+            extra={"load_count": len(load_ids)},
+        )
+        return PAYMENT_STATUS_SKILL, build_payment_status_intake(
+            email, load_ids, routes_map, **reply_kw
+        )
 
     def _bulk_portal_draft(self, email: InboundEmail) -> SubmitDraftOutput:
         """Build the §3.3 bulk reply: point the sender at the self-service portal.

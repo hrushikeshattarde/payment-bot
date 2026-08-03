@@ -161,6 +161,40 @@ class Settings(BaseSettings):
     #: — the agent never chooses recipients.
     reply_cc: tuple[str, ...] = ()
 
+    #: The sign-off every draft ends with. Injected into the intake message, because on
+    #: live mail the model invented identities when left to choose — one draft signed as
+    #: the *carrier's* company ("SAM AUTO TRANS LLC Accounting"), i.e. as the person it was
+    #: replying to. Config, not prompt text, so each deployment signs as its own team.
+    reply_signature: str = "Circle Delivers Payments"
+
+    #: Where senders should email missing paperwork. When ``tp_get_file_history`` reports a
+    #: required document absent (a missing carrier invoice is exactly why many loads sit
+    #: unscheduled), the reply names what is missing and asks for it at this address —
+    #: turning "your payment is pending" into an answer the sender can act on.
+    documents_email: str = "freightpay@circledelivers.com"
+
+    #: Draft status replies even when the email contains bank/ACH change WORDING, provided
+    #: the sender is authorized and asked something answerable. A deliberate policy switch
+    #: (like ``allow_factoring``), defaulting to the strict behaviour.
+    #:
+    #: What makes it defensible when on: the bot can move no money; every draft is
+    #: human-reviewed; the ``change_acknowledgment`` gate check forbids a reply from
+    #: confirming or acting on the instruction; and disclosure is still gated by
+    #: authorization. What it does NOT relax: paperwork and identity actions (NOA setup,
+    #: void-check / direct-deposit / NOA attachments, contact changes) and change
+    #: instructions with no answerable ask — those always escalate. The change request
+    #: itself still needs a human to action; the reply merely stops being held hostage
+    #: to it.
+    sensitive_bank_replies: bool = False
+
+    #: The NOA counterpart of ``sensitive_bank_replies``: draft status replies past NOA
+    #: action WORDING ("we've updated the factoring", "please add our NOA") for authorized
+    #: senders with an answerable ask. An actual NOA **attachment** always escalates — a
+    #: Notice of Assignment is a legal document someone must verify and file, which no
+    #: status reply can do. Gate check #9 forbids the reply from acknowledging or acting
+    #: on the setup request either way.
+    sensitive_noa_replies: bool = False
+
     # --- Amazon Bedrock (§8.1) — the deployed LLM provider -------------------
     aws_region: str = "us-east-1"
     #: Bedrock model / inference-profile id used to drive the agent loop in AWS.

@@ -461,6 +461,67 @@ def test_exact_free_mail_contact_still_allows(grounded_ctx: ToolContext) -> None
     assert result.allowed, result.reasons
 
 
+# --- Tool mentions and coverage -------------------------------------------------
+@pytest.mark.unit
+def test_a_tool_name_in_the_body_is_blocked(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Backstop behind submit_draft's sanitizer — other routes to the gate stay covered."""
+
+    body = _GOOD_BODY + " [tp_get_load_summary]"
+    result = PreSendGate().evaluate(
+        draft=_draft(body=body), email=sample_email, ctx=grounded_ctx
+    )
+    assert not result.allowed
+    assert _checks(result)["tool_mentions"] is False
+
+
+@pytest.mark.unit
+def test_a_skipped_load_fails_coverage(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Observed live: a carrier asked about two loads; the draft silently answered one."""
+
+    result = PreSendGate().evaluate(
+        draft=_draft(),  # answers 2462934 only
+        email=sample_email,
+        ctx=grounded_ctx,
+        expected_load_ids=("2462934", "2193195"),
+    )
+    assert not result.allowed
+    assert _checks(result)["coverage"] is False
+    assert any("2193195" in reason for reason in result.reasons)
+
+
+@pytest.mark.unit
+def test_a_hold_reply_naming_the_load_passes_coverage(grounded_ctx: ToolContext) -> None:
+    """A hold reply discloses nothing but must still show it addressed the load."""
+
+    hold = _draft(body="Load 2462934 is under review; we will follow up shortly.", load_ids=[])
+    result = PreSendGate().evaluate(
+        draft=hold,
+        email=_from("billing@ideaexpedited.com"),
+        ctx=grounded_ctx,
+        expected_load_ids=("2462934",),
+    )
+    assert _checks(result)["coverage"] is True
+
+
+@pytest.mark.unit
+def test_no_expected_loads_means_coverage_is_not_enforced(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The code-authored bulk portal reply names no load, deliberately."""
+
+    result = PreSendGate().evaluate(
+        draft=_draft(body="You can check these on the portal.", load_ids=[]),
+        email=sample_email,
+        ctx=grounded_ctx,
+        expected_load_ids=None,
+    )
+    assert _checks(result)["coverage"] is True
+
+
 @pytest.mark.unit
 def test_a_configured_domain_is_still_subject_to_the_policy_switch(
     grounded_ctx: ToolContext,
@@ -495,3 +556,49 @@ def test_a_subdomain_or_lookalike_is_not_the_configured_domain(
             draft=_draft(), email=_from(address), ctx=ctx
         )
         assert not result.allowed, address
+
+
+# --- Change acknowledgment (§7 compensating control) ----------------------------
+@pytest.mark.unit
+def test_a_draft_acknowledging_a_remit_change_is_blocked(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    body = _GOOD_BODY + " We have updated the remittance to OTR Solutions as requested."
+    result = PreSendGate().evaluate(
+        draft=_draft(body=body), email=sample_email, ctx=grounded_ctx
+    )
+    assert not result.allowed
+    assert _checks(result)["change_acknowledgment"] is False
+
+
+@pytest.mark.unit
+def test_ordinary_factoring_facts_pass_the_acknowledgment_check(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Stating who a load is payable to is reporting, not acknowledging a change."""
+
+    result = PreSendGate().evaluate(
+        draft=_draft(), email=sample_email, ctx=grounded_ctx
+    )
+    assert _checks(result)["change_acknowledgment"] is True
+
+
+@pytest.mark.unit
+def test_soft_boilerplate_email_passes_the_gate_with_a_clean_draft(
+    grounded_ctx: ToolContext,
+) -> None:
+    """§7: the OTR template proceeds; the gate polices the draft instead of the email."""
+
+    boilerplate = InboundEmail(
+        message_id="m",
+        thread_id="t",
+        from_email="billing@ideaexpedited.com",
+        subject="Rate Verification - Load 2462934",
+        body=(
+            "Please verify the rate.\nPlease ensure remittance is updated to OTR Solutions "
+            "or advise if a Notice of Assignment is required."
+        ),
+    )
+    result = PreSendGate().evaluate(draft=_draft(), email=boilerplate, ctx=grounded_ctx)
+    assert result.allowed, result.reasons
+    assert _checks(result)["sensitive_change"] is True

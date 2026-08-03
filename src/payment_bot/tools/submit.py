@@ -12,9 +12,46 @@ reviewers an at-a-glance provenance trail.
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field
 
 from payment_bot.tools.base import Tool, ToolContext
+
+#: Every tool name in the registry, spelled out statically so this module imports nothing
+#: heavy. A unit test asserts this stays equal to ``build_default_registry``'s names.
+TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "classify_intent", "extract_identifiers", "route_load", "detect_sensitive_change",
+        "check_authorization", "carrier_cross_check", "compute_scheduled_pay_date",
+        "compute_carrier_rate", "tp_get_load_summary", "tp_get_dispatch_history",
+        "tp_get_settlement_entries", "tp_get_file_history", "tp_get_noa_factoring",
+        "submit_draft",
+    }
+)  # fmt: skip
+
+_NAMES_ALTERNATION = "|".join(sorted(TOOL_NAMES))
+#: A tool name in the reply text, with or without bracket/paren wrapping. Observed live:
+#: "a payment of $900 [tp_get_load_summary] scheduled for Thursday, August 13, 2026
+#: [compute_scheduled_pay_date]" reached a carrier-facing draft — the model pasted its
+#: citation markers into the prose despite the prompt forbidding it.
+_TOOL_MENTION_RE = re.compile(
+    rf"\s*[\[\(]\s*(?:{_NAMES_ALTERNATION})\s*[\]\)]|\s*\b(?:{_NAMES_ALTERNATION})\b"
+)
+
+
+def strip_tool_mentions(text: str) -> str:
+    """Remove tool-name markers from a reply body, mechanically.
+
+    Deterministic and meaning-preserving: tool names never appear legitimately in a reply
+    to a carrier, so deleting them (and tidying the spacing left behind) cannot change
+    what the draft says. Prompt rules alone did not hold — this makes the cleanup code.
+    """
+
+    cleaned = _TOOL_MENTION_RE.sub("", text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"[ \t]+([,.;:!?])", r"\1", cleaned)
+    return cleaned
 
 
 class Citation(BaseModel):
@@ -68,8 +105,17 @@ class SubmitDraft(Tool):
 
     def run(self, params: BaseModel, ctx: ToolContext) -> SubmitDraftOutput:
         assert isinstance(params, SubmitDraftInput)
+        # Tool-name markers are stripped mechanically — citations belong in the citations
+        # field, and prompt rules alone did not keep them out of the prose.
+        body = strip_tool_mentions(params.reply_body).rstrip()
+        # The sign-off is likewise enforced here, not hoped for: three live drafts in one
+        # day omitted it despite the intake instruction. Appended only when the configured
+        # signature is not already present near the end, so a compliant draft is untouched.
+        signature = ctx.settings.reply_signature.strip()
+        if signature and signature.lower() not in body[-200:].lower():
+            body = f"{body}\n\n{signature}"
         return SubmitDraftOutput(
-            reply_body=params.reply_body,
+            reply_body=body,
             to=params.to,
             load_ids=params.load_ids,
             citations=params.citations,

@@ -82,6 +82,7 @@ class GmailApiClient:
         mark_read: bool = False,
         transport: HttpTransport | None = None,
         timeout: float = 30.0,
+        group_address: str = "",
     ) -> None:
         self._tokens = token_source
         self._user = user or token_source.subject
@@ -90,6 +91,12 @@ class GmailApiClient:
         self._mark_read = mark_read
         self._transport: HttpTransport = transport or UrllibTransport()
         self._timeout = timeout
+        #: The monitored group address (``paystatus@…``). Google Groups rewrites the From
+        #: of DMARC-strict external senders to this address ("teamamy via Payment Status
+        #: <paystatus@…>"), so mail *from* it is a carrier arriving through the group —
+        #: never a colleague. Without this, every unanswered email from such a sender was
+        #: skipped as "already answered by us" and the sender was invisible to the bot.
+        self._group = group_address.strip().lower()
 
     @property
     def user(self) -> str:
@@ -189,6 +196,7 @@ class GmailApiClient:
                     email.message_from_bytes(decoded),
                     thread_id=str(record.get("threadId") or "") or None,
                     labels=[str(label) for label in (record.get("labelIds") or [])],
+                    group_address=self._group or None,
                 )
             )
 
@@ -311,11 +319,21 @@ class GmailApiClient:
         return str(newest.get("id") or "") or None
 
     def _is_ours(self, from_header: str) -> bool:
-        """True when a message was sent from our own domain."""
+        """True when a message was sent by someone on our side — a colleague or ourselves.
+
+        The monitored group address itself is the exception: DMARC-strict external senders
+        arrive with From rewritten to exactly that address, so it marks a carrier coming
+        *through* the group, not a reply going out. Verified live: an OTR Solutions rate
+        verification read "teamamy via Payment Status <paystatus@…>" and was skipped as
+        already-answered until this carve-out existed.
+        """
 
         _, address = parseaddr(from_header)
+        normalized = address.lower()
+        if self._group and normalized == self._group:
+            return False
         domain = self._user.rsplit("@", 1)[-1].lower()
-        return bool(domain) and address.lower().endswith(f"@{domain}")
+        return bool(domain) and normalized.endswith(f"@{domain}")
 
     def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
         url = f"{GMAIL_API_ROOT}{path}"
@@ -435,4 +453,6 @@ def build_gmail_api_client(
         mark_read=resolved.gmail_mark_seen,
         transport=transport,
         timeout=resolved.google_timeout_seconds,
+        # The group whose From-rewritten mail must not read as "ours" (DMARC senders).
+        group_address=resolved.mailbox,
     )

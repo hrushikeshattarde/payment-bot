@@ -148,9 +148,11 @@ def _save_draft(
 
     try:
         return gmail.create_draft(email, result.draft.reply_body, settings.reply_cc)
-    except PaymentBotError as exc:
-        # A failed draft save must not look like a failed run: the draft text is already in
-        # the console report above, so surface the problem and carry on.
+    except Exception as exc:
+        # A failed draft save must not look like a failed run — and must never kill the
+        # emails still queued behind it: the draft text is already in the console report
+        # above, so surface the problem and carry on. Broad on purpose; a ValueError from
+        # a malformed header once crashed the whole runner mid-batch.
         print(f"  ! could not save the Gmail draft: {exc}")
         _log.warning("gmail_draft_failed", extra={"error": str(exc)})
         return None

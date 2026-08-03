@@ -434,10 +434,24 @@ def test_ownership_is_by_domain_not_by_the_impersonated_mailbox() -> None:
 
     client = _client(FakeHttp([]))
     assert client._is_ours("Angelica <angelica.baracao@circledelivers.com>") is True
-    assert client._is_ours("paystatus@circledelivers.com") is True
     assert client._is_ours(f"Carrier <{_CARRIER}>") is False
     # A lookalike domain must not read as ours.
     assert client._is_ours("x@notcircledelivers.com") is False
+
+
+@pytest.mark.unit
+def test_the_group_address_itself_is_never_ours() -> None:
+    """DMARC-strict senders arrive From-rewritten to exactly the group address.
+
+    Observed live: "teamamy via Payment Status <paystatus@…>" was an OTR Solutions rate
+    verification, and treating it as ours skipped every unanswered email that company ever
+    sent. A colleague's own address on the same domain still counts as answered.
+    """
+
+    client = _client(FakeHttp([]), group_address="paystatus@circledelivers.com")
+    assert client._is_ours("teamamy via Payment Status <paystatus@circledelivers.com>") is False
+    assert client._is_ours("Angelica <angelica.baracao@circledelivers.com>") is True
+    assert client._is_ours(f"Carrier <{_CARRIER}>") is False
 
 
 @pytest.mark.unit

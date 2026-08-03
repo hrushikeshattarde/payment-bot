@@ -244,6 +244,10 @@ class ExtractIdentifiersInput(BaseModel):
     subject: str = ""
     body: str = ""
     thread_text: str = ""
+    #: Text extracted from spreadsheet attachments (xlsx/csv). Carriers send statements
+    #: whose load ids appear nowhere in the body; this is where they surface. Feeds
+    #: identifier extraction only — never the sensitive-change scan.
+    attachments_text: str = ""
 
 
 class ExtractIdentifiersOutput(BaseModel):
@@ -268,7 +272,11 @@ class ExtractIdentifiers(Tool):
 
     def run(self, params: BaseModel, ctx: ToolContext) -> ExtractIdentifiersOutput:
         assert isinstance(params, ExtractIdentifiersInput)
-        text = "\n".join(p for p in (params.subject, params.body, params.thread_text) if p)
+        text = "\n".join(
+            p
+            for p in (params.subject, params.body, params.thread_text, params.attachments_text)
+            if p
+        )
 
         load_ids = _dedupe(_load_ids_in(text))
         invoice_numbers = _dedupe(_INVOICE_RE.findall(text))
@@ -355,6 +363,24 @@ class DetectSensitiveChangeOutput(BaseModel):
     flags: list[SensitiveFlag]
     evidence: list[str]
     action: SensitiveAction
+    #: True when the evidence is unambiguous — an explicit request phrase ("update bank",
+    #: "void check"), a bank/NOA attachment, an NOA action, a contact change, or a
+    #: "confirm the change was made" ask. False when the ONLY evidence is proximity
+    #: phrasing (a change word near a payment noun) — the shape of factoring template
+    #: boilerplate ("Please ensure remittance is updated to OTR Solutions…"), which per
+    #: ESCALATIONS.md §7 may proceed when the email also carries an answerable ask, with
+    #: the gate enforcing that the reply never acknowledges the instruction.
+    hard: bool = True
+    #: Per-category hard WORDING, so each policy switch governs exactly its own language:
+    #: ``sensitive_bank_replies`` may draft past ``hard_bank`` (explicit bank/ACH
+    #: instructions), ``sensitive_noa_replies`` past ``hard_noa`` (NOA action wording).
+    hard_bank: bool = False
+    hard_noa: bool = False
+    #: True when the email carries an ARTIFACT or identity action rather than language:
+    #: a void-check / direct-deposit / NOA attachment, or a contact change. These always
+    #: escalate — there is paperwork to file or an identity to re-verify, and a status
+    #: reply cannot do either — regardless of any wording policy.
+    paperwork: bool = False
 
 
 # Phrase → flag. NOA/factoring only escalates on an action verb (add/update/attach…),
@@ -388,22 +414,58 @@ _CHANGE_WORDS = (
     # "send" would re-catch ordinary asks such as "send us the remittance advice".
     "below", "as follows", "following",
 )  # fmt: skip
-#: A change word within ~8 words of a payment detail, in either order.
+#: A change word within ~8 words of a payment detail, split by ORDER, because order is
+#: what separates an instruction from boilerplate (§7):
+#:
+#: * verb first — "please **update our bank** account number" — acts ON the detail; an
+#:   instruction aimed at us. Always HARD.
+#: * detail first — "remittance **is updated** to OTR Solutions" — passive template
+#:   wording describing the sender's own arrangement. SOFT: may proceed when the email
+#:   also asks something answerable, with the gate policing the draft.
 #:
 #: The ``\b`` anchors are load-bearing. Without them "ach" matched inside "e**ach**", so
 #: "the status of each load listed below" read as a request to redirect payment by ACH.
+_CHANGES_ALT = "|".join(re.escape(w) for w in _CHANGE_WORDS)
+_DETAILS_ALT = "|".join(re.escape(d) for d in _BANK_DETAIL_PHRASES)
+_BANK_CHANGE_ACTIVE_RE = re.compile(
+    rf"\b(?:{_CHANGES_ALT})\b\W(?:\w+\W){{0,8}}?\b(?:{_DETAILS_ALT})\b", re.IGNORECASE
+)
+_BANK_CHANGE_PASSIVE_RE = re.compile(
+    rf"\b(?:{_DETAILS_ALT})\b\W(?:\w+\W){{0,8}}?\b(?:{_CHANGES_ALT})\b", re.IGNORECASE
+)
+#: Either order — used by the gate's change_acknowledgment check on DRAFT text, where any
+#: shape of change wording is disqualifying.
 _BANK_CHANGE_REQUEST_RE = re.compile(
-    r"(?:\b(?:{changes})\b\W(?:\w+\W){{0,8}}?\b(?:{details})\b"
-    r"|\b(?:{details})\b\W(?:\w+\W){{0,8}}?\b(?:{changes})\b)".format(
-        changes="|".join(re.escape(w) for w in _CHANGE_WORDS),
-        details="|".join(re.escape(d) for d in _BANK_DETAIL_PHRASES),
-    ),
-    re.IGNORECASE,
+    rf"(?:{_BANK_CHANGE_ACTIVE_RE.pattern}|{_BANK_CHANGE_PASSIVE_RE.pattern})", re.IGNORECASE
 )
 _CONTACT_PHRASES = (
     "change email", "update email", "new email address", "change our email",
     "update contact", "new contact email", "change of email",
 )  # fmt: skip
+
+#: "Confirm the change has been made" — asks us to *ratify* a redirect, which is always a
+#: hard escalation (§7): "please confirm that the payment remit address has been updated".
+#:
+#: A CHANGE word inside the clause is required, and only the strong ones (not the
+#: positional "below"/"following"). "Confirm payment going to Wex Bank P.O. Box 94565" is
+#: a factor VERIFYING its existing remit address — the single most common payment-inquiry
+#: template shape — and an earlier version of this pattern (confirm + any payment noun)
+#: escalated it on every email WEX ever sent.
+_STRONG_CHANGE_WORDS = tuple(
+    w for w in _CHANGE_WORDS if w not in ("below", "as follows", "following")
+)
+_STRONG_CHANGES_ALT = "|".join(re.escape(w) for w in _STRONG_CHANGE_WORDS)
+#: Bare nouns are fine here — unlike the proximity scan, this pattern also demands a
+#: strong change word in the same clause, so "confirm ... account" alone cannot fire.
+_CONFIRM_DETAILS_ALT = (
+    r"remit(?:tance)?|bank|account|payment\s+method|noa|notice\s+of\s+assignment"
+)
+_CONFIRM_CHANGE_RE = re.compile(
+    rf"\bconfirm\w*\b\W(?:\w+\W){{0,10}}?"
+    rf"(?:\b(?:{_STRONG_CHANGES_ALT})\b\W(?:\w+\W){{0,6}}?\b(?:{_CONFIRM_DETAILS_ALT})\b"
+    rf"|\b(?:{_CONFIRM_DETAILS_ALT})\b\W(?:\w+\W){{0,6}}?\b(?:{_STRONG_CHANGES_ALT})\b)",
+    re.IGNORECASE,
+)
 
 
 def _phrase_pattern(phrase: str) -> re.Pattern[str]:
@@ -454,9 +516,20 @@ def strip_quoted(body: str) -> str:
         if found is not None:
             earliest = min(earliest, found.start())
     return body[:earliest]
+#: An NOA/factoring *action* — verb near the noun. Both sides are word-bounded, and the
+#: verbs spell out their inflections rather than substring-matching them: without the
+#: boundaries, "Al**add**in Factoring" — a real factor's signature — matched (`add` inside
+#: the name, `Factor` within 30 chars), so every email that company ever sent escalated as
+#: an NOA change. Same bug class as "ach" inside "attached", fixed the same way.
 _NOA_ACTION_RE = re.compile(
-    r"(add|attach|update|change|set\s*up|setup|assign|register|remove|release)\D{0,30}"
-    r"(noa|notice of assignment|factor)",
+    # "assignment" is deliberately NOT a verb form: it is the noun in "notice of
+    # assignment", and including it made the phrase "notice of assignment or factoring"
+    # match itself (assignment → verb, factoring → noun) in a draft that was *reporting*
+    # nothing is on file.
+    r"\b(?:add(?:ed|ing)?|attach(?:ed|ing|ment)?|updat(?:e|ed|ing)|chang(?:e|ed|ing)"
+    r"|set\s*up|setup|assign(?:ed|ing)?|register(?:ed|ing)?|remov(?:e|ed|ing)"
+    r"|releas(?:e|ed|ing))\b\D{0,30}"
+    r"\b(?:noa|notice\s+of\s+assignment|factor(?:ing|s)?)\b",
     re.IGNORECASE,
 )
 
@@ -478,34 +551,55 @@ class DetectSensitiveChange(Tool):
         haystack = written.lower()
         flags: list[SensitiveFlag] = []
         evidence: list[str] = []
+        hard_bank = False
+        hard_noa = False
 
         for phrase, pattern in _BANK_REQUEST_PATTERNS:
             if pattern.search(haystack):
                 _add(flags, SensitiveFlag.BANK_CHANGE)
                 evidence.append(f"bank: matched {phrase!r}")
+                hard_bank = True  # a request phrase is self-evidently an instruction
 
         # A payment-detail noun alone is not a request — a change word must sit near it.
-        for match in _BANK_CHANGE_REQUEST_RE.finditer(written):
+        # Verb-first ("update our bank…") is an instruction aimed at us: HARD. Detail-first
+        # ("remittance is updated to X") is passive template boilerplate: the one SOFT
+        # signal.
+        for match in _BANK_CHANGE_ACTIVE_RE.finditer(written):
+            _add(flags, SensitiveFlag.BANK_CHANGE)
+            evidence.append(f"bank: change instructed — {' '.join(match.group(0).split())!r}")
+            hard_bank = True
+        for match in _BANK_CHANGE_PASSIVE_RE.finditer(written):
             _add(flags, SensitiveFlag.BANK_CHANGE)
             evidence.append(f"bank: change requested — {' '.join(match.group(0).split())!r}")
 
+        # Asking us to *ratify* a change is hard, whatever shape the wording takes.
+        if _CONFIRM_CHANGE_RE.search(written):
+            _add(flags, SensitiveFlag.BANK_CHANGE)
+            evidence.append("bank: asks to confirm a change was made")
+            hard_bank = True
+
+        paperwork = False
         for match in _NOA_ACTION_RE.finditer(written):
             _add(flags, SensitiveFlag.NOA_SETUP_CHANGE)
             evidence.append(f"noa_setup: matched {match.group(0).strip()!r}")
+            hard_noa = True
 
         for phrase, pattern in _CONTACT_PATTERNS:
             if pattern.search(haystack):
                 _add(flags, SensitiveFlag.EMAIL_CONTACT_CHANGE)
                 evidence.append(f"contact: matched {phrase!r}")
+                paperwork = True
 
         for att in params.attachments_metadata:
             lower = att.filename.lower()
             if any(k in lower for k in ("voidcheck", "void_check", "void-check", "directdeposit")):
                 _add(flags, SensitiveFlag.BANK_CHANGE)
                 evidence.append(f"bank: attachment {att.filename!r}")
+                paperwork = True
             if "noa" in lower or "assignment" in lower:
                 _add(flags, SensitiveFlag.NOA_SETUP_CHANGE)
                 evidence.append(f"noa_setup: attachment {att.filename!r}")
+                paperwork = True
 
         if not flags:
             flags.append(SensitiveFlag.NONE)
@@ -513,7 +607,15 @@ class DetectSensitiveChange(Tool):
         else:
             action = SensitiveAction.ESCALATE
 
-        return DetectSensitiveChangeOutput(flags=flags, evidence=evidence, action=action)
+        return DetectSensitiveChangeOutput(
+            flags=flags,
+            evidence=evidence,
+            action=action,
+            hard=hard_bank or hard_noa or paperwork,
+            hard_bank=hard_bank,
+            hard_noa=hard_noa,
+            paperwork=paperwork,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +927,11 @@ class ClassifyIntentOutput(BaseModel):
     intents: list[Intent]
     confidence: float
     secondary_asks: list[str]
+    #: True when the intent came from an actual keyword match, False when it is the
+    #: names-a-load fallback. The §7 sensitive-change narrowing keys off this: template
+    #: boilerplate may proceed only when the email *asked something answerable in words* —
+    #: a bare change instruction with a load number attached must still escalate.
+    keyword_grounded: bool = False
 
 
 #: Phrases that mean "check our rate against yours".
@@ -904,7 +1011,12 @@ class ClassifyIntent(Tool):
         confidence = 0.9 if len(intents) == 1 and intents[0] is not Intent.UNCERTAIN else (
             0.6 if has_rate and has_payment else 0.3
         )
-        return ClassifyIntentOutput(intents=intents, confidence=confidence, secondary_asks=secondary)
+        return ClassifyIntentOutput(
+            intents=intents,
+            confidence=confidence,
+            secondary_asks=secondary,
+            keyword_grounded=has_rate or has_payment,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -62,6 +62,14 @@ _log = get_logger("pipeline")
 #: PAYMENT_STATUS_SKILL.id, or a bulk reply could auto-send in Phase 2.
 _BULK_PORTAL_SKILL_ID = "bulk_portal"
 
+#: Absolute cap on a derived iteration budget, however many loads an email names.
+#:
+#: The per-load budget scales (see `_iteration_budget`), but it must still terminate: this is
+#: the backstop that keeps a runaway model bounded, which is the whole point of having a cap.
+#: Set to the same 50 that bounds `agent_max_iterations` in configuration, so a derived
+#: budget can never exceed what an operator could have set by hand.
+ITERATION_CEILING = 50
+
 #: The §3.3 bulk reply. Deliberately contains no amount, date or load id — see
 #: `_bulk_portal_draft` for why that is what makes it safe.
 #:
@@ -367,11 +375,13 @@ class PaymentBotPipeline:
         )
 
         # 3. Agent tool-use loop --------------------------------------------
+        budget = self._iteration_budget(len(load_ids))
         agent_result = self._loop.run(
             system=skill.system_prompt,
             intake_prompt=intake,
             allowed_tools=skill.allowed_tools,
             ctx=ctx,
+            max_iterations=budget,
         )
         if agent_result.draft is None:
             # Include what the model wrote. Without it "produced no draft" is unactionable —
@@ -379,6 +389,11 @@ class PaymentBotPipeline:
             # arrived at all.
             wrote = " ".join(agent_result.final_text.split())
             aside = f"; model wrote: {wrote[:300]!r}" if wrote else ""
+            # Name the budget and the load count on an exhausted run. Without them the
+            # reviewer cannot tell a model that misbehaved from one that was simply given
+            # less budget than the email needed.
+            if agent_result.stop_reason == "max_iterations":
+                aside = f"; {len(load_ids)} load(s), budget {budget} iterations{aside}"
             return self._escalate(
                 email,
                 "review",
@@ -639,6 +654,18 @@ class PaymentBotPipeline:
         return PipelineResult(
             Outcome.SENT, "reply sent", correlation_id, draft, gate_result, sent_message=sent
         )
+
+    def _iteration_budget(self, load_count: int) -> int:
+        """Iteration budget for an email naming ``load_count`` loads.
+
+        The skill procedures run per load, so cost grows with the load count while the
+        configured cap does not. One load keeps exactly the configured budget — so nothing
+        about the single-load case changes — and each additional load adds one more per-load
+        pass, clamped to :data:`ITERATION_CEILING` so the loop still terminates.
+        """
+
+        extra = max(0, load_count - 1) * self._settings.agent_iterations_per_extra_load
+        return min(self._settings.agent_max_iterations + extra, ITERATION_CEILING)
 
     def _escalate(
         self,

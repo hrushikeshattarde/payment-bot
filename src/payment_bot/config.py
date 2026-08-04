@@ -143,7 +143,24 @@ class Settings(BaseSettings):
         return values
 
     # --- Agent loop ----------------------------------------------------------
+    #: Iteration budget for a SINGLE-load email. Multi-load emails get more — see
+    #: ``agent_iterations_per_extra_load``.
     agent_max_iterations: int = Field(default=12, ge=1, le=50)
+
+    #: Extra iterations granted per load beyond the first.
+    #:
+    #: The skill procedures are per-load ("`tp_get_load_summary` for each load id"), so a
+    #: two-load email costs very nearly twice a one-load email: summary, pay date, dispatch,
+    #: cross-check, settlement and file history all run again. A fixed cap therefore cannot
+    #: serve a variable number of loads, and ``bulk_threshold`` lets up to five through.
+    #:
+    #: Observed live on load 2487002 + 2457019: fourteen tool calls, every one successful,
+    #: run ended at max_iterations with no draft because the budget was 12. Nothing was
+    #: wrong with the model's behaviour — the arithmetic simply did not allow it to finish.
+    #:
+    #: Default 7 = one full per-load pass. The total is clamped by
+    #: :data:`~payment_bot.pipeline.ITERATION_CEILING`.
+    agent_iterations_per_extra_load: int = Field(default=7, ge=0, le=20)
     #: Cap on each model turn. Must comfortably fit a full reply — too low truncates a
     #: draft mid-sentence. Open-weight models are chattier than Claude, hence the headroom.
     agent_max_tokens: int = Field(default=4096, ge=256, le=32768)

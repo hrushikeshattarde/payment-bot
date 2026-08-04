@@ -86,13 +86,24 @@ class AgentLoop:
         intake_prompt: str,
         allowed_tools: tuple[str, ...],
         ctx: ToolContext,
+        max_iterations: int | None = None,
     ) -> AgentResult:
+        """Drive the tool-use loop until a draft, an end-turn, or the iteration cap.
+
+        Args:
+            max_iterations: Budget for this run, overriding the constructor default. The
+                caller knows how much work the email actually implies — the per-load
+                procedure costs the same again for every extra load — and a fixed cap
+                cannot serve a variable number of loads. ``None`` keeps the default.
+        """
+
+        budget = self._max_iterations if max_iterations is None else max(1, max_iterations)
         allowed = set(allowed_tools)
         specs = [self._registry.get(name).spec() for name in allowed_tools]
         messages: list[Message] = [Message(Role.USER, [TextBlock(intake_prompt)])]
         nudges = 0
 
-        for iteration in range(1, self._max_iterations + 1):
+        for iteration in range(1, budget + 1):
             response = self._llm.converse(
                 system=system, messages=messages, tools=specs, max_tokens=self._max_tokens
             )
@@ -172,11 +183,11 @@ class AgentLoop:
 
         _log.warning(
             "agent_max_iterations",
-            extra={"correlation_id": ctx.correlation_id, "max": self._max_iterations},
+            extra={"correlation_id": ctx.correlation_id, "max": budget},
         )
         return AgentResult(
             draft=None,
             stop_reason="max_iterations",
-            iterations=self._max_iterations,
+            iterations=budget,
             transcript=messages,
         )

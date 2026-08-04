@@ -550,6 +550,45 @@ _CONFIRM_CHANGE_RE = re.compile(
 )
 
 
+#: A change word under a direct negation — a PROHIBITION, not an instruction.
+#:
+#: Factoring companies append anti-fraud disclaimers to every email, and the standard wording
+#: contains the exact shape the proximity scan looks for. Far West Capital's footer reads "Do
+#: not change payment instructions on wires or ACH without calling the person you are paying",
+#: which matched ``_BANK_CHANGE_ACTIVE_RE`` five times over the quoted chain and escalated a
+#: two-line TONU status question at severity=security. The scan cannot see that the sentence
+#: forbids the change rather than requesting it.
+#:
+#: At most ONE word may sit between the negation and the change word. "do not change" and
+#: "never update" are prohibitions; "please do not hesitate to update our remittance details"
+#: is a real request whose "do not" belongs to "hesitate", and two intervening words keep it
+#: out of this pattern.
+#:
+#: Negation only, deliberately. A fraud-warning CONTEXT ("fraud", "phishing", "compromise"
+#: nearby) looks like an equally good signal and is not: "due to recent fraud we need to
+#: update our ACH details" is both a genuine instruction and the classic fraud pretext, so
+#: suppressing on those words would blind the check to the very emails it exists for.
+_NEGATED_CHANGE_RE = re.compile(
+    rf"\b(?:do(?:es)?\s+not|do\s*n[o']t|never|can\s*not|can'?t|won'?t|will\s+not"
+    rf"|must\s+not|should\s+not|shall\s+not|no\s+need\s+to)\s+(?:\w+\s+){{0,1}}?"
+    rf"\b(?:{_CHANGES_ALT})\b",
+    re.IGNORECASE,
+)
+
+
+def _negated_change_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of every negated change phrase in ``text``."""
+
+    return [m.span() for m in _NEGATED_CHANGE_RE.finditer(text)]
+
+
+def _within_negation(span: tuple[int, int], negated: list[tuple[int, int]]) -> bool:
+    """True when ``span`` overlaps a negated change phrase, so it states a prohibition."""
+
+    start, end = span
+    return any(neg_start < end and start < neg_end for neg_start, neg_end in negated)
+
+
 def _phrase_pattern(phrase: str) -> re.Pattern[str]:
     """Match ``phrase`` only as whole words.
 
@@ -636,8 +675,19 @@ class DetectSensitiveChange(Tool):
         hard_bank = False
         hard_noa = False
 
+        # Negation is resolved once, up front: a prohibition is a prohibition whether it is
+        # spotted by the explicit phrase list or by the proximity scans below. Far West
+        # Capital's "Do not change payment instructions on wires or ACH" matches the phrase
+        # 'change payment' as well as the verb-first scan, so narrowing only the scans left
+        # the footer escalating anyway.
+        #
+        # Matched against `written` rather than `haystack`: the phrase patterns are already
+        # IGNORECASE, and using the un-lowercased text keeps match offsets aligned with the
+        # negated spans.
+        negated = _negated_change_spans(written)
         for phrase, pattern in _BANK_REQUEST_PATTERNS:
-            if pattern.search(haystack):
+            hits = [m for m in pattern.finditer(written) if not _within_negation(m.span(), negated)]
+            if hits:
                 _add(flags, SensitiveFlag.BANK_CHANGE)
                 evidence.append(f"bank: matched {phrase!r}")
                 hard_bank = True  # a request phrase is self-evidently an instruction
@@ -646,11 +696,22 @@ class DetectSensitiveChange(Tool):
         # Verb-first ("update our bank…") is an instruction aimed at us: HARD. Detail-first
         # ("remittance is updated to X") is passive template boilerplate: the one SOFT
         # signal.
+        #
+        # A negated change word states a prohibition, not a request, and every anti-fraud
+        # footer contains one. Skipping those spans is what keeps a disclaimer from reading
+        # as an instruction — see `_NEGATED_CHANGE_RE`. Only these proximity scans are
+        # narrowed: the explicit `_BANK_REQUEST_PATTERNS` phrases above stay as they are, and
+        # the gate's change_acknowledgment check on our own DRAFT text stays strict, because
+        # there any shape of change wording is disqualifying whatever its grammar.
         for match in _BANK_CHANGE_ACTIVE_RE.finditer(written):
+            if _within_negation(match.span(), negated):
+                continue
             _add(flags, SensitiveFlag.BANK_CHANGE)
             evidence.append(f"bank: change instructed — {' '.join(match.group(0).split())!r}")
             hard_bank = True
         for match in _BANK_CHANGE_PASSIVE_RE.finditer(written):
+            if _within_negation(match.span(), negated):
+                continue
             _add(flags, SensitiveFlag.BANK_CHANGE)
             evidence.append(f"bank: change requested — {' '.join(match.group(0).split())!r}")
 

@@ -158,9 +158,21 @@ class Settings(BaseSettings):
     #: run ended at max_iterations with no draft because the budget was 12. Nothing was
     #: wrong with the model's behaviour — the arithmetic simply did not allow it to finish.
     #:
-    #: Default 7 = one full per-load pass. The total is clamped by
-    #: :data:`~payment_bot.pipeline.ITERATION_CEILING`.
-    agent_iterations_per_extra_load: int = Field(default=7, ge=0, le=20)
+    #: Default 9 = one full per-load pass (8 calls) plus a little slack.
+    #:
+    #: Counted off a live 5-load email: per load the agent calls load_summary,
+    #: compute_scheduled_pay_date, dispatch_history, carrier_cross_check,
+    #: settlement_entries, file_history, noa_factoring and check_authorization — eight —
+    #: and then one submit_draft for the whole reply. An earlier value of 7 was one short
+    #: per load, which at five loads produced a budget of 40 against 41 calls needed: the
+    #: run made every call successfully and died with nothing left for submit_draft.
+    #:
+    #: The slack matters because a single tool error costs a whole iteration, and this model
+    #: issues one tool call per turn even though the loop can execute several.
+    #:
+    #: The total is clamped by :data:`~payment_bot.pipeline.ITERATION_CEILING`; 9 keeps the
+    #: five-load case (48) under it without being clamped.
+    agent_iterations_per_extra_load: int = Field(default=9, ge=0, le=20)
     #: Cap on each model turn. Must comfortably fit a full reply — too low truncates a
     #: draft mid-sentence. Open-weight models are chattier than Claude, hence the headroom.
     agent_max_tokens: int = Field(default=4096, ge=256, le=32768)

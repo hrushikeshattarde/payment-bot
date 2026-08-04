@@ -41,26 +41,53 @@ def _pipeline(**overrides: object) -> PaymentBotPipeline:
     )
 
 
+#: What the payment_status procedure costs per load, counted off live tool trails:
+#: load_summary, compute_scheduled_pay_date, dispatch_history, carrier_cross_check,
+#: settlement_entries, file_history, noa_factoring, check_authorization.
+CALLS_PER_LOAD = 8
+#: One submit_draft covers the whole reply, however many loads.
+TERMINAL_CALLS = 1
+
+
 @pytest.mark.unit
 def test_one_load_keeps_the_configured_budget_exactly() -> None:
     """The single-load case must be unchanged — no behaviour drift for the common email."""
 
-    pipeline = _pipeline(agent_max_iterations=12, agent_iterations_per_extra_load=7)
+    pipeline = _pipeline(agent_max_iterations=12)
     assert pipeline._iteration_budget(1) == 12
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(("loads", "expected"), [(2, 19), (3, 26), (4, 33), (5, 40)])
+@pytest.mark.parametrize(("loads", "expected"), [(2, 21), (3, 30), (4, 39), (5, 48)])
 def test_each_extra_load_adds_a_per_load_pass(loads: int, expected: int) -> None:
-    pipeline = _pipeline(agent_max_iterations=12, agent_iterations_per_extra_load=7)
+    pipeline = _pipeline(agent_max_iterations=12)
     assert pipeline._iteration_budget(loads) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("loads", [1, 2, 3, 4, 5])
+def test_every_answerable_load_count_can_actually_finish(loads: int) -> None:
+    """The budget must cover the real cost of the procedure, with room for submit_draft.
+
+    This is the assertion that would have caught the off-by-one: at 5 loads the budget was
+    40 against 41 calls needed, so the agent made every call successfully and then had
+    nothing left to deliver with. bulk_threshold lets up to 5 loads reach the agent, so
+    every count in that range must be finishable.
+    """
+
+    pipeline = _pipeline(agent_max_iterations=12)
+    required = loads * CALLS_PER_LOAD + TERMINAL_CALLS
+    assert pipeline._iteration_budget(loads) >= required, (
+        f"{loads} load(s) need {required} calls but the budget is "
+        f"{pipeline._iteration_budget(loads)}"
+    )
 
 
 @pytest.mark.unit
 def test_the_two_load_email_that_failed_now_gets_enough_budget() -> None:
     """14 successful calls were not enough at 12; two loads must clear that bar."""
 
-    pipeline = _pipeline(agent_max_iterations=12, agent_iterations_per_extra_load=7)
+    pipeline = _pipeline(agent_max_iterations=12)
     assert pipeline._iteration_budget(2) > 14
 
 
@@ -74,7 +101,7 @@ def test_budget_is_clamped_so_the_loop_still_terminates() -> None:
 
 @pytest.mark.unit
 def test_zero_or_one_load_never_goes_below_the_configured_budget() -> None:
-    pipeline = _pipeline(agent_max_iterations=12, agent_iterations_per_extra_load=7)
+    pipeline = _pipeline(agent_max_iterations=12)
     assert pipeline._iteration_budget(0) == 12
 
 

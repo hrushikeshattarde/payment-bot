@@ -322,6 +322,13 @@ class PaymentBotPipeline:
         unauthorized: list[str] = []
         authorized_loads: list[str] = []
         prenoa_loads: list[str] = []
+        #: Requested loads whose authorization could not be RESOLVED, as opposed to resolved
+        #: as a denial. Tracked apart because the two must not be treated alike downstream: a
+        #: denied load is legitimately withheld and the reply should say nothing about it,
+        #: while an unresolvable load is one the sender explicitly asked about and we simply
+        #: do not know — answering the rest and saying nothing about it is misleading. Feeds
+        #: the gate's coverage baseline; see below.
+        unresolved_loads: list[str] = []
         for load_id in load_ids:
             auth_out = self._registry.dispatch(
                 "check_authorization",
@@ -336,6 +343,7 @@ class PaymentBotPipeline:
             if not auth_out.ok:
                 # Cannot resolve authorization → treat as denied (fail closed, like the gate).
                 unauthorized.append(f"{load_id}=ERROR({auth_out.payload.get('error')})")
+                unresolved_loads.append(load_id)
                 continue
             auth = CheckAuthorizationOutput.model_validate(auth_out.payload)
             if not auth.authorized:
@@ -371,7 +379,13 @@ class PaymentBotPipeline:
         # reappear in the intake prompt.
         routes_map = {lid: routes[lid].value for lid in load_ids}
         skill, intake = self._select_skill(
-            email, classification, identifiers, load_ids, routes_map, prenoa_loads
+            email,
+            classification,
+            identifiers,
+            load_ids,
+            routes_map,
+            prenoa_loads,
+            unresolved_loads,
         )
 
         # 3. Agent tool-use loop --------------------------------------------
@@ -492,7 +506,10 @@ class PaymentBotPipeline:
             # Re-run the gate on the human's edit — approval does not bypass grounding/auth.
             edited = draft.model_copy(update={"reply_body": body})
             regate = self._gate.evaluate(
-                draft=edited, email=email, ctx=ctx, expected_load_ids=expected
+                draft=edited,
+                email=email,
+                ctx=ctx,
+                expected_load_ids=expected,
             )
             if not regate.allowed:
                 return self._escalate(
@@ -517,6 +534,7 @@ class PaymentBotPipeline:
         load_ids: list[str],
         routes_map: dict[str, str],
         prenoa_loads: list[str],
+        unlocated_loads: list[str],
     ) -> tuple[Skill, str]:
         """Pick the skill + build its intake from the classified intent.
 
@@ -555,6 +573,7 @@ class PaymentBotPipeline:
                     signature=self._settings.reply_signature,
                     documents_email=self._settings.documents_email,
                     prenoa_loads=prenoa_loads,
+                    unlocated_loads=unlocated_loads,
                 )
             return chosen, build_payment_status_intake(
                 email,
@@ -563,6 +582,7 @@ class PaymentBotPipeline:
                 signature=self._settings.reply_signature,
                 documents_email=self._settings.documents_email,
                 prenoa_loads=prenoa_loads,
+                unlocated_loads=unlocated_loads,
             )
         if has_rate:
             intake = build_rate_verification_intake(
@@ -574,6 +594,7 @@ class PaymentBotPipeline:
                 signature=self._settings.reply_signature,
                 documents_email=self._settings.documents_email,
                 prenoa_loads=prenoa_loads,
+                unlocated_loads=unlocated_loads,
             )
             return RATE_VERIFICATION_SKILL, intake
         if has_payment:
@@ -584,6 +605,7 @@ class PaymentBotPipeline:
                 signature=self._settings.reply_signature,
                 documents_email=self._settings.documents_email,
                 prenoa_loads=prenoa_loads,
+                unlocated_loads=unlocated_loads,
             )
         # Uncertain intent but the email names loads (possibly only inside an attached
         # statement — "please see attached" carries no keyword). Same reasoning as the
@@ -600,6 +622,7 @@ class PaymentBotPipeline:
             signature=self._settings.reply_signature,
             documents_email=self._settings.documents_email,
             prenoa_loads=prenoa_loads,
+            unlocated_loads=unlocated_loads,
         )
 
     def _bulk_portal_draft(self, email: InboundEmail) -> SubmitDraftOutput:

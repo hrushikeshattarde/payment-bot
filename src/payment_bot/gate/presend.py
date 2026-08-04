@@ -16,9 +16,12 @@ Checks (all must pass):
 6. **Bulk** — the disclosed-load count is within the portal-fallback threshold.
 7. **Tool mentions** — the reply body names no internal tool.
 8. **Coverage** — the draft addresses every load the agent was asked to answer.
-9. **Change acknowledgment** — the reply never confirms or acts on a remittance/bank/NOA
-   instruction (the §7 compensating control behind the boilerplate narrowing).
-10. **NOA request** — the reply asks the sender for an NOA only when the intake's pre-NOA
+9. **Carrier consistency** — every disclosed load belongs to the same carrier, so one reply
+   never mixes two carriers' loads. The only check that catches an identifier which is
+   authorized and grounded but simply is not this sender's load.
+10. **Change acknowledgment** — the reply never confirms or acts on a remittance/bank/NOA
+    instruction (the §7 compensating control behind the boilerplate narrowing).
+11. **NOA request** — the reply asks the sender for an NOA only when the intake's pre-NOA
     instruction said to; a draft must never invent a paperwork chore.
 """
 
@@ -160,6 +163,7 @@ class PreSendGate:
             self._check_grounding(draft, ctx),
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
+            self._check_carrier_consistency(draft, ctx),
             self._check_change_acknowledgment(draft),
             self._check_noa_request(draft, noa_request_expected),
         ]
@@ -392,6 +396,12 @@ class PreSendGate:
         one — a reviewer skimming the draft would not know the second was dropped. A load
         counts as addressed when it appears in ``load_ids`` (disclosed) or is named in the
         body (e.g. a hold reply: "load 2520677 is under review").
+
+        Loads the pipeline could not look up at all are deliberately NOT required here.
+        Failing on them would escalate every email that happens to contain a stray 7-digit
+        number, which `test_an_unresolvable_load_is_dropped_not_fatal` exists to prevent.
+        They are instead named in the intake message so the reply can say it could not
+        locate them — see `build_payment_status_intake`.
         """
 
         if expected_load_ids is None:
@@ -411,6 +421,60 @@ class PreSendGate:
             )
         return GateCheck(
             name="coverage", passed=True, detail="every requested load is addressed"
+        )
+
+    def _check_carrier_consistency(
+        self, draft: SubmitDraftOutput, ctx: ToolContext
+    ) -> GateCheck:
+        """Every disclosed load must belong to the same carrier.
+
+        One reply covering two carriers' loads is nearly always an accident of identifier
+        extraction rather than a real question, and it is materially misleading even when
+        every fact in it is grounded and every disclosure is authorized.
+
+        Observed live: an RTS enquiry titled "RAD LOGISTICS ONE LLC | 1669695" asked about
+        loads 2478316 and 2463787 in a table. ``1669695`` was RTS's own account reference in
+        the subject, and it collided with a real load — belonging to SKYWAY TRUCK LINE INC.
+        Both loads are factored to RTS, so authorization passed correctly and every amount
+        was grounded; the draft nonetheless reported Skyway's 2024 payment in a reply about
+        RAD Logistics, reading as though RAD had been paid $3,200.
+
+        Nothing else can catch this. Authorization is per load and was satisfied. Grounding
+        only checks that figures came from a tool. Coverage only checks loads are addressed.
+        The tell is that the loads do not belong to the same carrier.
+
+        A load whose carrier cannot be resolved is skipped rather than failed — an
+        unreachable Transport Pro must not turn every draft into a block. Comparison is on a
+        casefolded name, because the API returns inconsistent capitalisation for the same
+        company ("Rad Logistics One Llc" vs "RAD LOGISTICS ONE LLC").
+        """
+
+        by_carrier: dict[str, list[str]] = {}
+        for load_id in draft.load_ids:
+            try:
+                carrier = (ctx.tp.get_authorization_context(load_id).carrier_company or "").strip()
+            except (ClientError, ToolError):
+                continue
+            if carrier:
+                by_carrier.setdefault(carrier.casefold(), []).append(load_id)
+
+        if len(by_carrier) > 1:
+            spread = "; ".join(
+                f"{loads} = {carrier!r}" for carrier, loads in sorted(by_carrier.items())
+            )
+            return GateCheck(
+                name="carrier_consistency",
+                passed=False,
+                detail=f"draft mixes loads from different carriers: {spread}",
+            )
+        return GateCheck(
+            name="carrier_consistency",
+            passed=True,
+            detail=(
+                "all disclosed loads belong to one carrier"
+                if by_carrier
+                else "no carrier to compare"
+            ),
         )
 
     def _check_grounding(self, draft: SubmitDraftOutput, ctx: ToolContext) -> GateCheck:

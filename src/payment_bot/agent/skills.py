@@ -183,6 +183,28 @@ RATE_VERIFICATION_SKILL = Skill(
 )
 
 
+def _unlocated_line(unlocated_loads: list[str] | None) -> list[str]:
+    """Tell the agent about ids it must mention but must not try to look up.
+
+    These are numbers the sender named that no load record could be found for. They are
+    withheld from ``load_ids`` on purpose — handing one over burns the whole iteration
+    budget on retries — but the reply must not pass over them in silence either.
+
+    Observed live: an RTS enquiry listed loads 2478316 and 2463787; 2463787 returned HTTP
+    400, was dropped, and the draft answered the rest without ever mentioning it. The
+    sender had no way to tell their second load had not been checked.
+    """
+
+    if not unlocated_loads:
+        return []
+    return [
+        f"- No load record was found for {', '.join(unlocated_loads)}. Do NOT call any tool "
+        "for these — the lookup already failed. State in the reply that you could not "
+        "locate them and ask the sender to confirm the number. Never say anything about "
+        "their status, amount or pay date.",
+    ]
+
+
 def build_payment_status_intake(
     email: InboundEmail,
     load_ids: list[str],
@@ -190,6 +212,7 @@ def build_payment_status_intake(
     signature: str = "Circle Delivers Payments",
     documents_email: str = "freightpay@circledelivers.com",
     prenoa_loads: list[str] | None = None,
+    unlocated_loads: list[str] | None = None,
 ) -> str:
     """Compose the first user turn: the email plus the deterministic intake results."""
 
@@ -206,6 +229,7 @@ def build_payment_status_intake(
             f"- Routing: {routes}",
             f"- Sign the reply exactly as: {signature}",
             f"- Missing paperwork should be emailed to: {documents_email}",
+            *_unlocated_line(unlocated_loads),
             *(
                 [
                     "- The sender is a roster-verified factoring company but no NOA is on "
@@ -230,6 +254,7 @@ def build_rate_verification_intake(
     signature: str = "Circle Delivers Payments",
     documents_email: str = "freightpay@circledelivers.com",
     prenoa_loads: list[str] | None = None,
+    unlocated_loads: list[str] | None = None,
 ) -> str:
     """Compose the first user turn for rate verification, including the stated amount(s)."""
 
@@ -255,6 +280,7 @@ def build_rate_verification_intake(
             f"- Factoring company named by sender: {factoring_company or 'none'}",
             f"- Sign the reply exactly as: {signature}",
             f"- Missing paperwork should be emailed to: {documents_email}",
+            *_unlocated_line(unlocated_loads),
             *(
                 [
                     "- The sender is a roster-verified factoring company but no NOA is on "

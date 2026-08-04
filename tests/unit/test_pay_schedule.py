@@ -152,3 +152,68 @@ def test_grounded_dates_still_compute(ctx: ToolContext) -> None:
         ctx,
     )
     assert out.scheduled_pay_date == date(2026, 8, 20)
+
+
+# --- Null-ish placeholders mean "absent", not "malformed" ----------------------
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "placeholder", ["null", "NULL", "None", "none", "nil", "n/a", "N/A", "na", "undefined", "-", "--"]
+)
+def test_placeholder_dates_are_treated_as_absent(ctx: ToolContext, placeholder: str) -> None:
+    """A null-ish string must not read as an invalid date.
+
+    Live regression, load 2443422: the model sent the string "null" for both dates on a
+    load that has neither. "invalid date" told it to use ISO YYYY-MM-DD, but there was no
+    date to send, so it repeated the identical call six times and the run ended at
+    max_iterations with no draft. The placeholder now means absent, which surfaces the
+    real, terminal condition instead.
+    """
+
+    with pytest.raises(ToolError, match="no estimated or actual payment date on file"):
+        ComputeScheduledPayDate().run(
+            ComputeScheduledPayDateInput(
+                estimated_payment_date=placeholder,
+                actual_payment_date=placeholder,
+                load_id="2443422",
+            ),
+            ctx,
+        )
+
+
+@pytest.mark.unit
+def test_unschedulable_line_says_not_to_retry(ctx: ToolContext) -> None:
+    """The message must name the terminal condition and forbid a retry.
+
+    The bare "cannot schedule" wording reads like bad input and invited another attempt
+    with a different format; that is what the iteration budget was spent on.
+    """
+
+    with pytest.raises(ToolError, match="Do NOT call this tool again"):
+        ComputeScheduledPayDate().run(ComputeScheduledPayDateInput(load_id="2443422"), ctx)
+
+
+@pytest.mark.unit
+def test_placeholder_actual_does_not_block_a_real_estimated(ctx: ToolContext) -> None:
+    """An unpaid line: real estimated date, "null" actual. Must still compute."""
+
+    ctx.ledger.record_date(date(2026, 8, 19), "tp_get_load_summary", load_id="2462934")
+    out = ComputeScheduledPayDate().run(
+        ComputeScheduledPayDateInput(
+            estimated_payment_date="2026-08-19",
+            actual_payment_date="null",
+            load_id="2462934",
+        ),
+        ctx,
+    )
+    assert out.scheduled_pay_date == date(2026, 8, 20)
+    assert out.basis == PayBasis.ESTIMATED.value
+
+
+@pytest.mark.unit
+def test_a_real_malformed_date_is_still_rejected(ctx: ToolContext) -> None:
+    """The sentinel list must not become a hole for genuinely bad input."""
+
+    with pytest.raises(ToolError, match="invalid date"):
+        ComputeScheduledPayDate().run(
+            ComputeScheduledPayDateInput(estimated_payment_date="not-a-date"), ctx
+        )

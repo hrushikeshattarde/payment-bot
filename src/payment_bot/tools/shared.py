@@ -262,17 +262,33 @@ _SPELLED_DATE_FORMATS = (
 )
 
 
+#: Strings a model reaches for when a field has no value. All mean "absent".
+#:
+#: A JSON-emitting model asked for an optional date on a load that has none does not omit
+#: the field — it fills it in, and ``"null"`` is the overwhelming favourite. Rejecting that
+#: as an invalid date is a dead end: the error says "use ISO YYYY-MM-DD", but there IS no
+#: date to supply, so the model has nothing to correct and simply repeats itself. Observed
+#: live on load 2443422 — six byte-identical calls passing ``"null"`` for both dates, half
+#: the iteration budget gone, and the run ended at max_iterations with no draft on an
+#: otherwise trivial status request. Same reasoning as :func:`_coerce_id_to_str`: a type
+#: mismatch this trivial is not worth an agent iteration, let alone six.
+_ABSENT_DATE_SENTINELS = frozenset({"null", "none", "nil", "n/a", "na", "undefined", "-", "--"})
+
+
 def _parse_pay_date(value: str | None) -> date | None:
     """Parse an API or model-supplied pay date into an EDT calendar date.
 
     Bare ``YYYY-MM-DD`` values are calendar dates (no shift). Full timestamps are
     converted from their offset into EDT (fixed UTC-4) before the date is taken. Dates with a
-    named month are also accepted — see :data:`_SPELLED_DATE_FORMATS`.
+    named month are also accepted — see :data:`_SPELLED_DATE_FORMATS`. A null-ish placeholder
+    is treated as absent rather than invalid — see :data:`_ABSENT_DATE_SENTINELS`.
     """
 
     if value is None or not value.strip():
         return None
     text = value.strip()
+    if text.lower() in _ABSENT_DATE_SENTINELS:
+        return None
     try:
         if "T" in text:
             dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
@@ -932,12 +948,16 @@ class ComputeScheduledPayDateInput(BaseModel):
         default=None,
         description=(
             "ISO date, YYYY-MM-DD (e.g. 2026-07-29). Copy it verbatim from the earning line "
-            "returned by tp_get_load_summary. Never a human-readable date."
+            "returned by tp_get_load_summary. Never a human-readable date. If the line has no "
+            "estimated date, OMIT this field — do not send the string 'null'."
         ),
     )
     actual_payment_date: str | None = Field(
         default=None,
-        description="ISO date, YYYY-MM-DD, when the line is already paid. Same format rule.",
+        description=(
+            "ISO date, YYYY-MM-DD, when the line is already paid. Same format rule. Omit it "
+            "entirely when the line is unpaid; do not send the string 'null'."
+        ),
     )
     tz: str = Field(
         default="EDT", description="Timezone for the calendar date. Leave as the default."
@@ -995,6 +1015,17 @@ class ComputeScheduledPayDate(Tool):
                 estimated_payment_date=estimated, actual_payment_date=actual
             )
         except ValueError as exc:
+            if estimated is None and actual is None:
+                # Terminal, not a call to fix: the load genuinely carries no payment date, so
+                # no retry can succeed. Say that outright, because the bare "cannot schedule"
+                # message reads like bad input and invites the model to try again with a
+                # different date format — which is how an unschedulable line burns iterations.
+                raise ToolError(
+                    "this line has no estimated or actual payment date on file, so no pay "
+                    "date can be computed. Do NOT call this tool again for this line: "
+                    "report the line as pending and not yet scheduled for payment, and "
+                    "state no date."
+                ) from exc
             raise ToolError(str(exc)) from exc
 
         ctx.ledger.record_date(

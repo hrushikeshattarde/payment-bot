@@ -39,7 +39,11 @@ PROCEDURE — in order, skip nothing
 3. `tp_get_dispatch_history`, then `carrier_cross_check` — Delivered row only, ignore
    canceled rows.
 4. `tp_get_settlement_entries` for settlement, advances, fees and short pays.
-5. `tp_get_file_history` only if the status is blocked or paperwork is in question.
+5. `tp_get_file_history` whenever `tp_get_load_summary` returned invoice_generated=false, or
+   the status is blocked, or paperwork is in question. A load that has not been billed is
+   usually unbilled BECAUSE something required is not on file — find out which document
+   before reporting the load as merely pending. Skip this step only when the load is already
+   billed and nothing about paperwork is in doubt.
 6. `tp_get_noa_factoring` only if the sender asks about factoring, an NOA, or where
    payment is sent. Read-only — it reports what is on file.
 7. `check_authorization` for each load. Disclose a load only when it returns
@@ -90,7 +94,11 @@ NEVER
 
 PAYMENT_STATUS_SKILL = Skill(
     id="payment_status",
-    version="1.8.0",
+    # 1.9.0: step 5 now names the unbilled case. It used to read "only if the status is
+    # blocked or paperwork is in question", which left chasing paperwork on an unbilled load
+    # to the model's judgement — so whether a carrier was told WHICH document was missing
+    # varied run to run.
+    version="1.9.0",
     system_prompt=_PAYMENT_STATUS_PROMPT,
     allowed_tools=PAYMENT_STATUS_TOOLS,
 )

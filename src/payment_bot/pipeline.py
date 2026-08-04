@@ -530,11 +530,6 @@ class PaymentBotPipeline:
                     "stated_rates": len(identifiers.stated_rates),
                 },
             )
-            reply_kw = {
-                "signature": self._settings.reply_signature,
-                "documents_email": self._settings.documents_email,
-                "prenoa_loads": prenoa_loads,
-            }
             if chosen is RATE_VERIFICATION_SKILL:
                 return chosen, build_rate_verification_intake(
                     email,
@@ -542,14 +537,18 @@ class PaymentBotPipeline:
                     routes_map,
                     identifiers.stated_rates,
                     identifiers.factoring_company,
-                    **reply_kw,
+                    signature=self._settings.reply_signature,
+                    documents_email=self._settings.documents_email,
+                    prenoa_loads=prenoa_loads,
                 )
-            return chosen, build_payment_status_intake(email, load_ids, routes_map, **reply_kw)
-        reply_kw = {
-            "signature": self._settings.reply_signature,
-            "documents_email": self._settings.documents_email,
-            "prenoa_loads": prenoa_loads,
-        }
+            return chosen, build_payment_status_intake(
+                email,
+                load_ids,
+                routes_map,
+                signature=self._settings.reply_signature,
+                documents_email=self._settings.documents_email,
+                prenoa_loads=prenoa_loads,
+            )
         if has_rate:
             intake = build_rate_verification_intake(
                 email,
@@ -557,12 +556,19 @@ class PaymentBotPipeline:
                 routes_map,
                 identifiers.stated_rates,
                 identifiers.factoring_company,
-                **reply_kw,
+                signature=self._settings.reply_signature,
+                documents_email=self._settings.documents_email,
+                prenoa_loads=prenoa_loads,
             )
             return RATE_VERIFICATION_SKILL, intake
         if has_payment:
             return PAYMENT_STATUS_SKILL, build_payment_status_intake(
-                email, load_ids, routes_map, **reply_kw
+                email,
+                load_ids,
+                routes_map,
+                signature=self._settings.reply_signature,
+                documents_email=self._settings.documents_email,
+                prenoa_loads=prenoa_loads,
             )
         # Uncertain intent but the email names loads (possibly only inside an attached
         # statement — "please see attached" carries no keyword). Same reasoning as the
@@ -573,7 +579,12 @@ class PaymentBotPipeline:
             extra={"load_count": len(load_ids)},
         )
         return PAYMENT_STATUS_SKILL, build_payment_status_intake(
-            email, load_ids, routes_map, **reply_kw
+            email,
+            load_ids,
+            routes_map,
+            signature=self._settings.reply_signature,
+            documents_email=self._settings.documents_email,
+            prenoa_loads=prenoa_loads,
         )
 
     def _bulk_portal_draft(self, email: InboundEmail) -> SubmitDraftOutput:

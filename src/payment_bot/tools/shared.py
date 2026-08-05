@@ -171,6 +171,32 @@ _FACTOR_GENERIC_TOKENS = frozenset(
 )  # fmt: skip
 
 
+#: Punctuation that spells one company two ways: "G.H." / "GH", "Love's" / "Loves",
+#: "XFactors Financial, Inc." / "XFactors Financial Inc".
+#: The second apostrophe is U+2019, the curly form Outlook and Word substitute for a typed
+#: one. Both are needed: "Love's Solutions" arrives spelled either way depending on the
+#: sender's client. RUF001 flags it as visually ambiguous, which is precisely why it is
+#: called out here rather than removed.
+_NAME_PUNCT_RE = re.compile(r"[.,'’\-/&()]+")  # noqa: RUF001
+
+
+def _normalize_company_name(name: str) -> str:
+    """Lowercase, drop punctuation, collapse whitespace.
+
+    Exists because an initialism written with full stops on the load and without them in
+    the settlement export defeated the containment test entirely. Observed live: the load
+    for 2444099 records "G.H. Factor LLC" while the export says "GH Factor LLC", so the
+    roster key was ``gh factor llc`` and could not be linked — even though the entry, and
+    the sender's ``ghfactor.net`` domain, were both exactly right. The only word the two
+    spellings share is "factor", which is industry-generic and deliberately cannot link on
+    its own, and "gh" is too short to be a name token. Normalised, the two strings are
+    identical. Initialisms with stops are common in this industry (J.D. Factors, T.B.S.
+    Factoring), so each one cost an escalation against a correct roster entry.
+    """
+
+    return " ".join(_NAME_PUNCT_RE.sub("", name.lower()).split())
+
+
 def _factor_names_match(configured_name: str, on_file: str) -> bool:
     """Does a configured factor entry name the factor recorded on the load?
 
@@ -183,10 +209,14 @@ def _factor_names_match(configured_name: str, on_file: str) -> bool:
     token. Industry-generic tokens (capital, financial, funding…) never link on their
     own. The sender's domain equality stays exact regardless — this only decides which
     roster entries are eligible to vouch for that domain.
+
+    Both names are punctuation-normalised first (see :func:`_normalize_company_name`).
+    That widens nothing about which words may link — the generic-token rule is untouched
+    — it only stops one spelling of the same name reading as a different company.
     """
 
-    key = configured_name.strip().lower()
-    name = on_file.strip().lower()
+    key = _normalize_company_name(configured_name)
+    name = _normalize_company_name(on_file)
     if not key or not name:
         return False
     if key in name or name in key:

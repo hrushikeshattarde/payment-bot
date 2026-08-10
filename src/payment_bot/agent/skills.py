@@ -131,14 +131,18 @@ REPLY
   quoting both figures when they differ. Never adjust the sender's number to fit.
 - Name each deduction with its reason and amount, then the net; or say there are none.
 - Say whether the invoice has been generated, and what NOA or factoring is on file.
-- If `tp_get_file_history` reports required paperwork missing, name each missing
-  document and ask the sender to email it to the documents address in the intake
-  message.
-- Close with one sentence sending all billing paperwork to the documents address in the
-  intake message. This is standing routing information, not a request for a specific
-  document, so it goes in every reply — including when nothing is missing. Keep it its
-  own final sentence immediately before the sign-off, and never phrase it as part of a
-  sentence about a notice of assignment.
+- Name the documents address from the intake message EXACTLY ONCE in the whole reply.
+  Never twice, and never in two consecutive sentences. Which form it takes depends on
+  whether anything is missing:
+  - Paperwork missing (`tp_get_file_history` reports it): name each missing document and
+    ask the sender to email those to the address. That sentence IS the paperwork routing
+    — do NOT follow it with a second, general one. Writing "please email them to
+    <address>" and then "please send all billing paperwork to <address>" repeats
+    yourself and reads like a template.
+  - Nothing missing: close with one sentence sending all billing paperwork to the
+    address. Standing routing information, not a request for a specific document.
+  Either way that sentence is the last one before the sign-off, and is never phrased as
+  part of a sentence about a notice of assignment.
 - Asking for an NOA is a different thing and is still forbidden unless the intake message
   explicitly instructs it — never on your own, whatever the factoring situation looks
   like. When instructed, use the word "email", never "attach".
@@ -177,7 +181,13 @@ RATE_VERIFICATION_SKILL = Skill(
     # than a paperwork request, because the previous rule forbade asking for billing
     # paperwork unprompted — and kept away from any "notice of assignment" wording, since
     # the gate's noa_request check fires on a send verb within 8 words of an NOA mention.
-    version="1.8.0",
+    #
+    # 1.9.0: that rule said the closing line goes in "every reply — including when nothing
+    # is missing", which made it unconditional and contradicted the missing-documents rule
+    # above it. Live on load 2519206: "...please email them to freightpay@... Please send all
+    # billing paperwork to freightpay@..." — the address twice in consecutive sentences.
+    # The address is now stated exactly once, in whichever of the two forms applies.
+    version="1.9.0",
     system_prompt=_RATE_VERIFICATION_PROMPT,
     allowed_tools=RATE_VERIFICATION_TOOLS,
 )

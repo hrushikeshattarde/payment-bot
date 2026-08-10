@@ -16,9 +16,9 @@ Checks (all must pass):
 6. **Bulk** — the disclosed-load count is within the portal-fallback threshold.
 7. **Tool mentions** — the reply body names no internal tool.
 8. **Coverage** — the draft addresses every load the agent was asked to answer.
-9. **Carrier consistency** — every disclosed load belongs to the same carrier, so one reply
-   never mixes two carriers' loads. The only check that catches an identifier which is
-   authorized and grounded but simply is not this sender's load.
+9. **Carrier consistency** — a CARRIER's reply never mixes two carriers' loads, catching an
+   identifier that is authorized and grounded but simply is not this sender's load. A
+   factoring sender is exempt: one factor legitimately spans several carriers.
 10. **Change acknowledgment** — the reply never confirms or acts on a remittance/bank/NOA
     instruction (the §7 compensating control behind the boilerplate narrowing).
 11. **NOA request** — the reply asks the sender for an NOA only when the intake's pre-NOA
@@ -163,7 +163,7 @@ class PreSendGate:
             self._check_grounding(draft, ctx),
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
-            self._check_carrier_consistency(draft, ctx),
+            self._check_carrier_consistency(draft, email, ctx),
             self._check_change_acknowledgment(draft),
             self._check_noa_request(draft, noa_request_expected),
         ]
@@ -424,30 +424,55 @@ class PreSendGate:
         )
 
     def _check_carrier_consistency(
-        self, draft: SubmitDraftOutput, ctx: ToolContext
+        self, draft: SubmitDraftOutput, email: InboundEmail, ctx: ToolContext
     ) -> GateCheck:
-        """Every disclosed load must belong to the same carrier.
+        """A CARRIER's reply must not span two carriers' loads.
 
-        One reply covering two carriers' loads is nearly always an accident of identifier
-        extraction rather than a real question, and it is materially misleading even when
-        every fact in it is grounded and every disclosure is authorized.
+        A carrier asking about a load that is not theirs is nearly always an accident of
+        identifier extraction, and materially misleading even when every fact is grounded and
+        every disclosure authorized. Observed live: an RTS enquiry titled "RAD LOGISTICS ONE
+        LLC | 1669695" reported SKYWAY TRUCK LINE INC's 2024 payment in a reply about RAD
+        Logistics, because ``1669695`` was an account reference that collided with a real
+        load.
 
-        Observed live: an RTS enquiry titled "RAD LOGISTICS ONE LLC | 1669695" asked about
-        loads 2478316 and 2463787 in a table. ``1669695`` was RTS's own account reference in
-        the subject, and it collided with a real load — belonging to SKYWAY TRUCK LINE INC.
-        Both loads are factored to RTS, so authorization passed correctly and every amount
-        was grounded; the draft nonetheless reported Skyway's 2024 payment in a reply about
-        RAD Logistics, reading as though RAD had been paid $3,200.
+        **A factoring sender is exempt, and must be.** A factor's aging report legitimately
+        spans several of its carriers in one email — that is the normal shape of its work, not
+        an accident. Observed live, and the reason this exemption exists: Engaged Finance
+        asked about loads 2523916 (Forever13 Azorie Reynolds Trucking) and 2526677 (AAA
+        Expedited Services), both factored to Engaged Financial, and the first version of this
+        check blocked the draft. Factors are a large share of inbound, so an unscoped
+        same-carrier rule would block a great deal of legitimate mail.
 
-        Nothing else can catch this. Authorization is per load and was satisfied. Grounding
-        only checks that figures came from a tool. Coverage only checks loads are addressed.
-        The tell is that the loads do not belong to the same carrier.
+        That narrowing does mean this check no longer catches the RTS case, where RTS was the
+        factor on both loads. The durable fix for that was always the extraction side — see
+        ``_NOT_A_LOAD_LABEL_RE``, which now suppresses account-number labels. This check
+        remains the backstop for a carrier sender.
 
         A load whose carrier cannot be resolved is skipped rather than failed — an
         unreachable Transport Pro must not turn every draft into a block. Comparison is on a
         casefolded name, because the API returns inconsistent capitalisation for the same
         company ("Rad Logistics One Llc" vs "RAD LOGISTICS ONE LLC").
         """
+
+        for load_id in draft.load_ids:
+            try:
+                outcome = self._check_auth.run(
+                    CheckAuthorizationInput(
+                        sender_email=email.from_email,
+                        sender_name=email.from_name,
+                        load_id=load_id,
+                        system=route_load(load_id).system,
+                    ),
+                    ctx,
+                )
+            except (ToolError, ClientError):
+                continue
+            if outcome.decision is AuthDecision.FACTORING:
+                return GateCheck(
+                    name="carrier_consistency",
+                    passed=True,
+                    detail="factoring sender; one factor legitimately spans several carriers",
+                )
 
         by_carrier: dict[str, list[str]] = {}
         for load_id in draft.load_ids:

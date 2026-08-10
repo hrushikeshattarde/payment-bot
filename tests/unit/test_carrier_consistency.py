@@ -114,3 +114,59 @@ def test_an_unresolvable_carrier_is_skipped_not_failed(sample_email: InboundEmai
     checks = {c.name: c for c in result.checks}
     assert checks["carrier_consistency"].passed is True
     assert "no carrier to compare" in checks["carrier_consistency"].detail
+
+
+# --- A factoring sender legitimately spans several carriers --------------------
+class _FactoredToOneCompanyTp:
+    """Two loads, two carriers, both factored to the same company."""
+
+    def __init__(self) -> None:
+        self._inner = sample_transport_pro_client()
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._inner, name)
+
+    def get_authorization_context(self, load_id: str):  # type: ignore[no-untyped-def]
+        base = self._inner.get_authorization_context("2462934")
+        carrier = (
+            "AAA EXPEDITED SERVICES"
+            if load_id == "1669695"
+            else "Forever13 Azorie Reynolds Trucking Llc"
+        )
+        return base.model_copy(
+            update={"carrier_company": carrier, "factoring_company": "Engaged Financial"}
+        )
+
+
+@pytest.mark.unit
+def test_a_factoring_sender_may_span_two_carriers(sample_email: InboundEmail) -> None:
+    """Live false positive from the first version of this check.
+
+    Engaged Finance asked about loads 2523916 (Forever13 Azorie Reynolds Trucking) and
+    2526677 (AAA Expedited Services), both factored to Engaged Financial. A factor's aging
+    report spanning several of its carriers is the normal shape of its work, and the
+    same-carrier rule blocked the draft. Factors are a large share of inbound.
+    """
+
+    from payment_bot.config import Settings
+
+    settings = Settings(
+        factoring_domains={"engaged financial": ("engagedfinance.com",)},  # type: ignore[arg-type]
+        allow_factoring=True,
+    )
+    ctx = ToolContext(
+        tp=_FactoredToOneCompanyTp(),  # type: ignore[arg-type]
+        ledger=GroundingLedger(),
+        correlation_id="factor-test",
+        settings=settings,
+    )
+    factor_email = sample_email.model_copy(
+        update={"from_email": "jsoto@engagedfinance.com", "from_name": "Juan Soto"}
+    )
+
+    result = PreSendGate(allow_factoring=True).evaluate(
+        draft=_draft(["2462934", "1669695"]), email=factor_email, ctx=ctx
+    )
+    checks = {c.name: c for c in result.checks}
+    assert checks["carrier_consistency"].passed is True, checks["carrier_consistency"].detail
+    assert "factoring sender" in checks["carrier_consistency"].detail

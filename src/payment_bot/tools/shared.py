@@ -82,9 +82,32 @@ LoadIdStr = Annotated[str, BeforeValidator(_coerce_id_to_str)]
 #:
 #: Deliberately excludes "ref"/"reference": factoring templates write the load itself as
 #: "Reference#: 2520504".
+#:
+#: ``account``/``acct``/``aba``/``routing`` were added after a live block: Engaged Finance's
+#: verification email carries its full remittance block, and "Account #2657147" — their ACH
+#: account number — was read as a load. Transport Pro 400'd on it, the gate's authorization
+#: check failed on the unresolvable id, and the draft told the factoring company "I could not
+#: locate load 2657147, please confirm the number" about their own bank account. Every
+#: factoring template states remit details this way, so it is a recurring shape, and a
+#: coincidental collision with a real load id would be far worse than a 400 — that is exactly
+#: how an unrelated carrier's load reached a draft on the RTS enquiry.
+#:
+#: ``settlement``/``check`` are the collision case realised. Measured across 60 live messages:
+#: "Circle Logistics, Inc - Settlement 1311088" from bngtransportation.com, where 1311088 is a
+#: real load id belonging to Power Transport, LLC — an unrelated carrier. A settlement number
+#: is never a load number here (settlements are their own endpoint), so reading one as a load
+#: risks disclosing a third party's load, which is the more serious failure than escalating.
+#: The bank labels carry an optional "no."/"number" filler, because remittance blocks write
+#: "Account No. 2657147" as readily as "Account #2657147". That filler is NOT a label in its
+#: own right and must never become one: "Load No. 2523916" is a load, and suppressing a bare
+#: "no." would discard the very ids this tool exists to find.
 _NOT_A_LOAD_LABEL_RE = re.compile(
+    r"(?:"
     r"(?:p\.?\s*o\.?\s*box|\bpob\b|\bbox|\bmc\b|\bmc[#-]|\bdot\b|\bsuite\b|\bste\b|\bphone\b"
-    r"|\btel\b|\bfax\b|\bext\b|\bzip\b)\W{0,4}$",
+    r"|\btel\b|\bfax\b|\bext\b|\bzip\b)"
+    r"|(?:\bacct\b|\baccount\b|\baba\b|\brouting\b|\bsettlement\b|\bcheck\b)"
+    r"(?:\W{0,3}(?:no|nbr|num|number)\b)?"
+    r")\W{0,4}$",
     re.IGNORECASE,
 )
 

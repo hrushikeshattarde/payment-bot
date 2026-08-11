@@ -47,8 +47,22 @@ secrets/
 Thumbs.db
 gsheets-*.json
 
+# QuickBooks OAuth token store. Holds a live refresh token that reads the company's books,
+# and it is REWRITTEN on most runs (Intuit rotates the token), so it would otherwise show up
+# as a dirty file constantly as well as being a secret.
+.qbo_token.json
+qbo_token*.json
+# The fallback path qbo_authorize.py writes to when PAYBOT_QBO_TOKEN_FILE is unset.
+_qbo_token.json
+
 # Internal business data — this repo is public; keep these local.
 factoring_domains.json
+# Vendor send-from domains for the QuickBooks path. Same class of data as the factoring
+# roster: real company names mapped to the domains we will disclose payment details to.
+qbo_vendor_domains.json
+# Hand-verified send-from domains merged into the roster by the generator. Same class of
+# data as the file above: real company names mapped to the domains we will disclose to.
+factoring_domains_manual.json
 docs/ESCALATIONS.md
 # Settlements exports (factor remit emails) — internal data, repo is public.
 data-*.csv

@@ -15,9 +15,15 @@ Deliberately skipped, with a count reported per reason:
   address must NOT make every Gmail sender that factor. Uses the same exclusion list as
   ``check_authorization``'s domain matching.
 
+Hand-verified corrections live in ``factoring_domains_manual.json`` beside the output and are
+merged over the generated entries — union per company, so a manual send-from domain adds to
+the remit domain the export gave rather than replacing it. Regenerating therefore never drops
+them.
+
 Usage::
 
     python scripts/generate_factoring_domains.py <export.csv> <factoring_domains.json>
+    python scripts/generate_factoring_domains.py <export.csv> <out.json> <manual.json>
 """
 
 from __future__ import annotations
@@ -90,17 +96,68 @@ def generate(csv_path: Path) -> tuple[dict[str, list[str]], Counter[str]]:
     return {name: sorted(domains) for name, domains in sorted(result.items())}, skipped
 
 
+#: Hand-verified entries, merged over the generated ones. Sits beside the output by default.
+#:
+#: The export records where we REMIT; factors SEND from somewhere else, and rows with a NULL
+#: email are skipped entirely — so some gaps are structural and no regeneration will close
+#: them. Those corrections used to live in ``PAYBOT_FACTORING_DOMAINS`` in ``.env``, which put
+#: business data in a credentials file and made it invisible to anyone reading the roster.
+#: Keeping them in their own file, merged here, means regenerating never silently drops them.
+_MANUAL_FILENAME = "factoring_domains_manual.json"
+
+
+def _load_manual(path: Path) -> dict[str, list[str]]:
+    """Read the hand-verified patch file. Absent is fine; malformed is not.
+
+    Keys beginning with ``_`` are documentation, not companies — the file carries its own
+    README and a per-entry evidence note, because a domain that authorises a disclosure
+    should not be a bare string with nobody able to say where it came from. They are skipped
+    here rather than in the caller so no consumer of this function ever sees them.
+    """
+
+    if not path.is_file():
+        return {}
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} must hold a JSON object of name -> [domains]")
+
+    out: dict[str, list[str]] = {}
+    for key, value in loaded.items():
+        name = str(key).strip().lower()
+        if not name or name.startswith("_"):
+            continue
+        if not isinstance(value, list):
+            raise ValueError(f"{path}: {key!r} must map to a list of domains, got {type(value).__name__}")
+        out[name] = [str(d).strip().lower() for d in value if str(d).strip()]
+    return out
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
+    if len(argv) not in (3, 4):
         print(__doc__)
         return 2
     csv_path, out_path = Path(argv[1]), Path(argv[2])
+    manual_path = Path(argv[3]) if len(argv) == 4 else out_path.parent / _MANUAL_FILENAME
 
     mapping, skipped = generate(csv_path)
+    generated_count = len(mapping)
+
+    manual = _load_manual(manual_path)
+    for name, domains in manual.items():
+        # Union, not replace: a manual entry adds a send-from domain without discarding the
+        # remit domain the export supplied for the same company.
+        mapping[name] = sorted(set(mapping.get(name, [])) | set(domains))
+
     out_path.write_text(json.dumps(mapping, indent=1) + "\n", encoding="utf-8")
 
     total_domains = sum(len(d) for d in mapping.values())
     print(f"wrote {out_path}: {len(mapping)} factoring companies, {total_domains} domains")
+    if manual:
+        added = len(mapping) - generated_count
+        print(f"  merged {len(manual)} hand-verified entr{'y' if len(manual) == 1 else 'ies'} "
+              f"from {manual_path.name} ({added} new compan{'y' if added == 1 else 'ies'})")
+    else:
+        print(f"  no {manual_path.name} found — generated entries only")
     for reason, count in skipped.most_common():
         print(f"  skipped {count:>4}  {reason}")
     return 0

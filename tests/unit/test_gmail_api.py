@@ -670,3 +670,99 @@ def test_factory_builds_from_settings(tmp_path: Any) -> None:
     )
     client = build_gmail_api_client(settings, transport=FakeHttp([]))
     assert client.user == "paystatus@circledelivers.com"
+
+
+# --- a thread anyone on our side has written in is owned by a human ----------
+@pytest.mark.unit
+def test_thread_a_colleague_started_is_skipped_even_when_a_carrier_replied_last() -> None:
+    """The shape the newest-message-only rule missed.
+
+    A colleague emails a carrier with the group Cc'd; the carrier replies. The newest message
+    is then the carrier's, so the old rule answered it — drafting into a conversation a human
+    was already handling. Most `to:paystatus` matches are colleague mail of this kind.
+    """
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "m2", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    _thread_message("m1", _COLLEAGUE, "1000"),  # colleague started it
+                    _thread_message("m2", _CARRIER, "2000"),  # carrier replied last
+                ),
+            ),
+        ]
+    )
+    assert _client(http).fetch_new() == []
+
+
+@pytest.mark.unit
+def test_a_colleague_reply_mid_thread_also_skips() -> None:
+    """Ownership is not only about who started or who is newest."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "m3", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    _thread_message("m1", _CARRIER, "1000"),
+                    _thread_message("m2", _COLLEAGUE, "2000"),  # colleague stepped in
+                    _thread_message("m3", _CARRIER, "3000"),
+                ),
+            ),
+        ]
+    )
+    assert _client(http).fetch_new() == []
+
+
+@pytest.mark.unit
+def test_a_group_member_outside_our_domain_counts_as_ours() -> None:
+    """The domain rule cannot see a member on another domain; the list can."""
+
+    member = "shared.billing@partner-example.com"
+    client = _client(FakeHttp([]), group_members=(member.upper(),))
+    assert client._is_ours(f"Shared Billing <{member}>") is True
+    assert client._is_ours(f"Carrier <{_CARRIER}>") is False
+
+
+@pytest.mark.unit
+def test_the_group_address_itself_is_never_ours_even_if_listed() -> None:
+    """DMARC-rewritten carrier mail arrives FROM the group address.
+
+    Treating it as ours would make every DMARC-strict external sender invisible, which is the
+    regression the existing carve-out exists to prevent — the member list must not undo it.
+    """
+
+    group = "paystatus@circledelivers.com"
+    client = _client(FakeHttp([]), group_address=group, group_members=(group,))
+    assert client._is_ours(f"teamamy via Payment Status <{group}>") is False
+
+
+@pytest.mark.unit
+def test_an_all_carrier_thread_is_still_answered() -> None:
+    """The change must not suppress threads no human has touched."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "m1", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    _thread_message("m1", _CARRIER, "1000"),
+                    _thread_message("m2", _CARRIER, "2000"),
+                ),
+            ),
+            (
+                "/messages/m2",
+                200,
+                {"id": "m2", "threadId": "t1", "labelIds": ["UNREAD"], "raw": _b64(RAW_INBOUND)},
+            ),
+        ]
+    )
+    emails = _client(http).fetch_new()
+    assert len(emails) == 1

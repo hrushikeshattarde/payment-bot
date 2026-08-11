@@ -89,6 +89,7 @@ class GmailApiClient:
         transport: HttpTransport | None = None,
         timeout: float = 30.0,
         group_address: str = "",
+        group_members: tuple[str, ...] = (),
     ) -> None:
         self._tokens = token_source
         self._user = user or token_source.subject
@@ -97,6 +98,10 @@ class GmailApiClient:
         self._mark_read = mark_read
         self._transport: HttpTransport = transport or UrllibTransport()
         self._timeout = timeout
+        #: Members of the monitored group whose addresses are NOT on our own domain. The
+        #: domain rule already covers colleagues; this exists for a member who sits outside
+        #: it. Lowercased once here so `_is_ours` is a plain set lookup.
+        self._group_members = frozenset(m.strip().lower() for m in group_members if m.strip())
         #: The monitored group address (``paystatus@…``). Google Groups rewrites the From
         #: of DMARC-strict external senders to this address ("teamamy via Payment Status
         #: <paystatus@…>"), so mail *from* it is a carrier arriving through the group —
@@ -294,15 +299,19 @@ class GmailApiClient:
     def _thread_reply_target(self, thread_id: str) -> str | None:
         """The id of the message to answer in this thread, or ``None`` if none needs it.
 
-        Three reasons a thread needs nothing:
+        Reasons a thread needs nothing:
 
         * **A draft already exists in it.** Gmail keeps drafts in the thread, so this is what
           stops a re-run adding a second draft to the same conversation.
-        * **The newest message is ours.** Somebody on our side has already replied — a
-          colleague answering by hand, or an earlier run that was sent.
-        * **The newest message is a reply we sent.** Same as above; ownership is decided by
-          the sender's domain, not by the mailbox being impersonated, because group mail
-          arrives from colleagues on the same domain.
+        * **Anyone on our side has written in it, at any point.** A colleague who started the
+          thread or replied anywhere in it owns that conversation; ownership is decided by the
+          sender's domain and the configured group membership, not by the mailbox being
+          impersonated, because group mail arrives from colleagues on the same domain.
+
+        That last rule used to test only the NEWEST message, which missed the common shape: a
+        colleague emails a carrier with the group Cc'd, the carrier replies, and the newest
+        message is then the carrier's — so the bot drafted into a conversation a human was
+        already handling. Most `to:paystatus` matches are colleague mail of exactly this kind.
 
         Otherwise the answer is the thread's newest message, which may be *newer* than the one
         the query matched — a carrier who followed up twice should get one reply to the latest.
@@ -323,6 +332,13 @@ class GmailApiClient:
         for message in messages:
             if "DRAFT" in (message.get("labelIds") or []):
                 return None
+            # Any message from our side, anywhere in the thread, means a human has it.
+            if self._is_ours(_header_value(message, "From")):
+                _log.info(
+                    "gmail_api_thread_owned_by_us",
+                    extra={"thread_id": thread_id, "from": _header_value(message, "From")[:80]},
+                )
+                return None
             try:
                 stamp = int(message.get("internalDate") or 0)
             except (TypeError, ValueError):
@@ -332,17 +348,21 @@ class GmailApiClient:
         if newest is None:
             return None
 
-        if self._is_ours(_header_value(newest, "From")):
-            return None
         return str(newest.get("id") or "") or None
 
     def _is_ours(self, from_header: str) -> bool:
         """True when a message was sent by someone on our side — a colleague or ourselves.
 
-        The monitored group address itself is the exception: DMARC-strict external senders
-        arrive with From rewritten to exactly that address, so it marks a carrier coming
-        *through* the group, not a reply going out. Verified live: an OTR Solutions rate
-        verification read "teamamy via Payment Status <paystatus@…>" and was skipped as
+        Two signals, either sufficient:
+
+        * the sender's domain is our own (covers every colleague without a list to maintain);
+        * the sender is a configured member of the monitored group, which catches a member
+          whose address is NOT on our domain — a shared mailbox, a contractor, or an alias.
+
+        The monitored group address itself is the exception to both: DMARC-strict external
+        senders arrive with From rewritten to exactly that address, so it marks a carrier
+        coming *through* the group, not a reply going out. Verified live: an OTR Solutions
+        rate verification read "teamamy via Payment Status <paystatus@…>" and was skipped as
         already-answered until this carve-out existed.
         """
 
@@ -350,6 +370,8 @@ class GmailApiClient:
         normalized = address.lower()
         if self._group and normalized == self._group:
             return False
+        if normalized and normalized in self._group_members:
+            return True
         domain = self._user.rsplit("@", 1)[-1].lower()
         return bool(domain) and normalized.endswith(f"@{domain}")
 
@@ -473,4 +495,5 @@ def build_gmail_api_client(
         timeout=resolved.google_timeout_seconds,
         # The group whose From-rewritten mail must not read as "ours" (DMARC senders).
         group_address=resolved.mailbox,
+        group_members=resolved.gmail_group_members,
     )

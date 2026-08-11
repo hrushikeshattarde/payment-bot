@@ -281,6 +281,18 @@ class Settings(BaseSettings):
     #: The mailbox to read and draft in — also the user the service account impersonates.
     #: Falls back to ``mailbox`` when blank.
     gmail_user: str = ""
+    #: Members of the monitored group whose addresses are NOT on ``mailbox``'s own domain.
+    #:
+    #: A thread that anyone on our side has written in is skipped — a colleague who started it
+    #: or replied anywhere in it owns that conversation. Colleagues are already covered by the
+    #: domain rule, so this list is only for a member who sits outside it: a shared mailbox on
+    #: another domain, a contractor, an alias. Leave it empty unless the group has such members.
+    #:
+    #: The group address itself must NOT be listed. Google rewrites the From of DMARC-strict
+    #: external senders to exactly that address ("teamamy via Payment Status <paystatus@…>"),
+    #: so treating it as ours would make every such carrier invisible.
+    gmail_group_members: tuple[str, ...] = ()
+
     #: Gmail search syntax (not IMAP): ``is:unread``, ``newer_than:2d``, ``from:…``.
     gmail_query: str = "is:unread"
     gmail_fetch_limit: int = Field(default=10, ge=1, le=200)

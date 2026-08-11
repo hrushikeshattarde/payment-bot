@@ -52,6 +52,24 @@ _WEEKDAY_NAME: dict[int, str] = {
 }
 
 
+_MONTH_NAME: tuple[str, ...] = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)  # fmt: skip
+
+
+def format_pay_date(value: date) -> str:
+    """``value`` written the way a reply must render a pay date.
+
+    One string, assembled here from one date, so a reply has nothing to pair up wrongly.
+    Built from the tables above rather than ``strftime`` so the output cannot shift under a
+    non-English locale — the gate re-derives the weekday independently and would block a
+    localised month or weekday name as a mismatch.
+    """
+
+    return f"{_WEEKDAY_NAME[value.weekday()]}, {_MONTH_NAME[value.month - 1]} {value.day}, {value.year}"
+
+
 class ScheduledPayDate(BaseModel):
     """Resolved customer-facing pay date and the rule that produced it."""
 
@@ -59,8 +77,18 @@ class ScheduledPayDate(BaseModel):
 
     scheduled_pay_date: date
     basis: PayBasis
+    #: Weekday of the *input* estimated date — NOT of :attr:`scheduled_pay_date`, which the
+    #: Monday/Thursday rule may have moved. The two disagree for five of the seven weekdays
+    #: (Fri estimate → Mon pay date, etc.), so never render this beside the pay date; use
+    #: :attr:`display`. Retained because the rule's own wording is expressed in these terms.
     estimated_weekday: str
     rule_applied: str
+
+    @property
+    def display(self) -> str:
+        """:attr:`scheduled_pay_date` rendered for a reply, weekday included."""
+
+        return format_pay_date(self.scheduled_pay_date)
 
 
 def compute_scheduled_pay_date(

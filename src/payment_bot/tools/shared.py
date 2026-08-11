@@ -1084,8 +1084,15 @@ class ComputeScheduledPayDateInput(BaseModel):
 class ComputeScheduledPayDateOutput(BaseModel):
     ok: bool = True
     scheduled_pay_date: date
+    #: The pay date written exactly as the reply must render it — copy it verbatim.
+    #:
+    #: This replaced ``estimated_weekday``, which named the weekday of the *estimated* date
+    #: the caller passed in while ``scheduled_pay_date`` carried the Monday/Thursday-shifted
+    #: result. For five of the seven weekdays those disagree, so a reply that paired the two
+    #: fields wrote e.g. "Friday, August 10, 2026" for a Monday. Nothing is left to pair:
+    #: there is one date and one rendering of it.
+    scheduled_pay_date_display: str
     basis: str
-    estimated_weekday: str
     rule_applied: str
 
 
@@ -1150,8 +1157,8 @@ class ComputeScheduledPayDate(Tool):
         )
         return ComputeScheduledPayDateOutput(
             scheduled_pay_date=result.scheduled_pay_date,
+            scheduled_pay_date_display=result.display,
             basis=result.basis.value,
-            estimated_weekday=result.estimated_weekday,
             rule_applied=result.rule_applied,
         )
 

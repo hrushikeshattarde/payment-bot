@@ -12,6 +12,10 @@ The extraction is deliberately conservative and format-driven:
   amounts are caught while incidental counts in prose ("2 earning lines") are ignored.
 * **Dates** are recognised as ISO (``YYYY-MM-DD``) or ``Month DD, YYYY``.
 
+A weekday *name* is not a groundable token — nothing in a tool result is a weekday word to
+compare against — so :func:`find_weekday_mismatches` checks it arithmetically instead, from
+the date it is printed beside.
+
 Money is compared as :class:`~decimal.Decimal`, so ``$4,650`` and ``4650.00`` match.
 This is a heuristic that errs toward *blocking*; it is not a natural-language checker.
 """
@@ -59,6 +63,91 @@ def extract_money_tokens(text: str) -> set[Decimal]:
             out.add(Decimal(cleaned))
         except InvalidOperation:  # pragma: no cover - regex guarantees a number
             continue
+    return out
+
+
+#: Weekday names, Monday-first to match :meth:`datetime.date.weekday`.
+#:
+#: Spelled out rather than read from ``strftime("%A")`` so this check cannot change meaning
+#: under a non-English locale, and deliberately not imported from ``domain.pay_schedule``:
+#: this module stays stdlib-only, so the gate's arithmetic never borrows the same table as
+#: the code it is checking.
+_WEEKDAY_NAMES: tuple[str, ...] = (
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+)  # fmt: skip
+
+#: Spellings a reply might use → weekday index.
+_WEEKDAY_INDEX: dict[str, int] = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}  # fmt: skip
+
+#: Longest-first, so "monday" is preferred over the "mon" prefix.
+_WEEKDAY_ALT = "|".join(sorted(_WEEKDAY_INDEX, key=len, reverse=True))
+
+#: ``<Weekday>, <Month> D, YYYY`` or ``<Weekday>, YYYY-MM-DD``.
+_WEEKDAY_DATE_RE = re.compile(
+    rf"\b({_WEEKDAY_ALT})\b\.?,?\s+"
+    r"(?:([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})"
+    r"|(\d{4})-(\d{2})-(\d{2}))",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WeekdayMismatch:
+    """A weekday named in a draft that is not the weekday of the date beside it."""
+
+    stated: str  # as written in the draft
+    value: date
+    correct: str
+
+
+def find_weekday_mismatches(text: str) -> list[WeekdayMismatch]:
+    """Return every ``<Weekday>, <date>`` in ``text`` whose weekday is wrong for that date.
+
+    The ledger cannot catch this. Grounding compares *dates*, so "Monday, August 11, 2026"
+    grounds cleanly on a run that produced 2026-08-11 while the weekday word is compared
+    against nothing at all. Observed live on load 2481130: ``compute_scheduled_pay_date``
+    returned "Tuesday", the reply said "Monday" for that same date and cited the tool for
+    it, and all eleven checks passed.
+
+    This is pure arithmetic against the date itself, so it holds however the weekday was
+    arrived at — whether the model invented it or faithfully copied a field that did not
+    describe the date it was printed next to.
+    """
+
+    out: list[WeekdayMismatch] = []
+    seen: set[tuple[int, date]] = set()
+    for match in _WEEKDAY_DATE_RE.finditer(text):
+        index = _WEEKDAY_INDEX[match.group(1).lower()]
+        if match.group(5):
+            parts = (int(match.group(5)), int(match.group(6)), int(match.group(7)))
+        else:
+            month_num = _MONTHS.get((match.group(2) or "").lower())
+            if month_num is None:
+                # Not a date — e.g. "we pay on Monday, and August work is billed later".
+                continue
+            parts = (int(match.group(4)), month_num, int(match.group(3)))
+        try:
+            value = date(*parts)
+        except ValueError:
+            continue
+        if value.weekday() == index or (index, value) in seen:
+            continue
+        seen.add((index, value))
+        out.append(
+            WeekdayMismatch(
+                stated=match.group(1),
+                value=value,
+                correct=_WEEKDAY_NAMES[value.weekday()],
+            )
+        )
     return out
 
 

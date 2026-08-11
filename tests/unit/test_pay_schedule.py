@@ -217,3 +217,83 @@ def test_a_real_malformed_date_is_still_rejected(ctx: ToolContext) -> None:
         ComputeScheduledPayDate().run(
             ComputeScheduledPayDateInput(estimated_payment_date="not-a-date"), ctx
         )
+
+
+# ---------------------------------------------------------------------------
+# The pay date is rendered once, by the domain, so a reply cannot mis-pair it.
+#
+# `estimated_weekday` describes the date passed IN; `scheduled_pay_date` is the shifted
+# result. For five of the seven weekdays those disagree, and the tool used to hand the model
+# both — which is how "Friday, August 10, 2026" (a Monday) became writable. The tool output
+# now carries only `scheduled_pay_date_display`; these tests pin that it always agrees with
+# the date it renders, and that the trap is genuinely gone from the model-facing surface.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "estimated",
+    [date(2026, 8, d) for d in range(17, 24)],  # a full Mon-Sun week
+)
+def test_display_weekday_always_matches_the_date_it_renders(estimated: date) -> None:
+    from payment_bot.domain.pay_schedule import _WEEKDAY_NAME
+
+    result = compute_scheduled_pay_date(estimated_payment_date=estimated)
+    expected = _WEEKDAY_NAME[result.scheduled_pay_date.weekday()]
+    assert result.display.startswith(f"{expected}, ")
+
+
+@pytest.mark.unit
+def test_display_disagrees_with_estimated_weekday_when_the_rule_shifts_the_date() -> None:
+    """Documents the trap this guards: the two fields describe different dates."""
+
+    result = compute_scheduled_pay_date(estimated_payment_date=date(2026, 8, 21))  # Friday
+
+    assert result.estimated_weekday == "Friday"  # the input's weekday
+    assert result.scheduled_pay_date == date(2026, 8, 24)  # shifted to Monday
+    assert result.display == "Monday, August 24, 2026"  # renders the OUTPUT, not the input
+    assert result.estimated_weekday not in result.display
+
+
+@pytest.mark.unit
+def test_display_renders_an_already_paid_line_from_its_actual_date() -> None:
+    """The load-2481130 shape: paid 2026-08-11, a Tuesday."""
+
+    result = compute_scheduled_pay_date(
+        estimated_payment_date=date(2026, 8, 4), actual_payment_date=date(2026, 8, 11)
+    )
+
+    assert result.basis is PayBasis.ACTUAL
+    assert result.display == "Tuesday, August 11, 2026"
+
+
+@pytest.mark.unit
+def test_tool_output_exposes_the_display_string_and_not_the_estimated_weekday(
+    ctx: ToolContext,
+) -> None:
+    """The model must not be able to read a weekday that describes a different date."""
+
+    ctx.ledger.record_date(date(2026, 8, 21), "tp_get_load_summary", load_id="2462934")
+    out = ComputeScheduledPayDate().run(
+        ComputeScheduledPayDateInput(estimated_payment_date="2026-08-21", load_id="2462934"),
+        ctx,
+    )
+
+    assert out.scheduled_pay_date_display == "Monday, August 24, 2026"
+    assert "estimated_weekday" not in out.model_dump()
+
+
+@pytest.mark.unit
+def test_no_tool_output_can_produce_a_weekday_the_gate_would_block(ctx: ToolContext) -> None:
+    """End to end: copying the display string verbatim always clears weekday_consistency."""
+
+    from payment_bot.grounding import find_weekday_mismatches
+
+    for day in range(17, 24):
+        estimated = date(2026, 8, day)
+        ctx.ledger.record_date(estimated, "tp_get_load_summary", load_id="2462934")
+        out = ComputeScheduledPayDate().run(
+            ComputeScheduledPayDateInput(
+                estimated_payment_date=estimated.isoformat(), load_id="2462934"
+            ),
+            ctx,
+        )
+        assert find_weekday_mismatches(f"Payment is scheduled for {out.scheduled_pay_date_display}.") == []

@@ -23,6 +23,9 @@ Checks (all must pass):
     instruction (the §7 compensating control behind the boilerplate narrowing).
 11. **NOA request** — the reply asks the sender for an NOA only when the intake's pre-NOA
     instruction said to; a draft must never invent a paperwork chore.
+12. **Weekday consistency** — every weekday named in the reply is the real weekday of the
+    date beside it. Grounding checks dates, not the adjectives attached to them, so a
+    correct-and-grounded date carrying a wrong weekday passed all eleven checks above.
 """
 
 from __future__ import annotations
@@ -33,7 +36,11 @@ from pydantic import BaseModel
 
 from payment_bot.domain import route_load
 from payment_bot.errors import ClientError, ToolError
-from payment_bot.grounding import extract_date_tokens, extract_money_tokens
+from payment_bot.grounding import (
+    extract_date_tokens,
+    extract_money_tokens,
+    find_weekday_mismatches,
+)
 from payment_bot.logging import get_logger
 from payment_bot.models import AuthDecision, InboundEmail, SensitiveFlag, System
 from payment_bot.tools.base import ToolContext
@@ -161,6 +168,7 @@ class PreSendGate:
             self._check_sensitive_change(email, ctx),
             self._check_placeholders(draft),
             self._check_grounding(draft, ctx),
+            self._check_weekday_consistency(draft),
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
             self._check_carrier_consistency(draft, email, ctx),
@@ -520,4 +528,29 @@ class PreSendGate:
             )
         return GateCheck(
             name="grounding", passed=True, detail="every amount and date in the draft is grounded"
+        )
+
+    def _check_weekday_consistency(self, draft: SubmitDraftOutput) -> GateCheck:
+        """Companion to grounding: the date is right, but is the weekday beside it?
+
+        Blocks the load-2481130 shape — "Monday, August 11, 2026" for a Tuesday, cited to
+        `compute_scheduled_pay_date`, which had actually returned "Tuesday". A carrier reads
+        the weekday as the operative fact ("so it went out Monday"), and it is the one part
+        of a date the ledger has nothing to compare against.
+        """
+
+        mismatches = find_weekday_mismatches(draft.reply_body)
+        if mismatches:
+            stated = "; ".join(
+                f"{m.stated} {m.value.isoformat()} is a {m.correct}" for m in mismatches
+            )
+            return GateCheck(
+                name="weekday_consistency",
+                passed=False,
+                detail=f"draft names the wrong weekday for a date: {stated}",
+            )
+        return GateCheck(
+            name="weekday_consistency",
+            passed=True,
+            detail="every weekday named matches its date",
         )

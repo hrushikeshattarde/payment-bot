@@ -26,6 +26,7 @@ TOOL_NAMES: frozenset[str] = frozenset(
         "check_authorization", "carrier_cross_check", "compute_scheduled_pay_date",
         "compute_carrier_rate", "tp_get_load_summary", "tp_get_dispatch_history",
         "tp_get_settlement_entries", "tp_get_file_history", "tp_get_noa_factoring",
+        "cgt_get_load_status",
         "submit_draft",
     }
 )  # fmt: skip

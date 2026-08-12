@@ -9,6 +9,12 @@ those numbers, and they are the most heavily unit-tested part of the system.
 
 from __future__ import annotations
 
+from payment_bot.domain.cargotel import (
+    BillingState,
+    CargoTelPaymentState,
+    missing_documents,
+    resolve_payment,
+)
 from payment_bot.domain.documents import (
     REQUIRED_FOR_PAYMENT,
     ClassifiedDocument,
@@ -23,6 +29,8 @@ from payment_bot.domain.routing import RouteResult, route_load
 
 __all__ = [
     "REQUIRED_FOR_PAYMENT",
+    "BillingState",
+    "CargoTelPaymentState",
     "CarrierRate",
     "ClassifiedDocument",
     "DeductionLine",
@@ -35,5 +43,7 @@ __all__ = [
     "classify",
     "compute_carrier_rate",
     "compute_scheduled_pay_date",
+    "missing_documents",
+    "resolve_payment",
     "route_load",
 ]

@@ -33,6 +33,41 @@ class RolloutPhase(IntEnum):
     SELECTIVE_AUTOSEND = 2  # Low-risk, gate-passing intents may send without a click.
 
 
+def _merge_domain_file(values: Any, inline_key: str, file_key: str) -> Any:
+    """Merge a JSON name→domains roster file *under* its inline counterpart.
+
+    A name → tuple-of-domains map grows past what fits on one ``.env`` line, and a
+    hand-curated inline entry must be able to override a generated file entry. Kept as a
+    free function so a second roster can reuse it without duplicating the failure handling.
+
+    Runs as a ``mode="before"`` validator because :class:`Settings` is frozen. A
+    configured-but-unreadable file **raises** rather than silently authorising nobody —
+    an authorization roster that quietly failed to load is the worst of both worlds: it
+    looks configured and denies everyone, and ops has no signal that it did.
+    """
+
+    if not isinstance(values, dict):
+        return values
+    path_str = values.get(file_key) or ""
+    if not path_str:
+        return values
+    path = Path(str(path_str))
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"{file_key} {path_str!r} could not be read: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{file_key} {path_str!r} is not valid JSON: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{file_key} {path_str!r} must hold a JSON object")
+
+    inline = values.get(inline_key) or {}
+    if isinstance(inline, str):  # env sources may hand the raw JSON string through
+        inline = json.loads(inline)
+    values[inline_key] = {**loaded, **inline}
+    return values
+
+
 class Settings(BaseSettings):
     """Typed application settings. Instantiate via :func:`get_settings`."""
 
@@ -121,26 +156,45 @@ class Settings(BaseSettings):
         did not load.
         """
 
-        if not isinstance(values, dict):
-            return values
-        path_str = values.get("factoring_domains_file") or ""
-        if not path_str:
-            return values
-        path = Path(str(path_str))
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-        except OSError as exc:
-            raise ValueError(f"factoring_domains_file {path_str!r} could not be read: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"factoring_domains_file {path_str!r} is not valid JSON: {exc}") from exc
-        if not isinstance(loaded, dict):
-            raise ValueError(f"factoring_domains_file {path_str!r} must hold a JSON object")
+        return _merge_domain_file(values, "factoring_domains", "factoring_domains_file")
 
-        inline = values.get("factoring_domains") or {}
-        if isinstance(inline, str):  # env sources may hand the raw JSON string through
-            inline = json.loads(inline)
-        values["factoring_domains"] = {**loaded, **inline}
-        return values
+    # --- CargoTel (6-digit loads) --------------------------------------------
+    #: The load-maintenance page. CargoTel has no API, so the "client" scrapes this.
+    cargotel_base_url: str = "https://circle.cargotel.com/backoffice/loadmaint.mcgi"
+    #: The carrier client record. A separate page, reached from the load's carrier panel,
+    #: and the only source of contact addresses on this path.
+    cargotel_client_url: str = "https://circle.cargotel.com/backoffice/client.mcgi"
+    #: Where the login bot keeps the browser session cookie. There is no service credential
+    #: for CargoTel — a scraped session is the only way in — so this is the whole auth story.
+    cargotel_cookie_bucket: str = "circle-bot-cookies"
+    cargotel_cookie_key: str = "rubicon/cargotel.json"
+    #: Generous by default: the page is ~250 KB of CGI-rendered tables.
+    cargotel_timeout_seconds: float = Field(default=60.0, gt=0)
+
+    @property
+    def cargotel_configured(self) -> bool:
+        """True when enough is set to build a live :class:`CargoTelHttpClient`."""
+
+        return bool(
+            self.cargotel_base_url
+            and self.cargotel_client_url
+            and self.cargotel_cookie_bucket
+            and self.cargotel_cookie_key
+        )
+
+    #: Answer carrier mail about 6-digit / CargoTel loads at all.
+    #:
+    #: A deliberate policy switch in the spirit of ``allow_factoring``, defaulting to the
+    #: strict behaviour — and here the default is doing real work rather than being
+    #: cautious for its own sake. **Authorization has no source on this path yet.** A
+    #: CargoTel load page names the carrier but carries no contact address, and the
+    #: factoring company and its remit email live on a screen that is not wired
+    #: (Accounting → Payables → Carrier List & Settings). Until that exists,
+    #: ``check_authorization`` cannot resolve a sender and every 6-digit load escalates.
+    #:
+    #: Turning this on before that lands buys nothing: the loads would still escalate, one
+    #: layer later.
+    cargotel_replies: bool = False
 
     # --- Agent loop ----------------------------------------------------------
     #: Iteration budget for a SINGLE-load email. Multi-load emails get more — see

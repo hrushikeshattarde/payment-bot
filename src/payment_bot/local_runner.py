@@ -32,6 +32,7 @@ from dataclasses import dataclass
 
 from payment_bot.clients import (
     GMAIL_DRAFT_SCOPES,
+    CargoTelClient,
     DeferredApprovalResolver,
     DraftingGmailClient,
     DraftMessage,
@@ -40,6 +41,7 @@ from payment_bot.clients import (
     NullSlackClient,
     SlackClient,
     TransportProClient,
+    build_cargotel_client,
     build_gmail_api_client,
     build_groq_client,
     build_transport_pro_client,
@@ -47,7 +49,12 @@ from payment_bot.clients import (
 )
 from payment_bot.config import Settings, get_settings
 from payment_bot.errors import PaymentBotError
-from payment_bot.logging import InMemoryAuditSink, configure_logging, get_logger
+from payment_bot.logging import (
+    InMemoryAuditSink,
+    configure_console_output,
+    configure_logging,
+    get_logger,
+)
 from payment_bot.models import InboundEmail
 from payment_bot.pipeline import Outcome, PaymentBotPipeline, PipelineResult
 
@@ -75,6 +82,10 @@ class _Clients:
     gmail: GmailClient
     slack: SlackClient
     llm: LlmClient
+    #: Builds a CargoTel client for 6-digit loads, or returns None when the path is off or
+    #: unconfigured. Per-email like ``tp_factory``, and for the same reason: one consistent
+    #: snapshot per run.
+    cargotel_factory: Callable[[], CargoTelClient | None] = lambda: None
 
     @property
     def drafting_gmail(self) -> DraftingGmailClient | None:
@@ -114,11 +125,20 @@ def _build_clients(settings: Settings, *, dry_run: bool) -> _Clients:
     # console report. The seam stays for the deployed Phase 1 flow (§8.5).
     slack: SlackClient = NullSlackClient()
 
+    def cargotel_factory() -> CargoTelClient | None:
+        # Both conditions matter. Without configuration there is nothing to build; without
+        # the policy switch a 6-digit load must escalate, and handing the pipeline a live
+        # client anyway would only make `check_authorization` deny it one layer later.
+        if not (settings.cargotel_replies and settings.cargotel_configured):
+            return None
+        return build_cargotel_client(settings)
+
     return _Clients(
         tp_factory=lambda: build_transport_pro_client(settings),
         gmail=build_gmail_api_client(settings),
         slack=slack,
         llm=build_groq_client(settings),
+        cargotel_factory=cargotel_factory,
     )
 
 
@@ -245,6 +265,7 @@ def process_inbox(
         audit = InMemoryAuditSink()
         pipeline = PaymentBotPipeline(
             tp=clients.tp_factory(),
+            cargotel=clients.cargotel_factory(),
             gmail=clients.gmail,
             slack=clients.slack,
             llm=clients.llm,
@@ -306,6 +327,14 @@ def check_configuration(settings: Settings | None = None) -> int:
             print(f"  service account   : x {source}: {exc}")
 
     print(f"  transport pro     : {resolved.tp_base_url or '(unset)'}")
+    print(
+        "  cargotel (6-digit): "
+        + (
+            "on"
+            if resolved.cargotel_replies and resolved.cargotel_configured
+            else "off - 6-digit loads escalate (set PAYBOT_CARGOTEL_REPLIES=true)"
+        )
+    )
     print(f"  groq model        : {resolved.groq_model}")
     print(
         "  gmail draft       : "
@@ -338,16 +367,20 @@ def check_configuration(settings: Settings | None = None) -> int:
         # delegation, add a scope), so surface it verbatim.
         print(f"  x Gmail API      : {exc}")
         return 1
+
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    # A Windows console defaults to cp1252, and drafts routinely carry characters outside
-    # it (an em dash was enough). One unencodable character must degrade to '?' in the
-    # report, not kill the run mid-inbox with drafts left unwritten.
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(errors="replace")
+    # A Windows console defaults to cp1252, and drafts routinely carry characters outside it
+    # (an em dash was enough). One unencodable character must degrade in the report, not kill
+    # the run mid-inbox with drafts left unwritten.
+    #
+    # This used to set errors="replace" alone, which stopped the crash but left the encoding
+    # at cp1252 — so the report's own section rules ('─') came out as '?'. The shared helper
+    # switches the stream to UTF-8 as well, which prints them properly wherever the terminal
+    # can show them and still degrades safely where it cannot.
+    configure_console_output()
 
     parser = argparse.ArgumentParser(
         prog="payment-bot-local",

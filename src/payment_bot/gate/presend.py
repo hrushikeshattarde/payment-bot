@@ -485,7 +485,7 @@ class PreSendGate:
         by_carrier: dict[str, list[str]] = {}
         for load_id in draft.load_ids:
             try:
-                carrier = (ctx.tp.get_authorization_context(load_id).carrier_company or "").strip()
+                carrier = (self._carrier_for(load_id, ctx) or "").strip()
             except (ClientError, ToolError):
                 continue
             if carrier:
@@ -509,6 +509,24 @@ class PreSendGate:
                 else "no carrier to compare"
             ),
         )
+
+    def _carrier_for(self, load_id: str, ctx: ToolContext) -> str | None:
+        """The carrier a disclosed load belongs to, asking whichever system owns it.
+
+        Routed by id length rather than always asking Transport Pro. Asking TP about a
+        6-digit id does not fail usefully — it raises, the caller's ``except`` skips the
+        load, and the check quietly reports "no carrier to compare". That is the worst
+        outcome available for a safety check: a mixed reply would have been compared on its
+        Transport Pro loads alone and passed on a technicality.
+        """
+
+        if route_load(load_id).system is System.QUICKBOOKS:
+            if ctx.cargotel is None:
+                raise ToolError(
+                    f"load {load_id} is a 6-digit load but no CargoTel client is wired"
+                )
+            return ctx.cargotel.get_authorization_context(load_id).carrier_company
+        return ctx.tp.get_authorization_context(load_id).carrier_company
 
     def _check_grounding(self, draft: SubmitDraftOutput, ctx: ToolContext) -> GateCheck:
         # Magnitudes on both sides — the ledger stores them that way, see record_amount.

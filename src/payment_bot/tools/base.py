@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ValidationError
 
+from payment_bot.clients.cargotel import CargoTelClient
 from payment_bot.clients.llm import ToolSpec
 from payment_bot.clients.transport_pro import TransportProClient
 from payment_bot.config import Settings, get_settings
@@ -44,6 +45,11 @@ class ToolContext:
     settings: Settings = field(default_factory=get_settings)
     # Free-form space for tools to share intermediate state within one run.
     scratch: dict[str, Any] = field(default_factory=dict)
+    #: CargoTel client for 6-digit loads. Optional and defaulted, so every Transport-Pro-only
+    #: caller — including the existing tests — keeps working untouched. A ``cgt_*`` tool
+    #: reached with this unset reports a wiring error rather than a missing load, because
+    #: those two need different fixes.
+    cargotel: CargoTelClient | None = None
 
 
 class Tool(ABC):

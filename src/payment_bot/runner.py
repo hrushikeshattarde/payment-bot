@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from payment_bot.clients import AutoApproveResolver, LlmClient, MockGmailClient, MockSlackClient
 from payment_bot.config import get_settings
-from payment_bot.logging import InMemoryAuditSink, configure_logging
+from payment_bot.logging import InMemoryAuditSink, configure_console_output, configure_logging
 from payment_bot.models import InboundEmail
 from payment_bot.pipeline import Outcome, PaymentBotPipeline, PipelineResult
 from payment_bot.sample_data import (
@@ -91,6 +91,9 @@ def run_rate_demo() -> PipelineResult:
 
 
 def main() -> int:
+    # First: the report below is drawn with box-rule and arrow characters a Windows console
+    # cannot encode by default, and printing one raises mid-report.
+    configure_console_output()
     configure_logging("ERROR")  # keep the demo's stdout report clean
     results = [run_demo(), run_rate_demo()]
     return 0 if all(r.outcome is Outcome.SENT for r in results) else 1

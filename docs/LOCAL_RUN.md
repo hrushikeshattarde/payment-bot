@@ -72,7 +72,16 @@ python -m pip install -U pip; python -m pip install -e ".[dev,google]"
 ```
 
 The `google` extra pulls in `google-auth` (used only to RSA-sign the service-account JWT).
-`boto3` is *not* needed locally — that is the `aws` extra, for deployment.
+
+**If you also want 6-digit / CargoTel loads answered**, add two more extras:
+
+```bash
+python -m pip install -e ".[dev,google,cargotel,aws]"
+```
+
+`cargotel` pulls in BeautifulSoup (CargoTel has no API, so its client parses the
+back-office HTML), and `aws` pulls in `boto3` — needed here not for deployment but because
+CargoTel's session cookie lives in S3. Without CargoTel, neither is required locally.
 
 ---
 
@@ -316,14 +325,80 @@ Do **not** "fix" this by loosening the gate. A blocked draft is the gate doing i
 
 ---
 
+## 8b. 6-digit loads (CargoTel)
+
+Off by default. To turn it on, add to `.env`:
+
+```ini
+PAYBOT_CARGOTEL_REPLIES=true
+```
+
+Everything else has a working default — the two page URLs and the S3 location of the session
+cookie. `payment-bot-local --check` prints `cargotel (6-digit): on` once it is enabled.
+
+**You also need AWS credentials in the shell**, not just in `.env`. `boto3` reads the
+environment and does not see `.env`, so a profile has to be exported:
+
+```bash
+$env:AWS_PROFILE = "DataScientist-988836287275"
+```
+
+The identity needs `s3:GetObject` on `s3://circle-bot-cookies/rubicon/cargotel.json`, and if
+your account uses SSO the token expires — `aws sso login` refreshes it. A dead token surfaces
+as every 6-digit load escalating with a cookie-read error.
+
+### How this path differs from Transport Pro
+
+| | Transport Pro (7-digit) | CargoTel (6-digit) |
+|---|---|---|
+| Source | JSON API | **scraped HTML** — there is no API |
+| Pay date | estimated date → Mon/Thu rule | `Invoice Received` + the load's own terms |
+| Mon/Thu rule | applies | **does not apply** — dates land on any weekday |
+| Terms | fixed schedule | per carrier ("Check Net 30", "ACH Net 30") |
+| Documents | file history | BOL 05 + carrier invoice, from the Print Docs menu |
+| Authorization | dispatch contacts on the load | contacts on the carrier's client record |
+
+### Reading a CargoTel outcome
+
+The tool returns a `billing_state`, and it is the thing to look at first:
+
+| state | what it means | what the reply does |
+|---|---|---|
+| `scheduled` | invoice received, terms known | gives the payment date |
+| `awaiting_paperwork` | BOL 05 and/or carrier invoice missing | names what is missing and asks for it |
+| `awaiting_billing` | **documents are in; we have not processed them** | says it is with us — never chases the sender |
+| `invoiced_no_terms` | invoice in, terms unset on the load and carrier | no date, says it is being processed |
+| `on_hold` | an accounting hold | no date, needs a human |
+
+`awaiting_billing` is the one worth knowing about: the carrier has already sent everything,
+so a reply asking them for paperwork would be both wrong and annoying.
+
+### When it escalates
+
+Two CargoTel-specific reasons, and they mean opposite things:
+
+* **"no load NNNNNN exists (Invalid Order ID)"** — routine. Carrier mail is full of 6-digit
+  numbers that are not loads; an invoice number in a past-due chaser will do it. Nothing to
+  fix.
+* **"the session cookie is probably expired"** — systemic. Every 6-digit load will fail until
+  the login bot refreshes the cookie in S3. Nothing in this repo can refresh it.
+
+If you see a run of the second, that is the cookie, not the code.
+
+---
+
 ## 9. What is still not wired
 
 * **Sending.** By design. You press Send in Gmail.
 * **Slack approval buttons.** Needs a public callback endpoint — that belongs with the AWS
   deployment; see [AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md). Locally there is no Slack client at
   all; escalations surface in the console report and the JSON log.
-* **QuickBooks (6-digit loads)**, carrier-name lookup, combined intents, portal bulk reply —
-  all escalate today.
+* **Rate verification on 6-digit loads.** A CargoTel load carries one payable amount and no
+  line-item breakdown, so a rate question is answered as payment status plus the amount. The
+  charge detail lives on the Accounting tab, which is not wired.
+* **An email naming both a 6-digit and a 7-digit load.** One reply cannot come from two rule
+  sets, so it escalates.
+* Carrier-name lookup, combined intents, portal bulk reply — all escalate today.
 
 ---
 

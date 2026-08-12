@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from payment_bot.logging import AuditSink
 from payment_bot.tools.base import Tool, ToolContext, ToolOutcome, ToolRegistry
+from payment_bot.tools.cargotel import CgtGetLoadStatus
 from payment_bot.tools.shared import (
     CarrierCrossCheck,
     CheckAuthorization,
@@ -57,6 +58,20 @@ RATE_VERIFICATION_TOOLS: tuple[str, ...] = (
 )
 
 
+#: Tools for the CargoTel (6-digit) payment_status skill.
+#:
+#: Three, against nine on the Transport Pro side, because CargoTel is one page: the load,
+#: its documents, its terms and the computed date all arrive from a single read. There is no
+#: dispatch history, settlement table or file-history endpoint to advertise, and
+#: ``compute_scheduled_pay_date`` is deliberately absent — the Monday/Thursday rule does not
+#: apply here, and offering the tool would invite the model to apply it anyway.
+CARGOTEL_PAYMENT_STATUS_TOOLS: tuple[str, ...] = (
+    CgtGetLoadStatus.name,
+    CheckAuthorization.name,
+    SubmitDraft.name,
+)
+
+
 def build_default_registry(audit_sink: AuditSink | None = None) -> ToolRegistry:
     """Return a registry with every implemented tool registered."""
 
@@ -72,6 +87,8 @@ def build_default_registry(audit_sink: AuditSink | None = None) -> ToolRegistry:
             CarrierCrossCheck(),
             ComputeScheduledPayDate(),
             ComputeCarrierRate(),
+            # cargotel
+            CgtGetLoadStatus(),
             # transport pro
             TpGetLoadSummary(),
             TpGetDispatchHistory(),
@@ -86,6 +103,7 @@ def build_default_registry(audit_sink: AuditSink | None = None) -> ToolRegistry:
 
 
 __all__ = [
+    "CARGOTEL_PAYMENT_STATUS_TOOLS",
     "PAYMENT_STATUS_TOOLS",
     "RATE_VERIFICATION_TOOLS",
     "Citation",

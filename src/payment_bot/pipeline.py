@@ -25,14 +25,20 @@ from enum import StrEnum
 from payment_bot.agent import (
     AgentLoop,
     Skill,
+    build_cargotel_payment_status_intake,
     build_payment_status_intake,
     build_rate_verification_intake,
 )
-from payment_bot.agent.skills import PAYMENT_STATUS_SKILL, RATE_VERIFICATION_SKILL
+from payment_bot.agent.skills import (
+    CARGOTEL_PAYMENT_STATUS_SKILL,
+    PAYMENT_STATUS_SKILL,
+    RATE_VERIFICATION_SKILL,
+)
 from payment_bot.clients import (
     ApprovalAction,
     ApprovalResolver,
     ApprovalSummary,
+    CargoTelClient,
     GmailClient,
     LlmClient,
     SentMessage,
@@ -120,6 +126,7 @@ class PaymentBotPipeline:
         self,
         *,
         tp: TransportProClient,
+        cargotel: CargoTelClient | None = None,
         gmail: GmailClient,
         slack: SlackClient,
         llm: LlmClient,
@@ -130,6 +137,10 @@ class PaymentBotPipeline:
         allow_factoring: bool | None = None,
     ) -> None:
         self._tp = tp
+        # Optional and defaulted so every existing caller — the demo runner, the local
+        # runner, the integration tests — keeps working without a CargoTel client. Unset,
+        # 6-digit loads behave exactly as they did before this path existed.
+        self._cargotel = cargotel
         self._gmail = gmail
         self._slack = slack
         self._settings = settings or get_settings()
@@ -174,6 +185,7 @@ class PaymentBotPipeline:
         ledger = GroundingLedger()
         ctx = ToolContext(
             tp=self._tp,
+            cargotel=self._cargotel,
             ledger=ledger,
             correlation_id=correlation_id,
             settings=self._settings,
@@ -282,32 +294,56 @@ class PaymentBotPipeline:
                 _BULK_PORTAL_SKILL_ID,
             )
 
-        non_tp = [lid for lid, sys in routes.items() if sys is not System.TRANSPORT_PRO]
-        if non_tp:
-            tp_loads = [lid for lid, sys in routes.items() if sys is System.TRANSPORT_PRO]
+        tp_loads = [lid for lid, sys in routes.items() if sys is System.TRANSPORT_PRO]
+        # `System.QUICKBOOKS` is the §4.1 routing label for 6-digit ids. CargoTel is the
+        # system that actually holds them; QuickBooks receives them downstream as bills.
+        cgt_loads = [lid for lid, sys in routes.items() if sys is System.QUICKBOOKS]
+        cargotel_available = self._cargotel is not None and self._settings.cargotel_replies
+
+        if not cargotel_available:
             if not tp_loads:
-                # 6-digit / QuickBooks path is not wired in this slice.
+                # Unchanged behaviour where CargoTel is not enabled: a 6-digit-only email
+                # escalates exactly as it always did.
                 return self._escalate(
                     email,
                     "review",
-                    f"non-Transport-Pro loads {non_tp}",
+                    f"non-Transport-Pro loads {cgt_loads}",
                     tuple(load_ids),
                     correlation_id,
                 )
-            # A mixed email proceeds with its answerable loads. One stray 6-digit number
-            # used to stop the whole email — observed live: "Re: 2476340 - Need payment
-            # status" carried '107430' in the body and the answerable 7-digit load
-            # escalated with it. The dropped ids are logged; a human reviewing the draft
-            # sees the full ask in the thread.
-            _log.info(
-                "non_tp_loads_dropped",
-                extra={
-                    "correlation_id": correlation_id,
-                    "dropped": non_tp,
-                    "proceeding_with": tp_loads,
-                },
-            )
+            if cgt_loads:
+                # A mixed email proceeds with its answerable loads. One stray 6-digit number
+                # used to stop the whole email — observed live: "Re: 2476340 - Need payment
+                # status" carried '107430' in the body and the answerable 7-digit load
+                # escalated with it. The dropped ids are logged; a human reviewing the draft
+                # sees the full ask in the thread.
+                _log.info(
+                    "non_tp_loads_dropped",
+                    extra={
+                        "correlation_id": correlation_id,
+                        "dropped": cgt_loads,
+                        "proceeding_with": tp_loads,
+                    },
+                )
             load_ids = tp_loads
+            system = System.TRANSPORT_PRO
+        elif tp_loads and cgt_loads:
+            # Both systems named, and both answerable — so dropping one set would discard a
+            # real question rather than a stray number. One reply cannot be produced by two
+            # rule sets, so a human takes the whole email. Same unsolved problem as §3.5.
+            return self._escalate(
+                email,
+                "review",
+                f"email spans both systems: Transport Pro {tp_loads}, CargoTel {cgt_loads}",
+                tuple(load_ids),
+                correlation_id,
+            )
+        elif cgt_loads:
+            load_ids = cgt_loads
+            system = System.QUICKBOOKS
+        else:
+            load_ids = tp_loads
+            system = System.TRANSPORT_PRO
 
         # Authorization pre-check: the same `check_authorization` the gate re-runs (§5),
         # brought forward to before the model is invoked. When NO load is authorized, no
@@ -384,6 +420,7 @@ class PaymentBotPipeline:
             identifiers,
             load_ids,
             routes_map,
+            system,
             prenoa_loads,
             unresolved_loads,
         )
@@ -533,6 +570,7 @@ class PaymentBotPipeline:
         identifiers: ExtractIdentifiersOutput,
         load_ids: list[str],
         routes_map: dict[str, str],
+        system: System,
         prenoa_loads: list[str],
         unlocated_loads: list[str],
     ) -> tuple[Skill, str]:
@@ -555,37 +593,50 @@ class PaymentBotPipeline:
             # A quoted figure is the tell. Someone who wrote an amount wants it checked; with
             # no amount the ask is almost always "where is my money". Either way the reply
             # covers only one of the two questions, so it stays a human-reviewed draft.
-            chosen = RATE_VERIFICATION_SKILL if identifiers.stated_rates else PAYMENT_STATUS_SKILL
+            wants_rate = bool(identifiers.stated_rates)
             _log.info(
                 "combined_intent_narrowed",
                 extra={
-                    "chosen_skill": chosen.id,
+                    "chosen_skill": "rate_verification" if wants_rate else "payment_status",
                     "stated_rates": len(identifiers.stated_rates),
                 },
             )
-            if chosen is RATE_VERIFICATION_SKILL:
-                return chosen, build_rate_verification_intake(
-                    email,
-                    load_ids,
-                    routes_map,
-                    identifiers.stated_rates,
-                    identifiers.factoring_company,
-                    signature=self._settings.reply_signature,
-                    documents_email=self._settings.documents_email,
-                    prenoa_loads=prenoa_loads,
-                    unlocated_loads=unlocated_loads,
+        elif has_rate:
+            wants_rate = True
+        elif has_payment:
+            wants_rate = False
+        else:
+            # Uncertain intent but the email names loads (possibly only inside an attached
+            # statement — "please see attached" carries no keyword). Same reasoning as the
+            # classifier's own fallback: this inbox exists to answer payment status, and a
+            # human reviews the draft regardless.
+            _log.info(
+                "intent_defaulted_payment_status",
+                extra={"load_count": len(load_ids)},
+            )
+            wants_rate = False
+
+        if system is System.QUICKBOOKS:
+            # CargoTel answers payment status only: a load page carries one payable amount
+            # and no line-item breakdown, so there is nothing for a rate skill to itemise.
+            # A rate question therefore gets the status answer plus the amount, which is
+            # every figure that exists, rather than a skill that could only restate it.
+            if wants_rate:
+                _log.info(
+                    "cargotel_rate_narrowed_to_status",
+                    extra={"load_count": len(load_ids)},
                 )
-            return chosen, build_payment_status_intake(
+            return CARGOTEL_PAYMENT_STATUS_SKILL, build_cargotel_payment_status_intake(
                 email,
                 load_ids,
                 routes_map,
                 signature=self._settings.reply_signature,
                 documents_email=self._settings.documents_email,
-                prenoa_loads=prenoa_loads,
                 unlocated_loads=unlocated_loads,
             )
-        if has_rate:
-            intake = build_rate_verification_intake(
+
+        if wants_rate:
+            return RATE_VERIFICATION_SKILL, build_rate_verification_intake(
                 email,
                 load_ids,
                 routes_map,
@@ -596,25 +647,6 @@ class PaymentBotPipeline:
                 prenoa_loads=prenoa_loads,
                 unlocated_loads=unlocated_loads,
             )
-            return RATE_VERIFICATION_SKILL, intake
-        if has_payment:
-            return PAYMENT_STATUS_SKILL, build_payment_status_intake(
-                email,
-                load_ids,
-                routes_map,
-                signature=self._settings.reply_signature,
-                documents_email=self._settings.documents_email,
-                prenoa_loads=prenoa_loads,
-                unlocated_loads=unlocated_loads,
-            )
-        # Uncertain intent but the email names loads (possibly only inside an attached
-        # statement — "please see attached" carries no keyword). Same reasoning as the
-        # classifier's own fallback: this inbox exists to answer payment status, and a
-        # human reviews the draft regardless.
-        _log.info(
-            "intent_defaulted_payment_status",
-            extra={"load_count": len(load_ids)},
-        )
         return PAYMENT_STATUS_SKILL, build_payment_status_intake(
             email,
             load_ids,

@@ -12,9 +12,10 @@ Section references below (e.g. §4.1.1) point into that PRD.
 > intake & safety → intent classification → agent tool-use loop → deterministic pre-send
 > gate → Slack approval → gated Gmail send. External systems (Transport Pro, Gmail, Slack,
 > Bedrock) sit behind protocol interfaces with **mock implementations**, so the whole loop
-> runs and is unit-tested locally with no cloud access. QuickBooks (6-digit), carrier-name
-> lookup, and combined-intent merging (§3.5) have typed seams in place but are intentionally
-> not wired yet.
+> runs and is unit-tested locally with no cloud access. **6-digit loads are answered too**,
+> from CargoTel, under a separate rule set — see "Two systems, two rule sets" below.
+> Carrier-name lookup and combined-intent merging (§3.5) have typed seams in place but are
+> intentionally not wired yet.
 
 ## Architecture
 
@@ -29,11 +30,12 @@ Shared intake & safety (deterministic, §3.3)
    classify_intent → extract_identifiers → route_load → detect_sensitive_change → bulk/length
    │  (escalate & stop on sensitive change / invalid length / bulk / unclear intent)
    ▼
-Select skill by intent  ──▶  payment_status   or   rate_verification
+Select skill by intent AND owning system (7-digit → Transport Pro, 6-digit → CargoTel)
    │
    ▼
-Agent tool-use loop (Bedrock Converse, §8.1)     ← read-only TP tools + compute tools
-   tp_get_load_summary / dispatch / settlement / file_history / noa_factoring
+Agent tool-use loop (Bedrock Converse, §8.1)     ← read-only tools + compute tools
+   tp_get_load_summary / dispatch / settlement / file_history / noa_factoring   (7-digit)
+   cgt_get_load_status                                                          (6-digit)
    compute_scheduled_pay_date · compute_carrier_rate · carrier_cross_check · check_authorization
    → submit_draft (terminal)
    │
@@ -52,7 +54,7 @@ Slack approval (Phase 1, §8.5) ── approve ──▶ Gmail send  (gated)
 |---|---|
 | `models/` | Typed domain data — Transport Pro payload (§4.3.0), email, enums. |
 | `domain/` | **Pure** deterministic business logic (§4.1.1). No I/O. Fully unit-tested. |
-| `clients/` | External adapters behind protocols: Transport Pro, Gmail (service account), Groq (local) / Bedrock (deployed). |
+| `clients/` | External adapters behind protocols: Transport Pro, **CargoTel** (HTML scraping — no API), Gmail (service account), Groq (local) / Bedrock (deployed). |
 | `tools/` | Typed tool wrappers the agent calls; registry generates Bedrock tool specs. |
 | `grounding.py` | Ledger of facts emitted by tools — the gate checks drafts against it. |
 | `gate/` | The deterministic pre-send gate (§5). Never bypassed. |
@@ -122,8 +124,27 @@ python -m pip install -e ".[dev,aws]"
 |---|---|---|
 | `payment_status` (§3.1) | Status + scheduled pay date per earning line (Mon/Thu rule). | `tp_get_load_summary`, `compute_scheduled_pay_date`, dispatch/settlement/file-history, `carrier_cross_check`. |
 | `rate_verification` (§3.2) | Carrier rate = Σ earnings vs sender's stated amount (match/mismatch), each deduction with reason + net, invoice generated?, NOA/factoring (read-only). | `compute_carrier_rate`, `tp_get_noa_factoring`, load-summary, dispatch/settlement/file-history. |
+| `cargotel_payment_status` (6-digit) | Billing state, and the payment date as `Invoice Received` + the carrier's own terms. | `cgt_get_load_status`. |
 
-`classify_intent` routes each email; a rate **mismatch** is never auto-sent (§8.5).
+`classify_intent` picks the question; load-id length picks the system. A rate **mismatch** is
+never auto-sent (§8.5).
+
+### Two systems, two rule sets
+
+7-digit loads live in Transport Pro; 6-digit loads live in **CargoTel**, which has no API —
+its client parses the back-office HTML. The rules differ, and they are kept in separate
+modules ([`domain/pay_schedule.py`](src/payment_bot/domain/pay_schedule.py) vs
+[`domain/cargotel.py`](src/payment_bot/domain/cargotel.py)) so one cannot leak into the other:
+
+| | Transport Pro | CargoTel |
+|---|---|---|
+| Pay date | estimated date → **Mon/Thu rule** | `Invoice Received` + N, **no Mon/Thu rule** |
+| Terms | fixed schedule | per carrier ("Check Net 30", "ACH Net 30") |
+| Documents | file history | BOL 05 + carrier invoice |
+| Authorization | dispatch contacts on the load | contacts on the carrier's client record |
+
+Off by default (`PAYBOT_CARGOTEL_REPLIES=false`); with it off, 6-digit loads escalate as
+before. Setup is in [docs/LOCAL_RUN.md](docs/LOCAL_RUN.md) §8b.
 
 ## Testing strategy (§8.4)
 
@@ -137,7 +158,10 @@ python -m pip install -e ".[dev,aws]"
 
 ## Not yet wired (tracked seams)
 
-* QuickBooks Online tools (6-digit routing returns `quickbooks`; tools are stubs).
+* **Rate verification on 6-digit loads.** A CargoTel load has one payable amount and no
+  line-item breakdown, so a rate question is answered as payment status plus the amount.
+* **An email naming both a 6-digit and a 7-digit load** — one reply cannot come from two rule
+  sets, so it escalates. Same unsolved problem as §3.5.
 * Carrier-name lookup, portal bulk-reply body, combined-intent merging (§3.5, currently
   escalates).
 * **Sending email.** Deliberate: the bot creates Gmail drafts and a human presses Send.

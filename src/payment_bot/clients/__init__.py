@@ -23,6 +23,20 @@ and the AWS Phase 1 design (§8.5) depends on that seam. Locally there is no Sla
 
 from __future__ import annotations
 
+from payment_bot.clients.cargotel import (
+    CargoTelClient,
+    CargoTelLoadFixture,
+    MockCargoTelClient,
+)
+from payment_bot.clients.cargotel_html import is_login_page, parse_load_html
+from payment_bot.clients.cargotel_http import (
+    CargoTelHttpClient,
+    CargoTelSettings,
+    CookieSource,
+    S3CookieSource,
+    StaticCookieSource,
+    build_cargotel_client,
+)
 from payment_bot.clients.gmail import (
     DraftingGmailClient,
     DraftMessage,
@@ -95,7 +109,12 @@ __all__ = [
     "ApprovalSummary",
     "AutoApproveResolver",
     "BedrockLlmClient",
+    "CargoTelClient",
+    "CargoTelHttpClient",
+    "CargoTelLoadFixture",
+    "CargoTelSettings",
     "ContentBlock",
+    "CookieSource",
     "DeferredApprovalResolver",
     "DraftMessage",
     "DraftingGmailClient",
@@ -108,11 +127,13 @@ __all__ = [
     "LlmResponse",
     "LoadFixture",
     "Message",
+    "MockCargoTelClient",
     "MockGmailClient",
     "MockSlackClient",
     "MockTransportProClient",
     "NullSlackClient",
     "Role",
+    "S3CookieSource",
     "ScriptedApprovalResolver",
     "ScriptedLlmClient",
     "SendingDisabledError",
@@ -120,6 +141,7 @@ __all__ = [
     "ServiceAccountTokenSource",
     "SlackClient",
     "SlackPost",
+    "StaticCookieSource",
     "TextBlock",
     "ToolResultBlock",
     "ToolSpec",
@@ -128,9 +150,12 @@ __all__ = [
     "TransportProHttpClient",
     "TransportProSettings",
     "UrllibTransport",
+    "build_cargotel_client",
     "build_gmail_api_client",
     "build_groq_client",
     "build_transport_pro_client",
+    "is_login_page",
     "load_service_account_info",
+    "parse_load_html",
     "reply_subject",
 ]

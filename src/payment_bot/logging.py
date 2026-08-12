@@ -47,6 +47,42 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, ensure_ascii=False)
 
 
+def configure_console_output() -> None:
+    """Make stdout/stderr able to carry the characters this package actually prints.
+
+    Call this first in any console entrypoint.
+
+    Windows consoles default to cp1252, which cannot encode several characters the reports
+    are built from — ``─`` (U+2500) in the section rules, ``→`` (U+2192) in the outcome line,
+    ``⚠`` and ``✗`` in the local runner's checks. Writing one of them raises
+    ``UnicodeEncodeError`` *while printing*, so a completed run dies at its final report and
+    looks like a crash in the pipeline. The JSON log formatter is exposed too: it uses
+    ``ensure_ascii=False``, so any non-ASCII value in a log field reaches stderr raw.
+
+    Reconfiguring in place is what makes this safe to do at the boundary rather than by
+    rewriting every string: :meth:`io.TextIOWrapper.reconfigure` mutates the existing stream
+    object, so handlers already holding a reference to ``sys.stderr`` — including the one
+    :func:`configure_logging` installs — pick up the new encoding either way, whichever order
+    the two are called in.
+
+    ``errors="replace"`` rather than ``strict``: a mangled box-drawing character in a report
+    is cosmetic, while an exception at print time loses the whole run. Streams that are
+    redirected to a pipe or file, or replaced in tests, may have no ``reconfigure`` at all —
+    those are left alone.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # A detached or already-closed stream. Nothing to fix and nothing worth failing
+            # a run over — the caller has bigger problems than glyph fidelity.
+            continue
+
+
 def configure_logging(level: str = "INFO") -> None:
     """Install the JSON formatter on the root logger. Safe to call more than once."""
 

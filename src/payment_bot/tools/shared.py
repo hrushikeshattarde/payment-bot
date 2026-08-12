@@ -861,10 +861,11 @@ class CheckAuthorization(Tool):
 
     def run(self, params: BaseModel, ctx: ToolContext) -> CheckAuthorizationOutput:
         assert isinstance(params, CheckAuthorizationInput)
+        if params.system is System.QUICKBOOKS:
+            return self._decide_cargotel(params, ctx)
         if params.system is not System.TRANSPORT_PRO:
             raise ToolError(
-                f"authorization source not wired for system {params.system.value!r} "
-                "(this slice covers Transport Pro / 7-digit only)"
+                f"authorization source not wired for system {params.system.value!r}"
             )
 
         auth = ctx.tp.get_authorization_context(params.load_id)
@@ -972,6 +973,113 @@ class CheckAuthorization(Tool):
             decision=AuthDecision.DENY,
             matched_party=None,
             reason="sender does not match any authorized party for this load",
+        )
+
+    def _decide_cargotel(
+        self, params: CheckAuthorizationInput, ctx: ToolContext
+    ) -> CheckAuthorizationOutput:
+        """Authorize a 6-digit load against its carrier's CargoTel client record.
+
+        ``System.QUICKBOOKS`` is the routing label for 6-digit ids (§4.1); CargoTel is the
+        system that actually holds them, and QuickBooks receives them downstream as bills.
+
+        Three ways in, and one deliberately missing:
+
+        1. the sender's address is a contact on the carrier's record;
+        2. the sender's registrable domain matches a contact's, free-mail excluded;
+        3. the sender is the load's factoring company and its domain is configured in
+           ``factoring_domains`` — the same roster and the same rule the Transport Pro path
+           uses, so Saint John Capital is entered once and serves both systems.
+
+        Missing: any match on the carrier or factor *name* resembling the sender's domain.
+        Measured on real records, that test reduces "SAINT JOHN CAPITAL" to tokens a domain
+        like ``saintjohn-imports.com`` would satisfy, and here it would frequently be the
+        only signal. Email or exact domain, or DENY.
+
+        The free-mail exclusion is doing more work on this path than on the Transport Pro
+        one: of four real carrier records, two list **only** a Gmail address. Those senders
+        are authorizable on their exact address and nothing else — matching the domain would
+        authorize every Gmail user alive.
+        """
+
+        if not ctx.settings.cargotel_replies:
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.DENY,
+                matched_party=None,
+                reason=(
+                    "CargoTel replies are disabled; set PAYBOT_CARGOTEL_REPLIES=true to "
+                    "answer 6-digit loads"
+                ),
+            )
+        if ctx.cargotel is None:
+            # A wiring failure, not a denial. Raising keeps it out of the DENY bucket, where
+            # it would read as "this sender is not authorized" and send a reviewer hunting
+            # for a roster entry that was never the problem.
+            raise ToolError(
+                "CargoTel is not wired for this run, so authorization for a 6-digit load "
+                "cannot be resolved"
+            )
+
+        auth = ctx.cargotel.get_authorization_context(params.load_id)
+        sender = params.sender_email.strip().lower()
+        sender_domain = _sender_domain(sender)
+        contacts = {e.lower() for e in auth.authorized_emails}
+
+        if sender in contacts:
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.ALLOW,
+                authorized=True,
+                matched_party=auth.carrier_company,
+                reason="sender is a contact on this carrier's record",
+            )
+
+        if (
+            sender_domain
+            and sender_domain not in _FREE_MAIL_DOMAINS
+            and sender_domain in {_sender_domain(e) for e in contacts}
+        ):
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.ALLOW,
+                authorized=True,
+                matched_party=auth.carrier_company,
+                reason="sender's domain matches a contact on this carrier's record",
+            )
+
+        # The factor of record. Most carriers on this tenant are factored, so this is the
+        # common case for payment enquiries rather than an edge one.
+        if auth.factoring_company and _is_configured_factor_domain(
+            auth.factoring_company, sender, ctx
+        ):
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.FACTORING,
+                authorized=ctx.settings.allow_factoring,
+                matched_party=auth.factoring_company,
+                reason="sender domain is configured for the factoring company on this load",
+            )
+
+        if not contacts:
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.DENY,
+                matched_party=None,
+                reason=(
+                    f"the carrier record for {auth.carrier_company or 'this load'} lists no "
+                    "contact address, so the sender cannot be verified; add one in CargoTel"
+                ),
+            )
+        if auth.factoring_company:
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.DENY,
+                matched_party=None,
+                reason=(
+                    f"sender is neither a contact on the carrier's record nor a configured "
+                    f"domain for the factor on file ({auth.factoring_company!r}); add it to "
+                    "PAYBOT_FACTORING_DOMAINS if it is genuine"
+                ),
+            )
+        return CheckAuthorizationOutput(
+            decision=AuthDecision.DENY,
+            matched_party=None,
+            reason="sender is not a contact on this carrier's record",
         )
 
 

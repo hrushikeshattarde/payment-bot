@@ -31,7 +31,7 @@ credentials flow, and how the code we built maps onto Lambda functions.
                           └──────────┬────────────┘
                                      ▼
         Bedrock Runtime  ◀──────┌─────────────────────┐──────▶ Transport Pro API
-        (Converse)             │  Processor Lambda     │──────▶ QuickBooks Online API
+        (Converse)             │  Processor Lambda     │──────▶ CargoTel back-office (HTML)
                                │  PaymentBotPipeline    │
         Secrets/SSM  ◀─────────│  intake → agent loop   │──────▶ Slack API (post approval)
                                │  → pre-send gate (§5)  │
@@ -64,7 +64,8 @@ Slack; the **Slack-Callback** resumes on approval, re-runs the gate, and sends. 
 | Slack interactivity callback | **Lambda + Function URL / API Gateway** | Event-driven |
 | Audit log (every tool call) | **DynamoDB** or **S3** | Cheap; required for grounding audit |
 | Run state (correlation → draft) | **DynamoDB** (on-demand) | Pay-per-request |
-| Secrets (TP/QBO/Slack/Gmail) | **SSM Parameter Store** or **Secrets Manager** | Least-privilege secret access |
+| Secrets (TP/Slack/Gmail) | **SSM Parameter Store** or **Secrets Manager** | Least-privilege secret access |
+| CargoTel session cookie | **S3** (`circle-bot-cookies`), written by a separate login bot | Read-only to this system; not ours to rotate |
 | Logs / metrics | **CloudWatch** | Observability |
 
 ---
@@ -169,7 +170,7 @@ and **external third-party APIs** (consumed over HTTPS with their own credential
 | **Gmail API** (Google Workspace) | Read the inbox; send replies | **Service account with domain-wide delegation**, impersonating `paystatus@circledelivers.com` (§8.1.2) — server-side JWT, no interactive OAuth | `gmail.readonly` **or** `gmail.modify` (to label/thread) + `gmail.send` (least privilege — no delete) | `users.messages.list`, `users.messages.get`, `users.messages.send`, `users.threads.get` | Service-account JSON key in Secrets Manager; delegation configured in the Google Admin console |
 | **Slack API** | Post approval/escalation with Block Kit buttons; receive button clicks | **Bot token** (`xoxb-…`) for Web API; **signing secret** to verify inbound interactivity requests | Bot scopes: `chat:write` (+ `chat:write.customize` if needed) | `chat.postMessage`, `chat.update`; Interactivity **Request URL** → your callback Lambda | Bot token + signing secret in SSM/Secrets Manager |
 | **Transport Pro API** (7-digit loads) | Load summary (§4.3.0 payload), dispatch history, file history — see the endpoint table below | **Token flow, implemented:** `POST /auth` with HTTP Basic → `access_token` + `refresh_token`; all reads send `Authorization: Bearer`. Refresh-token grant on 401. | Read-only | `GET /voiceai/load/{n}/payment_information`, `GET /dispatch/search?loadId={n}`, `GET /files/search?recordType=loads&recordId={internal id}` | API user + password in SSM `SecureString` / Secrets Manager (`PAYBOT_TP_USERNAME` / `PAYBOT_TP_PASSWORD`) |
-| **QuickBooks Online API** (6-digit loads) | Payment status / line items for QBO-owned loads | **OAuth2** (authorization-code + refresh token) | Accounting read | `query` for `Bill`/`Invoice`, entity reads | OAuth client id/secret + refresh token in Secrets Manager |
+| **CargoTel back-office** (6-digit loads) | Billing state, documents, payment terms and the carrier's contacts — **HTML scraping, there is no API** | **Browser session cookie** (`cgt-browser-session`) read from S3, refreshed by a separate login bot. No service credential exists. | Read-only (GET only) | `GET /backoffice/loadmaint.mcgi?load_id={n}`, `GET /backoffice/client.mcgi?id={client id}` | The cookie object `s3://circle-bot-cookies/rubicon/cargotel.json`, maintained **outside this system** |
 
 > **Transport Pro is implemented** in
 > [`clients/transport_pro_http.py`](../src/payment_bot/clients/transport_pro_http.py) —
@@ -181,8 +182,37 @@ and **external third-party APIs** (consumed over HTTPS with their own credential
 > parties (carrier company + dispatch contact emails). The remaining §9 open item for TP is
 > confirming the **base URL** and whether `payment_information` is keyed by the
 > carrier-facing load number or the internal record id (the client keys by the number from
-> the email and never trusts the echoed id). The QBO (6-digit) path and carrier-name lookup
-> are still not built.
+> the email and never trusts the echoed id). Carrier-name lookup is still not built.
+
+> **CargoTel is implemented** in
+> [`clients/cargotel_http.py`](../src/payment_bot/clients/cargotel_http.py) and
+> [`clients/cargotel_html.py`](../src/payment_bot/clients/cargotel_html.py) — build it with
+> `build_cargotel_client()` from `PAYBOT_CARGOTEL_*` config, one client per email. It is
+> unlike every other adapter here in three ways that shape the deployment:
+>
+> 1. **It scrapes HTML.** CargoTel has no API. The parser is a pure function
+>    (`parse_load_html`), unit-tested against saved pages, precisely because it is the part
+>    most likely to break when CargoTel changes its markup. Expect it to need maintenance in
+>    a way the JSON adapters do not, and treat a parse failure as an escalation rather than
+>    an outage.
+> 2. **Its credential is somebody else's.** There is no service account. Authentication is a
+>    browser session cookie that a separate login bot writes to S3, so the bot's ability to
+>    read loads depends on a system outside this repository staying healthy. Nothing here
+>    can refresh it.
+> 3. **A dead cookie returns HTTP 200.** CargoTel serves the login page rather than an error,
+>    which parses as a load with no documents — i.e. the bot would tell a queue of carriers
+>    their paperwork is missing when it is not. The client detects this and raises, so the
+>    email escalates. A sudden run of CargoTel escalations means the cookie, not the code.
+>
+> **Alarm on it.** A stale cookie is silent from the outside — Gmail still polls, Transport
+> Pro still answers, only the 6-digit loads fail. Alarm on repeated
+> `cargotel_carrier_unreadable` warnings and on escalation reasons containing "session cookie
+> is probably expired", or the failure is invisible until a carrier complains.
+>
+> Two things also carry operational weight: `PAYBOT_CARGOTEL_REPLIES` gates the whole path
+> (off = 6-digit loads escalate, which is the safe default), and **rate verification is not
+> supported** — a CargoTel load has one payable amount and no line-item breakdown, so a rate
+> question is answered as payment status plus the amount.
 
 ### 5.3 Config → secret mapping
 
@@ -193,7 +223,8 @@ and **external third-party APIs** (consumed over HTTPS with their own credential
 | Slack bot token, Slack signing secret | SSM `SecureString` / Secrets Manager |
 | Gmail service-account JSON | Secrets Manager |
 | `PAYBOT_TP_PASSWORD` (Transport Pro API password) | SSM `SecureString` / Secrets Manager |
-| QuickBooks OAuth client id/secret + refresh token | Secrets Manager (rotation recommended) |
+| `PAYBOT_CARGOTEL_BASE_URL`, `PAYBOT_CARGOTEL_CLIENT_URL`, `PAYBOT_CARGOTEL_COOKIE_BUCKET`, `PAYBOT_CARGOTEL_COOKIE_KEY`, `PAYBOT_CARGOTEL_REPLIES` | Lambda env vars or SSM plaintext params — none of these is a secret |
+| The CargoTel session cookie itself | **Not a Secrets Manager entry.** It lives in S3 and is written by the login bot; the processor only reads it. |
 
 ---
 
@@ -211,6 +242,9 @@ One execution role per function. Sketches:
 - `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes` on `paybot-work`
 - `dynamodb:PutItem`, `UpdateItem`, `GetItem`, `Query` on `paybot-runstate` + `paybot-audit`
 - `ssm:GetParameter*` / `secretsmanager:GetSecretValue` on `paybot/*` (+ `kms:Decrypt`)
+- `s3:GetObject` on `arn:aws:s3:::circle-bot-cookies/rubicon/cargotel.json` — the CargoTel
+  session cookie. Scope it to that one object key, not the bucket: the processor never needs
+  to read another bot's cookies, and never needs to write.
 - CloudWatch Logs
 
 **Slack-Callback role**
@@ -377,7 +411,10 @@ emails never need the larger model.
       against a known load to check the returned `load_id` against the number requested.
 - [ ] Confirm the derived facts are acceptable, or get real endpoints for them: settlement
       entries, NOA/factoring, and the authorized-parties allow-list.
-- [ ] QuickBooks object/field for the 6-digit load number confirmed → implement QBO tools.
+- [ ] CargoTel login bot confirmed healthy and its cookie refresh cadence known — the
+      6-digit path depends on a system outside this repo.
+- [ ] Alarm wired on stale-cookie escalations (see the CargoTel note in §5.2).
+- [ ] `s3:GetObject` granted to the processor role on the cookie object only.
 - [ ] Gmail service account created with domain-wide delegation to `paystatus@` + scopes granted.
 - [ ] Slack app created: Bot token, Interactivity enabled, signing secret, channels created.
 - [ ] Factoring authorization policy decided (ALLOW vs escalate) → set `allow_factoring`.

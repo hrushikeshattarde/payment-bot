@@ -445,7 +445,10 @@ def parse_load_html(html: str, load_id: str) -> CargoTelLoad:
     if load.carries_no_order:
         raise ClientError(
             f"CargoTel: no load {load_id!r} exists — the page came back with no order on it "
-            "(no business unit, status, carrier or terms). The number in the email is "
-            "probably not a load id."
+            "(no business unit, status, carrier or terms). A 6-digit number in an email is "
+            "most often the sender's own invoice or reference number rather than a Circle "
+            "load id. Do NOT look it up in Transport Pro to find out: it numbered loads with "
+            "six digits years ago, so it will often match a stranger's archived load — see "
+            "payment_bot.domain.routing."
         )
     return load

@@ -6,14 +6,34 @@ split, credential flow); this document is the *plan*: what to do, in what order,
 step needs, how to verify it, and how to roll back.
 
 Written 2026-08-03, revised 2026-08-12, reflecting the system as it runs today: the
-authorization pre-check, the 271-factor trust roster, spreadsheet-attachment intake, the
+authorization pre-check, the 272-factor trust roster, spreadsheet-attachment intake, the
 twelve-check pre-send gate, the bank/NOA wording policies, **the CargoTel path for 6-digit
-loads**, and hourly scheduling via Windows Task Scheduler.
+loads**, and 20-minute scheduling via Windows Task Scheduler.
 
 The 2026-08-12 revision is mostly about CargoTel. It is the first dependency that is neither
 an API nor ours: a scraped back-office whose session cookie is maintained by a **separate
 login bot**. That changes the IAM, the alarms and the risk register, so it is threaded
 through this plan rather than noted once.
+
+A second 2026-08-12 pass folded in a day of live-mail fixes that touch deployment. In brief,
+because each is picked up where it lands:
+
+* **The HTML part of an email is now read** (`InboundEmail.html_text`). Portal collections
+  mail puts its invoice table in the HTML only, so a load id could exist nowhere else. It
+  feeds identifier extraction *and* the sensitive-change scan, and the gate's own re-derivation
+  of that scan, so all three see the same text.
+* **A twelfth gate check, `weekday_consistency`**, re-derives the weekday of every date a
+  draft names. Grounding compares dates and never the adjectives attached to them.
+* **Bank-redirect detection widened**: a change announcement carrying a supplied account or
+  routing number is now hard evidence however passive the grammar. Raises the
+  `PolicyAllowedChangeWording` digest's importance (§3.5).
+* **CargoTel not-a-load has three shapes, not two** — "Invalid Order ID", the login page, and
+  a load form with no order in it. That third one changes a metric filter (§3.5).
+* **6-digit ids are not exclusive to CargoTel.** Transport Pro numbered loads with six digits
+  years ago and still serves them. Measured, decided, and deliberately *not* "fixed" — see the
+  new risk row in §6, and `payment_bot.domain.routing` for the evidence.
+* **`PAYBOT_AWS_PROFILE`** is now a setting rather than a shell export, which matters for the
+  Lambda: it must be left blank there (§3.2).
 
 ---
 
@@ -23,13 +43,14 @@ through this plan rather than noted once.
 
 | Concern | Current implementation |
 |---|---|
-| Trigger | Windows Task Scheduler, hourly (`scripts/run_bot.cmd`) |
+| Trigger | Windows Task Scheduler, every 20 min (`scripts/run_bot.cmd`) |
 | Compute | `payment-bot-local` on a developer workstation |
-| LLM | OpenRouter free tier (`nemotron-3-ultra-550b:free`) — request-capped, flaky |
+| LLM | OpenRouter, `anthropic/claude-haiku-4.5` (the `PAYBOT_GROQ_*` settings are historically named; the endpoint is OpenAI-compatible, the model is Claude) |
 | Review surface | Gmail Drafts (a human reviews and presses Send) |
 | Secrets | `.env` file on disk |
-| Trust roster | `factoring_domains.json` generated from settlements CSV, local file |
-| 6-digit loads | CargoTel back-office scraped over HTTP; session cookie read from S3 (`AWS_PROFILE` exported by hand in the shell) |
+| Trust roster | `factoring_domains.json` generated from settlements CSV, local file; hand-verified send-from domains merged from `factoring_domains_manual.json` |
+| 6-digit loads | CargoTel back-office scraped over HTTP; session cookie read from S3 via the ambient AWS credential chain (`PAYBOT_AWS_PROFILE`, or a `[default]` profile in `~/.aws/credentials`) |
+| AWS credentials | Temporary, human-refreshed. They carry a session token but record no expiry, so boto3 cannot renew them: when they lapse every 6-digit load escalates until someone logs in again. **This is the single strongest operational argument for the migration** — a Lambda execution role has no expiry to manage |
 | Audit | In-memory per run + console/log file (`logs/`) |
 | Availability | Only while the workstation is on and the user logged in |
 
@@ -37,7 +58,7 @@ through this plan rather than noted once.
 
 | Concern | Target implementation |
 |---|---|
-| Trigger | EventBridge Scheduler (hourly; tighten later) |
+| Trigger | EventBridge Scheduler — match the workstation's **20 minutes**, not the hourly figure this plan originally assumed. Carriers chase within the hour and the local task was tightened for that reason; deploying at a slower cadence than the thing being replaced would be a visible regression |
 | Compute | Lambda (Python 3.12) — Fargate fallback if runs outgrow 15 min |
 | LLM | **Amazon Bedrock**, `us.anthropic.claude-sonnet-5-v1:0` (`BedrockLlmClient` already in the codebase) |
 | Review surface | Gmail Drafts (Stage 1) → Slack Approve/Edit/Reject (Stage 2) |
@@ -71,9 +92,14 @@ login bot, and P9, whether to enable the path in Stage 1 at all.
 
 ### Non-goals for this plan
 
-* **Rate verification on 6-digit loads.** A CargoTel load carries one payable amount and no
-  line-item breakdown, so a rate question is answered as payment status plus the amount.
-  Getting a real breakdown means scraping the Accounting tab — a separate piece of work.
+* **An itemised rate breakdown on 6-digit loads.** A CargoTel load carries one payable amount
+  and no line items, so a rate question is answered as payment status *plus that amount* — the
+  reply now states the figure and, where the sender quoted one, says whether the two agree
+  (`cargotel_payment_status` 1.1.0). Until today the narrowing was only half-built: the prompt
+  named dates and documents per billing state and never asked for the figure, so a Tru Funding
+  rate enquiry over five loads was answered entirely in missing-paperwork wording while $2,150
+  and $3,000 sat unused in the tool results. What remains out of scope is a genuine
+  *breakdown*, which means scraping the Accounting tab — a separate piece of work.
 * Auto-send (§8.5 Phase 2) — explicitly the LAST stage, gated on Stage 2 running clean.
 * The `/load/missing_documents` cache (see MISSING_DOCUMENTS_CACHE.md) — independent.
 * Owning the CargoTel login bot. If it needs to move to AWS too, that is its own plan.
@@ -94,7 +120,7 @@ Stage 3  "Selective auto-send"       PAYBOT_ROLLOUT_PHASE=2 for single-load paym
 
 ### Stage 1 — scheduled worker Lambda (target: ~1 week)
 
-One Lambda replicating exactly what `payment-bot-local` does hourly today: fetch unread →
+One Lambda replicating exactly what `payment-bot-local` does every 20 minutes today: fetch unread →
 pipeline per email → gate → save draft to Gmail Drafts → log. Humans keep reviewing in
 Gmail, exactly as now. The only functional change is the LLM: **Bedrock Claude replaces the
 free-tier model**, which eliminates the request-cap failures and most instruction-following
@@ -180,11 +206,12 @@ Lambda env for the boring constants.
 | `PAYBOT_FACTORING_DOMAINS_FILE` | Lambda env → `/tmp/factoring_domains.json` | Object fetched from S3 at cold start (see 3.3) |
 | `PAYBOT_ALLOW_FACTORING`, `PAYBOT_SENSITIVE_BANK_REPLIES`, `PAYBOT_SENSITIVE_NOA_REPLIES` | SSM `/paybot/policy/*` | **Policy switches — changing them should be deliberate and audited**, hence Parameter Store with change history, not plain env |
 | `PAYBOT_REPLY_SIGNATURE`, `PAYBOT_REPLY_CC`, `PAYBOT_DOCUMENTS_EMAIL`, `PAYBOT_PORTAL_URL`, `PAYBOT_BULK_THRESHOLD` | Lambda env | Plain constants |
-| `PAYBOT_AGENT_MAX_ITERATIONS=20`, `PAYBOT_AGENT_MAX_TOKENS` | Lambda env | 4096 tokens is fine for Claude (non-reasoning-budget); 16384 was a free-model accommodation |
+| `PAYBOT_AGENT_MAX_ITERATIONS`, `PAYBOT_AGENT_ITERATIONS_PER_EXTRA_LOAD`, `PAYBOT_AGENT_MAX_TOKENS` | Lambda env | Defaults 12 / 9 / 4096. The first two are a *base* and a *per-extra-load increment*, not a flat cap — see §3.7 for what that does to run time. 4096 tokens is fine for Claude (non-reasoning-budget); 16384 was a free-model accommodation |
 | `PAYBOT_MODEL_DRAFT`, `PAYBOT_AWS_REGION` | Lambda env | Bedrock model id |
 | `PAYBOT_CARGOTEL_BASE_URL`, `PAYBOT_CARGOTEL_CLIENT_URL` | Lambda env | Two back-office page URLs; not secret |
 | `PAYBOT_CARGOTEL_COOKIE_BUCKET`, `PAYBOT_CARGOTEL_COOKIE_KEY` | Lambda env | Where the login bot leaves the session cookie. The cookie itself is **not** a Secrets Manager entry — it is not ours to store or rotate, only to read |
 | `PAYBOT_CARGOTEL_REPLIES` | SSM `/paybot/policy/*` | A policy switch like the factoring ones: off means every 6-digit load escalates. Parameter Store so flipping it is deliberate and audited |
+| `PAYBOT_AWS_PROFILE` | Lambda env, **blank** | Exists because boto3 reads the *process environment* and never `.env`, so on a workstation the CargoTel cookie read fails with "Unable to locate credentials" unless a profile is named. **Leave it empty in Lambda**: there are no profiles there, the execution role is the credential source, and naming one that does not exist would break the cookie read outright |
 | `PAYBOT_GROQ_*` | **dropped** | Local-only provider |
 | `PAYBOT_DRAFT_ONLY` | Lambda env, `true` in Stage 1 | Stage 2 keeps it `true` in the processor; only the Slack callback sends |
 
@@ -239,14 +266,26 @@ Metric filters → CloudWatch metrics (per run):
 | `PolicyAllowedChangeWording` | `bank_change_language_allowed_by_policy` | Daily digest — every one of these needs a human to action the request |
 | `RunFailures` | Lambda errors / DLQ depth | Any → page |
 | `CargoTelCookieStale` | escalation reason containing `session cookie is probably expired`, or `cargotel_carrier_unreadable` | **Any → page.** This is the alarm that matters most on the new path: nothing else looks broken while it fires, and every 6-digit email is waiting on it |
-| `CargoTelInvalidOrder` | escalation reason containing `Invalid Order ID` | Digest only — routine. A 6-digit number in an email is often an invoice or account number, not a load |
-| `CargoTelParseFailures` | `ClientError` from `parse_load_html` / `parse_carrier_html` other than the two above | >2/day → investigate: the most likely cause is CargoTel changing its markup |
+| `CargoTelCookieUnavailable` | the `cargotel_cookie_unavailable` log event | **Any → page.** Distinct from the alarm above: this one means the cookie could not be *read* (credentials, permissions, missing object) rather than that it was read and rejected. The log entry carries the bucket, key and profile; the escalation carries only the action, deliberately. Should be near-impossible in Lambda — the execution role does not expire — so a hit here means an IAM or bucket-policy problem, not a stale login |
+| `CargoTelNotALoad` | escalation reason containing `Invalid Order ID` **or** `no order on it` | Digest only — routine. A 6-digit number in an email is often the sender's own invoice or reference number rather than a load. **Both phrases are needed:** CargoTel has two ways of saying "not a load" — the explicit message, and a 200 with the real load form and no order in it, which is the quieter and more common of the two |
+| `SenderInvoiceIdDropped` | the `sender_invoice_id_dropped` log event | Digest only. An id was withheld from lookup because it was the sender's own invoice number pulled into the wrong system. Watch the rate: a rise means senders' reference formats are drifting, and each one used to cost an escalation |
+| `CargoTelParseFailures` | `ClientError` from `parse_load_html` / `parse_carrier_html` other than the cases above | >2/day → investigate: the most likely cause is CargoTel changing its markup |
 
-`CargoTelCookieStale` and `CargoTelInvalidOrder` must stay separate alarms even though both
+`CargoTelCookieStale` and `CargoTelNotALoad` must stay separate alarms even though both
 surface as escalations. One is systemic and urgent, the other is a carrier writing an invoice
 number in an email. Collapsing them into one "CargoTel escalations" metric means the urgent
 case is buried in routine noise — the first live run of this path produced exactly one of
-each.
+each, and the routine one was initially *reported* as the urgent one, which is why the
+distinction is drawn in code rather than left to whoever reads the alarm.
+
+`PolicyAllowedChangeWording` deserves more weight than its "daily digest" suggests. It fires
+when an email carrying a bank or NOA instruction was drafted anyway because
+`PAYBOT_SENSITIVE_BANK_REPLIES` / `_NOA_REPLIES` allow it. The gate guarantees the *draft*
+never acknowledges the instruction; nothing guarantees anyone *actions* it. A live example the
+same day: a factoring company announced changed banking details with a full account and routing
+number alongside a routine rate question, and the bot drafted a correct answer that mentioned
+none of it. Sending that reply and closing the thread would have lost the request silently.
+Treat each entry as a task, not a log line.
 
 Plus a weekly *capability report*: the ESCALATIONS.md §6 audit run as a read-only scheduled
 job, publishing the answerable/escalated breakdown — the number that shows whether the
@@ -256,10 +295,12 @@ roster and checks are keeping up with real mail.
 
 GitHub Actions on the repo (branches already in use):
 
-1. **On PR**: `ruff check` + `mypy` + `pytest` (567 tests, no network — the suite is already
+1. **On PR**: `ruff check` + `mypy` + `pytest` (624 tests, no network — the suite is already
    hermetic thanks to `isolate_settings`). The CargoTel parser tests run against a synthetic
    page fixture rather than saved real pages: real ones carry carrier names, contact emails,
-   VINs and payable amounts, and this repository is public.
+   VINs and payable amounts, and this repository is public. The blank-form fixture is built
+   from the same `build_page` helper with its values emptied, because the guard it exercises
+   exists to tell a real *form* from a real *load* — a hand-written stub would not test it.
 2. **On merge to `main`**: `sam build && sam deploy` to a **staging stack** pointed at a
    test mailbox + Transport Pro sandbox credentials (or the mock client if no sandbox
    exists), then manual promotion to prod.
@@ -270,12 +311,18 @@ GitHub Actions on the repo (branches already in use):
 
 ### 3.7 Runtime shape & limits
 
-* One email averages 8–15 Bedrock turns (procedure + submit); with Claude Sonnet latency
-  that is ~30–90 s per email; `PAYBOT_GMAIL_FETCH_LIMIT=10` keeps the worst-case run under
-  ~12 min — inside Lambda's 15-min cap but close. Mitigations, in order: drop fetch limit
-  to 5 per run (the hourly cadence absorbs it), raise cadence to every 30 min, or move the
-  worker to a scheduled Fargate task (same container, no time cap). Decide after a week of
-  Stage 1 timings.
+* **The turn budget scales with load count, so "one email" is not one cost.** `_iteration_budget`
+  gives `agent_max_iterations + (loads − 1) × 9`, clamped by `ITERATION_CEILING = 50`. On today's
+  defaults (`agent_max_iterations = 12`) that is 12 turns for a single load, 21 for two, 30 for
+  three, 48 for five and 50 from eight upward. A single-load email is the ~30–90 s case; a
+  five-load factoring enquiry — an ordinary shape, not a pathological one — can be four times
+  that on its own. `PAYBOT_GMAIL_FETCH_LIMIT=10` therefore does **not** bound a run to ~12 min
+  the way the original estimate assumed: ten multi-load emails could exceed Lambda's 15-min cap
+  outright. Mitigations, in order: drop the fetch limit to 5 (the 20-minute cadence absorbs it
+  easily — three times the runs), then measure real per-email wall time in Stage 1 before
+  choosing between a lower ceiling and moving the worker to a scheduled Fargate task (same
+  container, no time cap). **Measure this in Stage 1 parallel running specifically**; it is the
+  most likely reason Stage 1 needs Fargate rather than Lambda.
 * Concurrency **1** on the worker (reserved concurrency) — not for safety (thread-skip
   makes concurrent runs converge) but to keep Gmail API usage and logs sane.
 * Cold start: SA-JWT mint + roster fetch ≈ 1–2 s; irrelevant at this cadence. CargoTel adds
@@ -336,7 +383,10 @@ it without pipeline changes).
 | **CargoTel login bot stops or its cookie goes stale** | The client raises rather than parsing the login page as an empty load, so emails escalate instead of being answered wrongly. `CargoTelCookieStale` pages immediately. **Not mitigable from inside this system** — P8 exists to name an owner |
 | **CargoTel changes its HTML** | The parser is a pure function with fixture-backed tests, so a break is loud and reproducible offline rather than a mystery in production. `CargoTelParseFailures` catches it. Residual risk: a *silent* change — a field that moves rather than disappears. The load-bearing selectors key off form-field names, which are far more stable than layout |
 | Scraping treated as a stable integration | It is not. Budget for parser maintenance, and prefer an API if CargoTel ever exposes one |
-| A 6-digit number that is not a load | Routine and already handled: CargoTel answers "Invalid Order ID" and the load is dropped with a clear reason. Worth watching the rate, though — every one costs a fetch, and the Transport Pro side suppresses these earlier via `_NOT_A_LOAD_LABEL_RE` |
+| A 6-digit number that is not a load | Routine and handled in two shapes: CargoTel either answers "Invalid Order ID" or returns the real load form with no order in it, and both now raise with a reason naming the likely cause — a sender's own invoice or reference number. Worth watching the rate, since each one costs a fetch. `_drop_stray_sender_invoice_ids` removes the narrow case that used to cost a whole escalation, where a sender's invoice number dragged an otherwise single-system email into a cross-system refusal |
+| **A 6-digit id that exists in BOTH systems** | Real and measured: Transport Pro numbered loads with six digits years ago and still serves them, so 316040 is Ma Trucks in Transport Pro *and* Continental Autoshipping in CargoTel. Every 6-digit Transport Pro load found had settled in 2018–19 while the CargoTel loads sharing those numbers were delivered 2026-08-10 and unpaid, so preferring CargoTel is correct for any live question and routing is unchanged. **The trap is the obvious-looking fix**: adding a Transport Pro fallback when CargoTel has no such load would resolve arbitrary numbers onto strangers' archived loads — 999998, 111111, 222222 and 555555 are all real, distinct Transport Pro loads — and answering one would disclose an unrelated carrier's payment history. Ruled out with the evidence in `payment_bot.domain.routing`, and locked by a test asserting `route_load` consults no client |
+| A wrong weekday on a correct date | Closed by gate check 12. Grounding compares dates and never the words beside them, so a fabricated weekday on a grounded date passed all eleven earlier checks and reached Drafts. The pay-date tool now emits one preformatted string for the reply to copy, so there are no longer two fields to mis-pair |
+| A load id that exists only in an email's HTML | Closed. `InboundEmail.html_text` strips tags — never parses them — so attribute values (URLs, tracking ids, widths, colours) are discarded and only text a human would have read is scanned. Feeds the sensitive-change scan too, since the mirror case is the dangerous one: a bank instruction present only in the HTML would otherwise pass unseen |
 
 ---
 
@@ -355,5 +405,18 @@ it without pipeline changes).
       loads should be answered — most carriers on this path factor to them, so without it
       their enquiries escalate. The roster entry exists; confirm the domain is the one they
       actually mail from
-* [ ] Consider extending `_NOT_A_LOAD_LABEL_RE` to suppress invoice/account numbers before
-      they reach a CargoTel fetch, as it already does for Transport Pro
+* [x] ~~Consider extending `_NOT_A_LOAD_LABEL_RE` to suppress invoice/account numbers before
+      they reach a CargoTel fetch~~ — done differently, and deliberately narrower.
+      `invoice` cannot become a suppression label because carriers write "Invoice 2462934"
+      meaning a real Transport Pro load, and refusing those would be a false negative, worse
+      than an escalation. `_drop_stray_sender_invoice_ids` instead drops a sender-invoice id
+      only when it disagrees about *which system* the email is about. Account and routing
+      labels are suppressed by the label rule as before
+* [ ] **Confirm the CargoTel rate reply end to end against the live model.** The prompt now
+      requires the amount and the intake carries the ask through, verified under a scripted
+      model — but not yet against Bedrock or OpenRouter on a real rate enquiry, because the
+      only one available is a thread the bot's own draft already owns
+* [ ] Verify the two hand-added roster domains that rest on a sender's own signature rather
+      than on a settlement record — `afgfactor.com` and `aladdincap.com`. Both companies are
+      corroborated by the payee table; the domains are not. `_evidence` in
+      `factoring_domains_manual.json` records which is which

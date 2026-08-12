@@ -451,3 +451,113 @@ def test_html_markup_alone_does_not_trip_the_scan(ctx: ToolContext) -> None:
 
     assert out.hard_bank is False
     assert out.flags == [SensitiveFlag.NONE]
+
+
+# ---------------------------------------------------------------------------
+# A stop-payment request is paperwork, not wording — it always escalates.
+#
+# The wording switches rest on one argument: the bot cannot move money, so
+# answering past a remittance instruction is safe because the instruction still
+# waits for a human. A stop payment is where that argument fails — it operates on
+# money already sent, and the reply closing the thread is what loses it.
+# ---------------------------------------------------------------------------
+def _detect(ctx: ToolContext, body: str) -> DetectSensitiveChangeOutput:
+    return DetectSensitiveChange().run(
+        DetectSensitiveChangeInput(subject="", body=body), ctx
+    )
+
+
+@pytest.mark.unit
+def test_the_rts_stop_payment_notice_escalates(ctx: ToolContext) -> None:
+    """Live regression. The detector scored no flags at all on this email.
+
+    A check had been issued to the carrier on a factored load and RTS wanted it stopped. With
+    both wording switches on, the payment-status question would have been answered and the
+    stop-payment request left unmentioned and unactioned.
+    """
+
+    out = _detect(
+        ctx,
+        "**PLACE STOP PAYMENT ON CHK 787147 - PAID TO CARRIER ON 7.27, SEE NOA**\n"
+        "Please provide payment status on the invoices below.",
+    )
+
+    assert out.paperwork is True
+    assert out.hard is True
+    assert SensitiveFlag.BANK_CHANGE in out.flags
+    assert any("payment halt requested" in e for e in out.evidence)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Please stop payment on check 787147.",
+        "Put a stop-payment on that ACH please.",
+        "Please stop the check.",
+        "PLACE STOP PAYMENT ON CHK 787147",
+        "Requesting a payment stop on this one.",
+    ],
+)
+def test_a_halt_request_escalates_however_it_is_phrased(ctx: ToolContext, body: str) -> None:
+    assert _detect(ctx, body).paperwork is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Do not stop payment on this one, it is fine.",
+        "We will not stop payment.",
+        "There is no need to stop payment.",
+    ],
+)
+def test_a_prohibition_is_not_a_halt_request(ctx: ToolContext, body: str) -> None:
+    """"stop" is not a change word, so the shared negation guard cannot see these.
+
+    The halt check carries its own, built from the same negation prefix. Adding "stop" to the
+    change words instead would have loosened the bank proximity scan, where "stop" beside a
+    payment noun is not a change request at all.
+    """
+
+    assert _detect(ctx, body).paperwork is False
+
+
+@pytest.mark.unit
+def test_an_incidental_stop_is_not_a_halt_request(ctx: ToolContext) -> None:
+    body = "The truck had to stop for fuel before payment was due."
+
+    assert _detect(ctx, body).paperwork is False
+
+
+@pytest.mark.unit
+def test_a_standing_remit_footer_still_does_not_escalate(ctx: ToolContext) -> None:
+    """The §7 narrowing must survive: a company plus an address is not a halt or a redirect."""
+
+    out = _detect(ctx, "Please ensure remittance is updated to OTR Solutions.")
+
+    assert out.paperwork is False
+    assert out.hard is False
+
+
+@pytest.mark.unit
+def test_a_halt_request_escalates_even_with_both_wording_switches_on(
+    ctx: ToolContext,
+) -> None:
+    """The point of routing it to `paperwork` rather than to `hard_bank`.
+
+    `hard_bank` is admitted when PAYBOT_SENSITIVE_BANK_REPLIES is true, which is how this
+    deployment runs — so a halt classified as wording would still have drafted.
+    """
+
+    from payment_bot.config import Settings
+
+    permissive = Settings(sensitive_bank_replies=True, sensitive_noa_replies=True)
+    out = _detect(ctx, "Please stop payment on check 787147.")
+
+    blocked = (
+        out.paperwork
+        or (out.hard_bank and not permissive.sensitive_bank_replies)
+        or (out.hard_noa and not permissive.sensitive_noa_replies)
+    )
+    assert blocked is True

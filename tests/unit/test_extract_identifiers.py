@@ -405,3 +405,77 @@ def test_a_repeated_id_on_one_line_still_binds_its_amount(ctx: ToolContext) -> N
 
     assert out.load_ids == ["2502262"]
     assert [(r.load_id, str(r.amount)) for r in out.stated_rates] == [("2502262", "1300.00")]
+
+
+# ---------------------------------------------------------------------------
+# Payment mail abbreviates its labels. A list that only knows the long form
+# knows half of it.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "text",
+    [
+        "PLACE STOP PAYMENT ON CHK 787147",
+        "chk 787147",
+        "CHK# 787147",
+        "CHK No. 787147",
+        "Check# 787147",
+        "Checks 787147",
+        "CK 787147",
+        "cheque 787147",
+    ],
+)
+def test_a_check_number_is_not_a_load_however_it_is_abbreviated(
+    ctx: ToolContext, text: str
+) -> None:
+    """Live regression: an RTS stop-payment notice escalated over a check number.
+
+    "PLACE STOP PAYMENT ON CHK 787147" — six digits, so it routed to CargoTel, and the email
+    was refused as spanning two systems. Spelled-out "check 787147" had been suppressed since
+    the settlement-number case; only the abbreviation was missing.
+    """
+
+    assert _run(ctx, body=text).load_ids == []
+
+
+@pytest.mark.unit
+def test_the_rts_stop_payment_email_leaves_only_its_real_load(ctx: ToolContext) -> None:
+    """The whole email: a check number, a PO box, a phone number and one load."""
+
+    out = _run(
+        ctx,
+        subject="2471739 -",
+        body=(
+            "**PLACE STOP PAYMENT ON CHK 787147 - PAID TO CARRIER ON 7.27, SEE NOA**\n"
+            "Confirm all payments will be made to RTS Financial Service "
+            "P.O. Box 840267 Dallas, TX 75284-0267.\n"
+            "Global Freight LLC 540 2471739 6.29.26 $7600\n"
+            "O: (913) 329-9697\n"
+        ),
+    )
+
+    assert out.load_ids == ["2471739"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Load # 2471739", ["2471739"]),
+        ("Load No. 2523916", ["2523916"]),
+        ("load 787147", ["787147"]),  # the same number, labelled as a load
+        ("INV 2462934", ["2462934"]),  # "inv" is NOT suppressed, same reason as "ref"
+        ("Reference#: 2520504", ["2520504"]),
+    ],
+)
+def test_the_check_labels_do_not_swallow_real_loads(
+    ctx: ToolContext, text: str, expected: list[str]
+) -> None:
+    """The widening stays confined to labels that are never a load reference.
+
+    "INV" and "Reference#" are excluded on purpose: carriers write both meaning the load
+    itself, so suppressing them would discard real ids — a false negative, worse than an
+    escalation. Nobody labels a load "CHK".
+    """
+
+    assert _run(ctx, body=text).load_ids == expected

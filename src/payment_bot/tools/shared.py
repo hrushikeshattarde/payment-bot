@@ -104,11 +104,23 @@ LoadIdStr = Annotated[str, BeforeValidator(_coerce_id_to_str)]
 #: "Account No. 2657147" as readily as "Account #2657147". That filler is NOT a label in its
 #: own right and must never become one: "Load No. 2523916" is a load, and suppressing a bare
 #: "no." would discard the very ids this tool exists to find.
+#:
+#: ``chk``/``ck``/``cheque`` are the abbreviations of a label already here, and their absence
+#: cost an escalation: an RTS stop-payment notice opened "PLACE STOP PAYMENT ON CHK 787147",
+#: and because six digits route to CargoTel the email was refused as spanning two systems —
+#: over a check number. Spelled-out "check 787147" had been suppressed since the settlement
+#: case above. Payment mail abbreviates by default, so a label list that only knows the long
+#: form knows half of it. The same lesson as the factoring acronyms in ``company_acronym``.
+#:
+#: Still deliberately excludes ``inv``, for the reason ``ref`` is excluded: carriers write
+#: "INV 2462934" meaning the load itself, so suppressing it would discard real ids. A check
+#: number is different in kind — nobody labels a load "CHK".
 _NOT_A_LOAD_LABEL_RE = re.compile(
     r"(?:"
     r"(?:p\.?\s*o\.?\s*box|\bpob\b|\bbox|\bmc\b|\bmc[#-]|\bdot\b|\bsuite\b|\bste\b|\bphone\b"
     r"|\btel\b|\bfax\b|\bext\b|\bzip\b)"
-    r"|(?:\bacct\b|\baccount\b|\baba\b|\brouting\b|\bsettlement\b|\bcheck\b)"
+    r"|(?:\bacct\b|\baccount\b|\baba\b|\brouting\b|\bsettlement\b"
+    r"|\bcheck\b|\bchecks\b|\bchk\b|\bck\b|\bcheque\b)"
     r"(?:\W{0,3}(?:no|nbr|num|number)\b)?"
     r")\W{0,4}$",
     re.IGNORECASE,
@@ -632,10 +644,11 @@ class DetectSensitiveChangeOutput(BaseModel):
     #: instructions), ``sensitive_noa_replies`` past ``hard_noa`` (NOA action wording).
     hard_bank: bool = False
     hard_noa: bool = False
-    #: True when the email carries an ARTIFACT or identity action rather than language:
-    #: a void-check / direct-deposit attachment, or a contact change. These always
-    #: escalate — there is paperwork to file or an identity to re-verify, and a status
-    #: reply cannot do either — regardless of any wording policy.
+    #: True when the email carries an ARTIFACT, an identity action, or an operation on money
+    #: already sent, rather than language about future money: a void-check / direct-deposit
+    #: attachment, a contact change, or a stop-payment request. These always escalate — there
+    #: is paperwork to file, an identity to re-verify, or a payment to halt, and a status reply
+    #: cannot do any of them — regardless of any wording policy.
     paperwork: bool = False
     #: True when an NOA / notice-of-assignment file is attached. Split from ``paperwork``
     #: because pre-funding factors routinely attach their NOA to a routine rate
@@ -722,6 +735,28 @@ _SUPPLIED_ACCOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: A request to halt a payment already issued. Treated as ``paperwork`` — always escalating,
+#: whatever the wording policies say — rather than as bank-change language.
+#:
+#: The wording switches rest on one argument: the bot cannot move money, so answering the
+#: status question past a remittance instruction is safe because the instruction still waits
+#: for a human. A stop payment is the case where that argument does not hold. It is not a
+#: change to where future money goes; it is an operation on money already gone, and the reply
+#: closing the thread is what loses it. ``void check`` is already a hard bank phrase for the
+#: same reason — this is the same operation named the way a payer names it.
+#:
+#: Live on an RTS notice opening "PLACE STOP PAYMENT ON CHK 787147 - PAID TO CARRIER ON 7.27":
+#: a check had been issued to the carrier on a factored load and RTS wanted it stopped. The
+#: detector scored no flags at all, so with both wording switches on the email would have been
+#: answered on payment status with the stop-payment request unmentioned and unactioned.
+#: Grouped, so it can be embedded after a negation prefix without the alternation escaping the
+#: prefix's scope — ``prefix A|B`` would mean ``(prefix A)|(B)``.
+_STOP_PAYMENT_BODY = (
+    r"(?:\bstop(?:\s|-)*(?:payment|pay|the\s+(?:check|cheque|payment)|ach|wire|deposit)\b"
+    r"|\bpayment\s+stop\b)"
+)
+_STOP_PAYMENT_RE = re.compile(_STOP_PAYMENT_BODY, re.IGNORECASE)
+
 _CONTACT_PHRASES = (
     "change email", "update email", "new email address", "change our email",
     "update contact", "new contact email", "change of email",
@@ -770,10 +805,25 @@ _CONFIRM_CHANGE_RE = re.compile(
 #: nearby) looks like an equally good signal and is not: "due to recent fraud we need to
 #: update our ACH details" is both a genuine instruction and the classic fraud pretext, so
 #: suppressing on those words would blind the check to the very emails it exists for.
+#: Shared by every negation guard, so a prohibition recognised for one signal is recognised
+#: for all of them. Kept as a string rather than a compiled pattern because it is a prefix,
+#: not a pattern in its own right.
+_NEGATION_PREFIX = (
+    r"\b(?:do(?:es)?\s+not|do\s*n[o']t|never|can\s*not|can'?t|won'?t|will\s+not"
+    r"|must\s+not|should\s+not|shall\s+not|no\s+need\s+to)\s+(?:\w+\s+){0,1}?"
+)
+
 _NEGATED_CHANGE_RE = re.compile(
-    rf"\b(?:do(?:es)?\s+not|do\s*n[o']t|never|can\s*not|can'?t|won'?t|will\s+not"
-    rf"|must\s+not|should\s+not|shall\s+not|no\s+need\s+to)\s+(?:\w+\s+){{0,1}}?"
-    rf"\b(?:{_CHANGES_ALT})\b",
+    rf"{_NEGATION_PREFIX}\b(?:{_CHANGES_ALT})\b",
+    re.IGNORECASE,
+)
+
+#: "Do not stop payment" is a prohibition, and ``_NEGATED_CHANGE_RE`` cannot see it: "stop" is
+#: not a change word, and adding it there would also loosen the bank proximity scan, where
+#: "stop" near a payment noun is not a change request at all. So the halt check carries its own
+#: guard, built from the same prefix so the two cannot drift apart.
+_NEGATED_STOP_PAYMENT_RE = re.compile(
+    _NEGATION_PREFIX + _STOP_PAYMENT_BODY,
     re.IGNORECASE,
 )
 
@@ -951,6 +1001,18 @@ class DetectSensitiveChange(Tool):
                 _add(flags, SensitiveFlag.EMAIL_CONTACT_CHANGE)
                 evidence.append(f"contact: matched {phrase!r}")
                 paperwork = True
+
+        # Its own negation spans, not the bank scan's — see _NEGATED_STOP_PAYMENT_RE.
+        halt_negated = [m.span() for m in _NEGATED_STOP_PAYMENT_RE.finditer(written)]
+        for match in _STOP_PAYMENT_RE.finditer(written):
+            if _within_negation(match.span(), halt_negated):
+                continue
+            _add(flags, SensitiveFlag.BANK_CHANGE)
+            evidence.append(
+                f"bank: payment halt requested — {' '.join(match.group(0).split())!r}"
+            )
+            paperwork = True
+            break
 
         noa_attachment = False
         for att in params.attachments_metadata:

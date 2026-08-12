@@ -422,7 +422,7 @@ def parse_load_html(html: str, load_id: str) -> CargoTelLoad:
     carrier_panel = soup.find("td", id="max_carrier")
     carrier_id_match = _CARRIER_ID_RE.search(_text(carrier_panel)) if carrier_panel else None
 
-    return CargoTelLoad(
+    load = CargoTelLoad(
         load_id=str(load_id).strip(),
         business_unit=biz_match.group(1).strip() if biz_match else None,
         carrier_client_id=carrier_id_match.group(1) if carrier_id_match else None,
@@ -436,3 +436,16 @@ def parse_load_html(html: str, load_id: str) -> CargoTelLoad:
         pay_hold=_checkbox_checked(soup, "loadmaint_form__ldmnt_audit_carrier_pay_hold"),
         documents=_print_docs(soup),
     )
+
+    # The third "that is not a load", and the quietest: the form rendered with no order in
+    # it. Judged on the parsed load rather than the markup, because "no order here" is a
+    # question about content — see CargoTelLoad.carries_no_order for the measurement behind
+    # it. Left unchecked, the caller reads an all-empty load as a real record with missing
+    # data and sends someone to add a contact address to a load that does not exist.
+    if load.carries_no_order:
+        raise ClientError(
+            f"CargoTel: no load {load_id!r} exists — the page came back with no order on it "
+            "(no business unit, status, carrier or terms). The number in the email is "
+            "probably not a load id."
+        )
+    return load

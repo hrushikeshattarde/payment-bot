@@ -189,6 +189,41 @@ class CargoTelLoad(BaseModel):
 
     documents: tuple[CargoTelDocument, ...] = ()
 
+    @property
+    def carries_no_order(self) -> bool:
+        """True when the page rendered the load form with nothing loaded into it.
+
+        CargoTel's third way of saying "that is not a load", after "Invalid Order ID" and the
+        login page — and the quietest. An id it does not have can return HTTP 200 with a
+        179KB load form carrying no order: not the login page, no "Invalid Order ID" anywhere,
+        so both existing guards pass and it parses into a load whose every field is empty.
+
+        Live on a Neon Freight collections email. Its "Ref No" column held ``246558`` — the
+        sender's own reference — which is six digits, so it routed here, and the blank form
+        that came back was reported as *"the carrier record for this load lists no contact
+        address, so the sender cannot be verified; add one in CargoTel"*. There was no record
+        to add a contact to. Same misdiagnosis the :func:`~payment_bot.clients.cargotel_html.
+        is_invalid_order` split exists to prevent: a routine not-a-load reported as a data gap
+        someone then goes looking for.
+
+        Every field here, rather than a single tell, because one alone is not decisive.
+        Measured against real loads: all of them carry a business unit, a carrier client id, a
+        status, a status date, a carrier name and terms. Both non-loads carry none of the six.
+        ``payable`` is deliberately excluded — ``318354`` came back with $420.00 and nothing
+        else, so a figure on its own does not make a page an order.
+        """
+
+        return not any(
+            (
+                self.business_unit,
+                self.carrier_client_id,
+                self.status,
+                self.status_date,
+                self.carrier_name,
+                self.ap_terms,
+            )
+        )
+
     # -- document questions ---------------------------------------------------
     @property
     def carrier_invoice_count(self) -> int:

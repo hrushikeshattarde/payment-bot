@@ -17,7 +17,12 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
-from tests.cargotel_pages import INVALID_ORDER_PAGE, LOGIN_PAGE, build_page
+from tests.cargotel_pages import (
+    BLANK_LOAD_PAGE,
+    INVALID_ORDER_PAGE,
+    LOGIN_PAGE,
+    build_page,
+)
 
 from payment_bot.clients.cargotel_html import (
     is_invalid_order,
@@ -582,3 +587,87 @@ def test_the_failure_message_does_not_leak_the_cookie_location(
     assert "circle-bot-cookies" not in message
     assert "rubicon/cargotel.json" not in message
     assert "s3://" not in message
+
+
+# ---------------------------------------------------------------------------
+# The third "that is not a load": the form with no order in it.
+# ---------------------------------------------------------------------------
+def test_a_load_form_with_no_order_raises_instead_of_parsing_empty() -> None:
+    """Live on a Neon Freight email whose "Ref No" column held 246558.
+
+    Six digits routed that here, CargoTel returned 179KB of load form with no order, and the
+    escalation read "the carrier record for this load lists no contact address ... add one in
+    CargoTel". There was no record to add a contact to.
+    """
+
+    with pytest.raises(ClientError, match="no order on it"):
+        parse_load_html(BLANK_LOAD_PAGE, "246558")
+
+
+def test_the_blank_form_slips_both_older_guards() -> None:
+    """Why a third check was needed at all, rather than widening one of the first two."""
+
+    assert is_invalid_order(BLANK_LOAD_PAGE) is False
+    assert is_login_page(BLANK_LOAD_PAGE) is False
+
+
+def test_a_real_load_is_not_mistaken_for_a_blank_form() -> None:
+    load = _load()
+
+    assert load.carries_no_order is False
+    assert load.carrier_name == "EXAMPLE TRUCKING LLC"
+
+
+def test_a_payable_alone_does_not_make_a_page_an_order() -> None:
+    """The 318354 shape: $420.00 and every other field empty.
+
+    A figure on its own is not an order, which is why ``payable`` is excluded from the test.
+    """
+
+    page = build_page(
+        carrier="",
+        business_unit="",
+        status="",
+        status_date="",
+        ap_terms=None,
+        ap_invoice=None,
+        invoice_received=None,
+        payable="420.00",
+    )
+
+    with pytest.raises(ClientError, match="no order on it"):
+        parse_load_html(page, "318354")
+
+
+@pytest.mark.parametrize(
+    "present",
+    [
+        # status and status_date are one regex with two groups, so they are set as a pair.
+        {"status": "In-Route", "status_date": "07/02/2026"},
+        {"business_unit": "CIRCLE LOGISTICS"},
+        {"carrier": "EXAMPLE TRUCKING LLC"},
+        {"ap_terms": "Check Net 30"},
+    ],
+)
+def test_any_one_headline_field_is_enough_to_be_a_real_load(present: dict[str, str]) -> None:
+    """A sparse but genuine load must still parse — a new load has few fields set.
+
+    The guard fires only when the page carries *nothing*, so the cost of being wrong is
+    bounded: it can withhold an answer about a load with literally no content, which was not
+    answerable anyway.
+    """
+
+    fields: dict[str, object] = {
+        "carrier": "",
+        "business_unit": "",
+        "status": "",
+        "status_date": "",
+        "ap_terms": None,
+        "ap_invoice": None,
+        "invoice_received": None,
+        "payable": "",
+    }
+    fields.update(present)
+
+    load = parse_load_html(build_page(**fields), "296006")  # type: ignore[arg-type]
+    assert load.carries_no_order is False

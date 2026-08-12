@@ -142,6 +142,29 @@ INVALID_ORDER_PAGE = """<html><head><title>CargoTel /backoffice/loadmaint.mcgi</
 <body>Invalid Order ID Copyright Information Feedback &amp; Support</body></html>"""
 
 
+#: CargoTel's THIRD answer for an id it does not have: HTTP 200 with the real load form and
+#: no order in it. No "Invalid Order ID" anywhere, not the login page, so both of the guards
+#: above pass and it parses into a load whose every field is empty. Verified against the live
+#: system for 246558 and 318354 — 179KB and no order on either.
+#:
+#: Built from build_page so it stays a genuine load form: the same markup a real load uses,
+#: with every headline value emptied. A hand-written stub would not prove the guard works,
+#: because the guard's whole job is telling a real form apart from a real load.
+BLANK_LOAD_PAGE = build_page(
+    carrier="",
+    business_unit="",
+    status="",
+    status_date="",
+    ap_terms=None,
+    ap_invoice=None,
+    invoice_received=None,
+    payable="",
+    bol05=False,
+    carrier_invoices=None,
+    carrier_agreement=False,
+)
+
+
 LOGIN_PAGE = """<html><body><form name="login">
 <input name="username"><input type="password" name="password">
 </form></body></html>"""

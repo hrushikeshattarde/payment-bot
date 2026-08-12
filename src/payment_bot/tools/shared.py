@@ -339,6 +339,55 @@ def _roster_entry_for_domain(sender_domain: str, ctx: ToolContext) -> str | None
     return None
 
 
+#: Legal-entity suffixes, dropped when building an acronym. Only these — an industry word
+#: like "group" or "capital" IS part of how a company abbreviates itself ("American Factoring
+#: Group" is AFG, not AF), which is why this cannot reuse ``_STOPWORDS``.
+_LEGAL_SUFFIXES = frozenset(
+    {
+        "inc", "incorporated", "llc", "l", "c", "ltd", "limited", "corp", "corporation",
+        "co", "company", "lp", "llp", "plc", "pllc", "gmbh", "nv", "bv", "sa",
+    }
+)  # fmt: skip
+
+
+def _domain_without_tld(sender_email: str) -> str:
+    """The sender's domain labels except the last, concatenated. ``""`` when there are none.
+
+    Exists so a three-letter acronym cannot be satisfied by the TLD: a factor named
+    "National Equipment Transport" abbreviates to "net", which would otherwise resemble every
+    ``.net`` address on earth. Subdomains are kept — ``bwc.fleetsmarts.net`` gives
+    ``bwcfleetsmarts`` — because a per-tenant subdomain is exactly where an acronym shows up.
+    """
+
+    labels = [label for label in _sender_domain(sender_email).split(".") if label]
+    if not labels:
+        return ""
+    return "".join(labels[:-1] if len(labels) > 1 else labels)
+
+
+def company_acronym(name: str | None) -> str:
+    """Initials of a company name, or ``""`` when too short to be distinctive.
+
+    Factors abbreviate themselves in their domains, and the initials are then the *only*
+    resemblance to the name on the load. "American Factoring Group, LLC" sends from
+    ``afgfactor.com``: no token of the name appears in that domain, so the resemblance hint
+    stayed silent and the escalation read "sender does not match any authorized party" — as
+    if a stranger had written in, rather than a known factor whose domain simply was not
+    configured yet. Whoever reviewed it was sent looking for the wrong thing.
+
+    Three characters minimum, because two are meaningless: "Operation Finance" gives "of",
+    which appears in a large share of all domains. Names that abbreviate to fewer than three
+    are left to the token test, which already covers them — "Aladdin Financial" is "af", but
+    ``aladdin`` matches ``aladdincap.com`` directly.
+    """
+
+    if not name:
+        return ""
+    words = [w for w in re.split(r"[^a-z0-9]+", name.lower()) if w and w not in _LEGAL_SUFFIXES]
+    acronym = "".join(w[0] for w in words)
+    return acronym if len(acronym) >= 3 else ""
+
+
 def company_tokens(name: str | None) -> set[str]:
     """Distinctive lowercase tokens of a company name (len ≥ 4, minus generic words)."""
 
@@ -1074,8 +1123,16 @@ class CheckAuthorization(Tool):
         # FACTORING, which meant any domain containing "finance" would have been disclosed to
         # the moment `allow_factoring` was enabled. Say so in the reason so a human reviewing
         # the escalation can add the domain to PAYBOT_FACTORING_DOMAINS if it is genuine.
+        # Two ways a domain can resemble the name: a whole distinctive word of it, or its
+        # initials. The acronym is searched in the domain WITHOUT its TLD, so a three-letter
+        # acronym cannot be satisfied by "com" or "net". Both routes only ever change the
+        # WORDING of a denial — this branch returns DENY either way — so a hint that fires
+        # too eagerly costs a reviewer one wasted glance, never a disclosure.
         factor_toks = company_tokens(auth.factoring_company)
-        if factor_toks and any(tok in domain for tok in factor_toks):
+        acronym = company_acronym(auth.factoring_company)
+        if (factor_toks and any(tok in domain for tok in factor_toks)) or (
+            acronym and acronym in _domain_without_tld(sender)
+        ):
             return CheckAuthorizationOutput(
                 decision=AuthDecision.DENY,
                 matched_party=None,

@@ -74,3 +74,69 @@ def test_normalization_is_punctuation_and_case_only() -> None:
     assert _normalize_company_name("RTS - Financial") == "rts financial"
     # Words themselves are untouched — no stemming, no token dropping.
     assert _normalize_company_name("Factoring Solutions") == "factoring solutions"
+
+
+# ---------------------------------------------------------------------------
+# The escalation WORDING when a known factor's domain is not configured.
+#
+# Diagnostic only: the branch this feeds returns DENY either way, so a hint that
+# fires too eagerly costs a reviewer a wasted glance and can never disclose a
+# load. That is what makes searching an acronym safe here and nowhere else.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("AMERICAN FACTORING GROUP, LLC", "afg"),  # the live miss
+        ("Triumph Business Capital", "tbc"),
+        ("Nu-Ko Capital", "nkc"),
+        ("RTS Financial Service, Inc", "rfs"),
+        # Two letters are meaningless — "of" appears in a large share of all domains.
+        ("Operation Finance, Inc", ""),
+        ("Aladdin Financial, Inc.", ""),
+        ("Tru Funding LLC", ""),
+        ("OTR Capital, LLC", ""),
+        ("Apex", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_the_acronym_is_built_from_significant_words_only(name: str | None, expected: str) -> None:
+    from payment_bot.tools.shared import company_acronym
+
+    assert company_acronym(name) == expected
+
+
+@pytest.mark.unit
+def test_an_industry_word_stays_in_the_acronym() -> None:
+    """"Group" is dropped by _STOPWORDS but belongs in AFG — hence a separate suffix list.
+
+    Reusing _STOPWORDS would yield "af", below the three-character floor, and the live case
+    would still be missed.
+    """
+
+    from payment_bot.tools.shared import company_acronym, company_tokens
+
+    assert "group" not in company_tokens("AMERICAN FACTORING GROUP, LLC")
+    assert company_acronym("AMERICAN FACTORING GROUP, LLC") == "afg"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("sender", "expected"),
+    [
+        ("billing@afgfactor.com", "afgfactor"),
+        ("a@bwc.fleetsmarts.net", "bwcfleetsmarts"),  # per-tenant subdomain kept
+        ("a@localhost", "localhost"),                 # no TLD to strip
+        ("not-an-address", ""),
+    ],
+)
+def test_the_tld_is_excluded_from_the_acronym_search(sender: str, expected: str) -> None:
+    """A factor abbreviating to "net" must not resemble every .net address."""
+
+    from payment_bot.tools.shared import _domain_without_tld, company_acronym
+
+    assert _domain_without_tld(sender) == expected
+    # "National Equipment Transport" really does abbreviate to a TLD, which is the point.
+    assert company_acronym("National Equipment Transport") == "net"
+    assert "net" not in _domain_without_tld("a@bwc.fleetsmarts.net")

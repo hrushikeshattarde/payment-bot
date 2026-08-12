@@ -643,10 +643,19 @@ class PaymentBotPipeline:
             # and no line-item breakdown, so there is nothing for a rate skill to itemise.
             # A rate question therefore gets the status answer plus the amount, which is
             # every figure that exists, rather than a skill that could only restate it.
+            #
+            # That is only true if the amount actually reaches the reply. It did not: the
+            # prompt named dates and documents per billing state and never asked for the
+            # figure, so a Tru Funding rate enquiry over five loads was answered entirely
+            # with missing-paperwork wording while $2,150 and $3,000 sat in the tool results.
+            # `rate_question` carries the ask through so the reply leads with the amount.
             if wants_rate:
                 _log.info(
                     "cargotel_rate_narrowed_to_status",
-                    extra={"load_count": len(load_ids)},
+                    extra={
+                        "load_count": len(load_ids),
+                        "stated_rates": len(identifiers.stated_rates),
+                    },
                 )
             return CARGOTEL_PAYMENT_STATUS_SKILL, build_cargotel_payment_status_intake(
                 email,
@@ -655,6 +664,8 @@ class PaymentBotPipeline:
                 signature=self._settings.reply_signature,
                 documents_email=self._settings.documents_email,
                 unlocated_loads=unlocated_loads,
+                rate_question=wants_rate,
+                stated_rates=identifiers.stated_rates,
             )
 
         if wants_rate:

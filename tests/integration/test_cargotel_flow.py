@@ -241,3 +241,93 @@ def test_a_load_awaiting_paperwork_is_not_given_a_date() -> None:
     assert out.expected_payment_date is None
     assert out.missing_documents == ["BOL 05", "carrier invoice"]
     assert date(2026, 8, 6) not in ctx.ledger.grounded_dates
+
+
+# ---------------------------------------------------------------------------
+# A rate question on a 6-digit load. This skill answers both asks — a CargoTel
+# load has one payable and no line items to itemise — but the narrowing is only
+# honest if the amount reaches the reply.
+# ---------------------------------------------------------------------------
+def _rate_intake(**kwargs: object) -> str:
+    from payment_bot.agent.skills import build_cargotel_payment_status_intake
+    from payment_bot.models import InboundEmail
+
+    email = InboundEmail(
+        message_id="<m>",
+        thread_id="t",
+        from_email="m.anastasovska@Trufunding.net",
+        subject="Rate Verification, Please",
+        body="Please verify the rates on the loads below.",
+    )
+    return build_cargotel_payment_status_intake(
+        email,
+        ["316039", "318410"],
+        {"316039": "quickbooks", "318410": "quickbooks"},
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.integration
+def test_a_rate_question_tells_the_agent_to_lead_with_the_amount() -> None:
+    """Live regression: a Tru Funding rate enquiry over five loads got no figure at all.
+
+    Every load was correctly reported as awaiting a carrier invoice while $2,150 and $3,000
+    sat in the tool results. The prompt asked for dates and documents per billing state and
+    never for the amount, so the reply obeyed it and dropped the question.
+    """
+
+    intake = _rate_intake(rate_question=True, stated_rates=[])
+
+    assert "asked about the RATE" in intake
+    assert "Lead with each load's amount" in intake
+    assert "quoted no amount" in intake
+
+
+@pytest.mark.integration
+def test_a_quoted_amount_is_carried_in_for_comparison() -> None:
+    from decimal import Decimal
+
+    from payment_bot.tools.shared import StatedRate
+
+    intake = _rate_intake(
+        rate_question=True,
+        stated_rates=[
+            StatedRate(load_id="316039", amount=Decimal("2150")),
+            StatedRate(load_id=None, amount=Decimal("3000")),
+        ],
+    )
+
+    assert "316039: $2,150" in intake
+    assert "unattributed: $3,000" in intake
+    assert "Never adjust theirs to match" in intake
+
+
+@pytest.mark.integration
+def test_a_timing_question_carries_no_rate_wording() -> None:
+    """Otherwise a plain "where is my money" invites an argument about undisputed figures."""
+
+    from decimal import Decimal
+
+    from payment_bot.tools.shared import StatedRate
+
+    intake = _rate_intake(
+        rate_question=False,
+        stated_rates=[StatedRate(load_id="316039", amount=Decimal("2150"))],
+    )
+
+    assert "RATE" not in intake
+    assert "2,150" not in intake
+
+
+@pytest.mark.integration
+def test_the_prompt_requires_the_amount_and_forbids_a_breakdown() -> None:
+    """Both halves matter: state the one payable, and never invent line items beside it."""
+
+    from payment_bot.agent.skills import CARGOTEL_PAYMENT_STATUS_SKILL
+
+    prompt = CARGOTEL_PAYMENT_STATUS_SKILL.system_prompt
+
+    assert "Give each load's `amount`" in prompt
+    assert "State it even when the load is not yet scheduled" in prompt
+    assert "no line items" in prompt
+    assert CARGOTEL_PAYMENT_STATUS_SKILL.version == "1.1.0"

@@ -231,6 +231,15 @@ PROCEDURE — in order, skip nothing
 REPLY
 - Two to four sentences. Answer what was asked, then stop.
 - Address every load id listed in the intake message — never skip one.
+- Give each load's `amount` — it is the payable on that load and it exists whatever the
+  billing state is. State it even when the load is not yet scheduled: "we have $2,000 payable
+  on load 296006, awaiting your invoice" answers the question, while naming only the missing
+  paperwork leaves the sender still asking what the load is worth.
+- If the intake says the sender asked about the RATE, lead with `amount` — that is the
+  question. Where the intake lists an amount the sender stated, say whether it agrees with
+  `amount`, quoting both figures when they differ. Never adjust the sender's figure to fit
+  ours, and never call a mismatch settled: say the two do not agree and that someone will
+  follow up.
 - Read `billing_state` and say what it means, in plain words:
   - scheduled — give the expected payment date.
   - awaiting_paperwork — name what is in `missing_documents` and ask the sender to send it.
@@ -264,12 +273,24 @@ NEVER
 - Adjust the payment date to a payment day.
 - Ask the sender for paperwork when the state is awaiting_billing.
 - Disclose a load whose `check_authorization` did not return authorized=true.
+- Break `amount` into a rate plus charges, or state any figure beside it. A CargoTel load
+  carries one payable and no line items, so any breakdown would be invented.
 """
 
 
 CARGOTEL_PAYMENT_STATUS_SKILL = Skill(
     id="cargotel_payment_status",
-    version="1.0.0",
+    # 1.1.0: the reply must state `amount`, and must answer a rate question as one.
+    #
+    # This skill also serves rate verification, because a CargoTel load has a single payable
+    # and no line items for a rate skill to itemise — see pipeline._select_skill. But the
+    # prompt never asked for the amount: every billing_state branch named dates and documents
+    # only, and "write money as $2,000" is a formatting rule that presupposes money appears
+    # without requiring it. So the narrowing quietly dropped the question instead of answering
+    # it more simply. Live on a Tru Funding rate-verification email over five loads: the draft
+    # correctly reported all five as awaiting carrier invoices and never stated a figure, while
+    # $2,150 and $3,000 sat in the tool results.
+    version="1.1.0",
     system_prompt=_CARGOTEL_PAYMENT_STATUS_PROMPT,
     allowed_tools=CARGOTEL_PAYMENT_STATUS_TOOLS,
 )
@@ -282,12 +303,20 @@ def build_cargotel_payment_status_intake(
     signature: str = "Circle Delivers Payments",
     documents_email: str = "freightpay@circledelivers.com",
     unlocated_loads: list[str] | None = None,
+    rate_question: bool = False,
+    stated_rates: list[StatedRate] | None = None,
 ) -> str:
     """Compose the first user turn for a CargoTel payment-status run.
 
     Takes no ``prenoa_loads``: the pre-NOA flow is a Transport Pro concept and there is no
     equivalent here. ``documents_email`` is kept because a load awaiting paperwork needs
     somewhere to send it.
+
+    ``rate_question`` is true when the sender asked about the rate rather than the timing.
+    This skill answers both — a CargoTel load has one payable and no line items to itemise
+    (see ``pipeline._select_skill``) — but the reply has to lead with the amount when the
+    amount is what was asked, or the narrowing reads as an evasion. ``stated_rates`` carries
+    what the sender quoted, so the reply can say whether it agrees.
     """
 
     return "\n".join(
@@ -304,12 +333,45 @@ def build_cargotel_payment_status_intake(
             "- These are 6-digit loads. Use the cgt_* tools only.",
             f"- Sign the reply exactly as: {signature}",
             f"- Missing paperwork should be emailed to: {documents_email}",
+            *_cargotel_rate_lines(rate_question, stated_rates),
             *_unlocated_line(unlocated_loads),
             "",
             "Run the cargotel_payment_status procedure for the load id(s) above and submit a "
             "grounded draft.",
         ]
     )
+
+
+def _cargotel_rate_lines(
+    rate_question: bool, stated_rates: list[StatedRate] | None
+) -> list[str]:
+    """Tell the agent the ask was about the rate, and what the sender quoted.
+
+    Only emitted for a rate question. On a timing question these lines would invite the reply
+    to argue about figures nobody disputed.
+    """
+
+    if not rate_question:
+        return []
+    lines = [
+        "- The sender asked about the RATE, not the timing. Lead with each load's amount. "
+        "This system holds one payable per load and no line items, so give that figure and "
+        "do not break it down."
+    ]
+    quoted = [r for r in (stated_rates or []) if r.amount is not None]
+    if quoted:
+        rendered = ", ".join(
+            f"{r.load_id or 'unattributed'}: ${r.amount:,}" for r in quoted
+        )
+        lines.append(
+            f"- Amount(s) the sender stated: {rendered}. Say whether ours agrees, quoting "
+            "both when they differ. Never adjust theirs to match."
+        )
+    else:
+        lines.append(
+            "- The sender quoted no amount, so there is nothing to compare — state ours."
+        )
+    return lines
 
 
 def _unlocated_line(unlocated_loads: list[str] | None) -> list[str]:

@@ -479,3 +479,96 @@ def test_the_check_labels_do_not_swallow_real_loads(
     """
 
     assert _run(ctx, body=text).load_ids == expected
+
+
+# ---------------------------------------------------------------------------
+# Hidden tracking text. Stripping tags discards attribute values, but a token
+# put in element TEXT and hidden with CSS survives that — and every helpdesk
+# does exactly this.
+# ---------------------------------------------------------------------------
+_FRESHDESK_TAIL = (
+    "<div><p>Load 277848 — could you provide payment status?</p></div>"
+    "<span title=\"fd_tkt_identifier\" style='font-size:0px; font-family:\"fdtktid\"; "
+    "min-height:0px; height:0px; opacity:0; max-height:0px; line-height:0px; "
+    "color:#ffffff'>25946:4480806</span>"
+)
+
+
+@pytest.mark.unit
+def test_a_hidden_tracking_id_is_not_read_as_a_load(ctx: ToolContext) -> None:
+    """Live regression, and one my own html_text change introduced.
+
+    Freshdesk closes every message with an invisible span carrying `<ticket>:<id>`. On a
+    Cashway Funding enquiry about CargoTel load 277848 the trailing 4480806 was read as a
+    7-digit Transport Pro load, and the email was refused as spanning both systems. The number
+    is in no plain-text part and no human ever saw it.
+    """
+
+    from payment_bot.models import InboundEmail
+
+    email = InboundEmail(
+        message_id="<m>",
+        thread_id="t",
+        from_email="support@cashwayfunding.com",
+        subject="Re: 277848",
+        body="Load 277848\nCould you please provide payment status?",
+        html=f"<html><body>{_FRESHDESK_TAIL}</body></html>",
+    )
+    out = _run(ctx, subject=email.subject, body=email.body, html_text=email.html_text)
+
+    assert out.load_ids == ["277848"]
+    assert "4480806" not in email.html_text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "style",
+    [
+        "display:none",
+        "display: none",
+        "visibility:hidden",
+        "opacity:0",
+        "font-size:0px",
+        "max-height:0px",
+    ],
+)
+def test_every_hiding_declaration_removes_the_element_and_its_text(
+    ctx: ToolContext, style: str
+) -> None:
+    """Keyed on the CSS, not on Freshdesk's attribute — every helpdesk hides its own way.
+
+    The same rule removes marketing preheader text, which is equally not text a human read.
+    """
+
+    from payment_bot.models import InboundEmail
+
+    email = InboundEmail(
+        message_id="<m>",
+        thread_id="t",
+        from_email="a@b.com",
+        html=f"<html><body><p>Load 2462934</p><span style='{style}'>9876543</span></body></html>",
+    )
+    out = _run(ctx, html_text=email.html_text)
+
+    assert out.load_ids == ["2462934"]
+
+
+@pytest.mark.unit
+def test_visible_text_in_a_styled_element_is_still_read(ctx: ToolContext) -> None:
+    """The rule must not swallow ordinary styling — most real tables carry a style attribute."""
+
+    from payment_bot.models import InboundEmail
+
+    email = InboundEmail(
+        message_id="<m>",
+        thread_id="t",
+        from_email="a@b.com",
+        html=(
+            "<html><body><table style='width:600px; font-size:13px; color:#333333'>"
+            "<tr><td style='padding:4px'>2502262</td><td>$1,300.00</td></tr>"
+            "</table></body></html>"
+        ),
+    )
+    out = _run(ctx, html_text=email.html_text)
+
+    assert out.load_ids == ["2502262"]

@@ -13,6 +13,32 @@ from pydantic import BaseModel, ConfigDict, Field
 
 #: Elements whose *contents* are markup rather than message text.
 _NON_TEXT_ELEMENTS_RE = re.compile(r"(?is)<(script|style|head|title)\b.*?</\1\s*>")
+
+#: Elements the sender styled invisible, contents included.
+#:
+#: Stripping tags discards attribute values, which is what makes it safe to scan an HTML part
+#: for load ids — every URL, pixel width and hex colour lives in an attribute. A tracking token
+#: placed in element *text* and hidden with CSS defeats that, and it is not a hypothetical:
+#: Freshdesk closes every message with
+#:
+#:     <span title="fd_tkt_identifier" style='font-size:0px; opacity:0; max-height:0px;
+#:           line-height:0px; color:#ffffff'>25946:4480806</span>
+#:
+#: On a Cashway Funding enquiry about CargoTel load 277848, that ``4480806`` was read as a
+#: seventh-digit Transport Pro load and the email was refused as spanning both systems. The
+#: number is not in the plain-text part and no human ever saw it.
+#:
+#: Keyed on the hiding declarations rather than on Freshdesk's attribute, because every
+#: helpdesk does this — and the same rule removes marketing preheader text, which is also not
+#: text a human read. Lazy inner match, so a self-contained hidden element is removed and a
+#: nested same-tag one merely under-removes, leaving a stray close tag that tag-stripping eats.
+_HIDDEN_ELEMENT_RE = re.compile(
+    r"(?is)<(\w+)\b[^>]*?\bstyle\s*=\s*(['\"])"
+    r"(?:(?!\2).)*?"
+    r"(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0"
+    r"|font-size\s*:\s*0|max-height\s*:\s*0)"
+    r"(?:(?!\2).)*?\2[^>]*>.*?</\1\s*>"
+)
 _TAG_RE = re.compile(r"(?s)<[^>]+>")
 #: Horizontal whitespace only — line structure is left alone, because the stated-rate scan
 #: reads one line at a time and pairs an amount with a load id on that same line.
@@ -72,11 +98,16 @@ class InboundEmail(BaseModel):
         ``html`` had been captured since this model was written and read by nothing.
 
         Tags are removed rather than parsed, which is what makes this safe to feed a scan
-        that drives authorization: every URL, tracking id, pixel width and hex colour lives
-        in an *attribute*, so stripping tags discards them and only text a human would have
-        read survives. On that Summar mail it reduced 29,363 characters of markup to 1,621 of
-        text, yielding exactly one load id and no phantoms. ``<script>``, ``<style>``,
-        ``<head>`` and ``<title>`` go with their contents, which are markup, not message.
+        that drives authorization: every URL, pixel width and hex colour lives in an
+        *attribute*, so stripping tags discards them. On that Summar mail it reduced 29,363
+        characters of markup to 1,621 of text, yielding exactly one load id and no phantoms.
+        ``<script>``, ``<style>``, ``<head>`` and ``<title>`` go with their contents, which
+        are markup, not message.
+
+        Attribute-stripping alone was not enough, and a live escalation proved it: a tracking
+        token can be put in element *text* and hidden with CSS instead, which is what every
+        helpdesk does. See :data:`_HIDDEN_ELEMENT_RE` — invisible elements go with their
+        contents too, so what survives really is only text a human could have read.
 
         No BeautifulSoup: it is an optional extra here, and making every inbound email
         depend on it would turn a missing extra into a dead inbox.
@@ -85,5 +116,6 @@ class InboundEmail(BaseModel):
         if not self.html:
             return ""
         text = _NON_TEXT_ELEMENTS_RE.sub(" ", self.html)
+        text = _HIDDEN_ELEMENT_RE.sub(" ", text)
         text = _TAG_RE.sub(" ", text)
         return _HSPACE_RE.sub(" ", html_entities.unescape(text)).strip()

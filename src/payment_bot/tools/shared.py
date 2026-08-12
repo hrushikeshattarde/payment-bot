@@ -19,6 +19,7 @@ from payment_bot.domain import compute_carrier_rate as domain_carrier_rate
 from payment_bot.domain import compute_scheduled_pay_date as domain_scheduled_pay_date
 from payment_bot.domain import route_load as domain_route_load
 from payment_bot.errors import ToolError
+from payment_bot.logging import get_logger
 from payment_bot.models import (
     AuthDecision,
     Intent,
@@ -27,6 +28,8 @@ from payment_bot.models import (
     System,
 )
 from payment_bot.tools.base import Tool, ToolContext
+
+_log = get_logger("tools.shared")
 
 # Company-name tokens too generic to prove identity by themselves.
 _STOPWORDS = frozenset(
@@ -147,6 +150,57 @@ def _load_ids_in(text: str) -> list[str]:
     return found
 _MONEY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?")
 _INVOICE_RE = re.compile(r"invoice\s*(?:no\.?|number|#)?\s*:?\s*(\d{3,})", re.IGNORECASE)
+
+
+def _drop_stray_sender_invoice_ids(load_ids: list[str], invoice_numbers: list[str]) -> list[str]:
+    """Drop an id that is only the sender's own invoice number, pulled into another system.
+
+    Live on an OperFi second-request email. It named "Load #: 2485194" — a Transport Pro
+    load carried by Mays Transport and factored to Operation Finance, which is the sender —
+    beside "OperFi Invoice #: 318354". Six digits routes to CargoTel, where 318354 happens
+    to hit a record with no carrier and no factor, so the run escalated as "email spans both
+    systems" and an answerable question from the load's own factor went unanswered. Third
+    instance of this shape: RTS's account reference collided with a real Skyway load, and a
+    "Past Due Invoices" email's 405445 was reported as an expired CargoTel cookie.
+
+    The extractor already knew — 318354 came back in ``sender_invoice_numbers`` as well.
+    Nothing consumed it.
+
+    Deliberately narrow. ``invoice`` is **not** a label in :data:`_NOT_A_LOAD_LABEL_RE`,
+    because carriers say "Invoice 2462934" meaning a real Transport Pro load; suppressing the
+    bare word would refuse real questions, and a false negative is worse than an escalation.
+    So this fires only when all three hold:
+
+    * the ids span more than one system, so there is a disagreement to resolve at all;
+    * at least one id is *not* a sender invoice number, giving an anchor;
+    * those anchored ids agree on a single system.
+
+    Only then is a sender-invoice id belonging to a *different* system a stray. A
+    single-system email is never touched, and neither is an email whose only id is an invoice
+    number — with no anchor there is nothing to contradict it, so "Invoice 2462934" survives.
+    """
+
+    invoice_set = set(invoice_numbers)
+    if len(load_ids) < 2 or not invoice_set:
+        return load_ids
+
+    systems = {lid: domain_route_load(lid).system for lid in load_ids}
+    if len(set(systems.values())) < 2:
+        return load_ids
+
+    anchored = {systems[lid] for lid in load_ids if lid not in invoice_set}
+    if len(anchored) != 1:
+        return load_ids
+
+    anchor = next(iter(anchored))
+    kept = [lid for lid in load_ids if lid not in invoice_set or systems[lid] is anchor]
+    dropped = [lid for lid in load_ids if lid not in kept]
+    if dropped:
+        _log.info(
+            "sender_invoice_id_dropped",
+            extra={"dropped": dropped, "kept": kept, "anchor_system": anchor.value},
+        )
+    return kept
 _COMPANY_RE = re.compile(
     r"\b([A-Z][A-Za-z0-9&'.\- ]{2,40}?,?\s+(?:Inc|LLC|L\.L\.C\.|Incorporated|Corp|Corporation|Co|Ltd)\b\.?)"
 )
@@ -377,6 +431,12 @@ class ExtractIdentifiersInput(BaseModel):
     #: whose load ids appear nowhere in the body; this is where they surface. Feeds
     #: identifier extraction only — never the sensitive-change scan.
     attachments_text: str = ""
+    #: Visible text of the HTML part (:attr:`~payment_bot.models.InboundEmail.html_text`).
+    #: A sender's plain-text alternative need not match their HTML: portal collections mail
+    #: puts its invoice table in the HTML only, so this is where the load id lives. Unlike
+    #: ``attachments_text`` this DOES also feed the sensitive-change scan — a bank
+    #: instruction present only in the HTML would otherwise never be seen.
+    html_text: str = ""
 
 
 class ExtractIdentifiersOutput(BaseModel):
@@ -403,19 +463,32 @@ class ExtractIdentifiers(Tool):
         assert isinstance(params, ExtractIdentifiersInput)
         text = "\n".join(
             p
-            for p in (params.subject, params.body, params.thread_text, params.attachments_text)
+            for p in (
+                params.subject,
+                params.body,
+                params.thread_text,
+                params.attachments_text,
+                params.html_text,
+            )
             if p
         )
 
         load_ids = _dedupe(_load_ids_in(text))
         invoice_numbers = _dedupe(_INVOICE_RE.findall(text))
+        load_ids = _drop_stray_sender_invoice_ids(load_ids, invoice_numbers)
 
         stated_rates: list[StatedRate] = []
         for line in text.splitlines():
             amounts = [_money(m) for m in _MONEY_RE.findall(line)]
             if not amounts:
                 continue
-            line_ids = _load_ids_in(line)
+            # Deduped: an invoice table routinely prints the same number under both an
+            # "Invoice No" and a "Load No" column, and counting one id twice left the amount
+            # bound to nothing. Two *different* ids on a line stays ambiguous — that is the
+            # case this guard is for. Only helps a row that arrives on ONE line, i.e. from a
+            # text part; an HTML table puts each cell on its own line, so its amounts bind to
+            # no load and would need row-aware parsing to fix.
+            line_ids = _dedupe(_load_ids_in(line))
             load_ref = line_ids[0] if len(line_ids) == 1 else None
             stated_rates.extend(StatedRate(load_id=load_ref, amount=a) for a in amounts)
 
@@ -484,6 +557,11 @@ class AttachmentMeta(BaseModel):
 class DetectSensitiveChangeInput(BaseModel):
     subject: str = ""
     body: str = ""
+    #: Visible text of the HTML part. Scanned alongside the body because a plain-text
+    #: alternative may omit what the HTML says — the mirror of the missing-invoice-table bug,
+    #: and the dangerous direction of it: a bank instruction the text part drops would pass
+    #: unseen. Erring toward more text can only ever escalate more, never less.
+    html_text: str = ""
     attachments_metadata: list[AttachmentMeta] = Field(default_factory=list)
 
 
@@ -743,7 +821,11 @@ class DetectSensitiveChange(Tool):
     def run(self, params: BaseModel, ctx: ToolContext) -> DetectSensitiveChangeOutput:
         assert isinstance(params, DetectSensitiveChangeInput)
         # Only what the sender wrote in this message, never the quoted thread below it.
+        # The HTML part gets the same quote-stripping: it is the same message in another
+        # format, so its quoted history is just as much not-this-sender's-words.
         written = f"{params.subject}\n{strip_quoted(params.body)}"
+        if params.html_text:
+            written = f"{written}\n{strip_quoted(params.html_text)}"
         haystack = written.lower()
         flags: list[SensitiveFlag] = []
         evidence: list[str] = []

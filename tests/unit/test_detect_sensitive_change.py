@@ -390,3 +390,64 @@ def test_a_standing_remittance_block_alone_is_still_not_a_change(ctx: ToolContex
 
     assert out.action is SensitiveAction.CONTINUE
     assert out.hard_bank is False
+
+
+@pytest.mark.unit
+def test_a_bank_instruction_only_in_the_html_is_still_seen(ctx: ToolContext) -> None:
+    """The dangerous mirror of the missing-invoice-table bug.
+
+    A plain-text alternative is not obliged to repeat what the HTML says. On a Summar
+    collections email the text part dropped the whole invoice table — so a sender whose HTML
+    carries "please update our bank details" while their text part omits it would have passed
+    the scan unseen. Erring toward more text can only escalate more, never less.
+    """
+
+    from payment_bot.models import InboundEmail
+
+    email = InboundEmail(
+        message_id="<m>",
+        thread_id="t",
+        from_email="collections@example.com",
+        subject="Payment status on load 2462934",
+        body="Hello, can we get a status on the above load? Thanks.",
+        html="<html><body><p>Hello, can we get a status on the above load?</p>"
+        "<p>Also please update our bank details before remitting.</p></body></html>",
+    )
+
+    out = DetectSensitiveChange().run(
+        DetectSensitiveChangeInput(
+            subject=email.subject, body=email.body, html_text=email.html_text
+        ),
+        ctx,
+    )
+
+    assert out.hard_bank is True
+    assert SensitiveFlag.BANK_CHANGE in out.flags
+
+
+@pytest.mark.unit
+def test_html_markup_alone_does_not_trip_the_scan(ctx: ToolContext) -> None:
+    """Style and script bodies are markup, not message — they must not create evidence."""
+
+    from payment_bot.models import InboundEmail
+
+    email = InboundEmail(
+        message_id="<m>",
+        thread_id="t",
+        from_email="a@b.com",
+        subject="Payment status on load 2462934",
+        body="Status please.",
+        html="<html><head><style>.bank{color:#036990}</style>"
+        "<script>var account_number=4941701385;</script></head>"
+        "<body><p>Status please.</p></body></html>",
+    )
+
+    out = DetectSensitiveChange().run(
+        DetectSensitiveChangeInput(
+            subject=email.subject, body=email.body, html_text=email.html_text
+        ),
+        ctx,
+    )
+
+    assert out.hard_bank is False
+    assert out.flags == [SensitiveFlag.NONE]

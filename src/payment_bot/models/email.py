@@ -6,7 +6,17 @@ pipeline only reads these fields; nothing here decides authorization or groundin
 
 from __future__ import annotations
 
+import html as html_entities
+import re
+
 from pydantic import BaseModel, ConfigDict, Field
+
+#: Elements whose *contents* are markup rather than message text.
+_NON_TEXT_ELEMENTS_RE = re.compile(r"(?is)<(script|style|head|title)\b.*?</\1\s*>")
+_TAG_RE = re.compile(r"(?s)<[^>]+>")
+#: Horizontal whitespace only — line structure is left alone, because the stated-rate scan
+#: reads one line at a time and pairs an amount with a load id on that same line.
+_HSPACE_RE = re.compile(r"[ \t\r\f\v]+")
 
 
 class EmailAttachment(BaseModel):
@@ -49,3 +59,31 @@ class InboundEmail(BaseModel):
         """Subject + body + thread, joined — the surface identifier/keyword scans read."""
 
         return "\n".join(part for part in (self.subject, self.body, self.thread_text) if part)
+
+    @property
+    def html_text(self) -> str:
+        """The visible text of :attr:`html`, or ``""`` when there is no HTML part.
+
+        A sender's plain-text alternative is not required to say the same thing as their
+        HTML, and portal mail routinely proves it. Live on a Summar Financial collections
+        email: the text part carried the prose but dropped the invoice table, so the load id
+        ``2502262``, the carrier and the amount existed only in the HTML — and the run
+        escalated with "no valid 6/7-digit load id found" over an id that was right there.
+        ``html`` had been captured since this model was written and read by nothing.
+
+        Tags are removed rather than parsed, which is what makes this safe to feed a scan
+        that drives authorization: every URL, tracking id, pixel width and hex colour lives
+        in an *attribute*, so stripping tags discards them and only text a human would have
+        read survives. On that Summar mail it reduced 29,363 characters of markup to 1,621 of
+        text, yielding exactly one load id and no phantoms. ``<script>``, ``<style>``,
+        ``<head>`` and ``<title>`` go with their contents, which are markup, not message.
+
+        No BeautifulSoup: it is an optional extra here, and making every inbound email
+        depend on it would turn a missing extra into a dead inbox.
+        """
+
+        if not self.html:
+            return ""
+        text = _NON_TEXT_ELEMENTS_RE.sub(" ", self.html)
+        text = _TAG_RE.sub(" ", text)
+        return _HSPACE_RE.sub(" ", html_entities.unescape(text)).strip()

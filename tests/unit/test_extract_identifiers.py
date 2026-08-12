@@ -237,3 +237,171 @@ def test_a_settlement_or_check_number_is_not_a_load_id(
 
     out = _run(ctx, subject=f"Fwd: Circle Logistics, Inc - {labelled}", body="Please advise.")
     assert out.load_ids == [], out.load_ids
+
+
+# ---------------------------------------------------------------------------
+# A sender's own invoice number is not one of our loads — but only when
+# something in the same email contradicts it. See
+# `_drop_stray_sender_invoice_ids` for why the bare word "invoice" cannot be a
+# suppression label.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_a_sender_invoice_number_does_not_fake_a_second_system(ctx: ToolContext) -> None:
+    """The OperFi regression: an answerable email escalated as spanning two systems.
+
+    "Load #: 2485194" is a real Transport Pro load — carrier Mays Transport, factored to
+    Operation Finance, which is the sender. "OperFi Invoice #: 318354" is the sender's own
+    invoice number; six digits routed it to CargoTel, where it collided with a record having
+    no carrier and no factor, and the whole email escalated.
+    """
+
+    out = _run(
+        ctx,
+        subject="2ND REQUEST: PAYMENT STATUS - Load 2485194 - OperFi Invoice# 318354",
+        body="Load #: 2485194\nOperFi Invoice #: 318354\nOperation Finance\nPO Box 227352",
+    )
+
+    assert out.load_ids == ["2485194"]
+    # Still reported as what it is, so a reviewer can see the reference the sender quoted.
+    assert out.sender_invoice_numbers == ["318354"]
+
+
+@pytest.mark.unit
+def test_an_invoice_number_that_is_the_load_survives_on_its_own(ctx: ToolContext) -> None:
+    """Carriers say "Invoice 2462934" meaning a real Transport Pro load.
+
+    Nothing contradicts it, so it must stay. Dropping it would refuse a real question — a
+    false negative, which is worse than the escalation this rule exists to prevent.
+    """
+
+    assert _run(ctx, body="Invoice 2462934 please").load_ids == ["2462934"]
+
+
+@pytest.mark.unit
+def test_an_invoice_labelled_load_survives_alongside_a_same_system_load(
+    ctx: ToolContext,
+) -> None:
+    """Both 7-digit: one system, no disagreement, so nothing is dropped."""
+
+    out = _run(ctx, body="Invoice 2462934 and load 2485194 please")
+
+    assert out.load_ids == ["2462934", "2485194"]
+
+
+@pytest.mark.unit
+def test_a_genuine_two_system_email_still_spans_two_systems(ctx: ToolContext) -> None:
+    """No invoice label, so neither id is a candidate and the escalation must still fire."""
+
+    out = _run(ctx, body="Load 2485194 and load 318354 please")
+
+    assert out.load_ids == ["2485194", "318354"]
+
+
+@pytest.mark.unit
+def test_an_email_whose_only_ids_are_invoice_numbers_is_left_alone(ctx: ToolContext) -> None:
+    """No anchor system, so there is nothing to judge the ids against.
+
+    Dropping here would empty the email of loads entirely on the strength of a label.
+    """
+
+    out = _run(ctx, body="Invoice 2462934 and invoice 318354")
+
+    assert out.load_ids == ["2462934", "318354"]
+
+
+@pytest.mark.unit
+def test_a_sender_invoice_number_in_the_anchor_system_is_kept(ctx: ToolContext) -> None:
+    """Only a *different* system makes a sender-invoice id a stray.
+
+    Here the invoice number is 7-digit like the load, so it may well be the same load
+    referred to twice; it is not this rule's business to decide otherwise.
+    """
+
+    out = _run(ctx, subject="Load 2485194", body="Our invoice 2462934 covers it")
+
+    assert out.load_ids == ["2485194", "2462934"]
+
+
+# ---------------------------------------------------------------------------
+# The HTML part. A sender's plain-text alternative need not say what their HTML
+# says, and portal collections mail proves it: the invoice table is HTML-only.
+# ---------------------------------------------------------------------------
+_SUMMAR_HTML = """
+<html><head><style>.t{width:600px;color:#1a2b3c}</style>
+<script>var trackingId=4839201;</script></head>
+<body><img src="http://url5942.summar.com/x/689196371/pixel.gif" width="600">
+<p>Dear Circle Logistics, please release them on your system.</p>
+<table><tr><th>Invoice No</th><th>Load No</th><th>Date</th><th>Carrier</th><th>Amount</th></tr>
+<tr><td>2502262</td><td>2502262</td><td>07/14/2026</td><td>D&amp;Y USA Inc</td><td>$1,300.00</td></tr>
+</table>
+<p>Payments to Summar at P.O BOX 748841, Atlanta, GA 30374-8841.</p></body></html>
+"""
+
+
+@pytest.mark.unit
+def test_a_load_id_that_exists_only_in_the_html_is_found(ctx: ToolContext) -> None:
+    """The Summar regression: escalated "no valid 6/7-digit load id found" over 2502262.
+
+    Its plain-text alternative carried the prose and dropped the invoice table, so the id,
+    the carrier and the amount were HTML-only — and `html` was captured by the Gmail client
+    and read by nothing.
+    """
+
+    from payment_bot.models import InboundEmail
+
+    email = InboundEmail(
+        message_id="<m>",
+        thread_id="t",
+        from_email="sserna@summar.com",
+        subject="Missing Website Payment status - Summar Financial LLC",
+        body="Dear Circle Logistics, please release them on your system. Sincerely, Summar",
+        html=_SUMMAR_HTML,
+    )
+    out = _run(ctx, subject=email.subject, body=email.body, html_text=email.html_text)
+
+    assert out.load_ids == ["2502262"]
+    assert "D&Y USA Inc" in out.carrier_names
+
+
+@pytest.mark.unit
+def test_markup_does_not_become_phantom_load_ids(ctx: ToolContext) -> None:
+    """The reason tags are stripped rather than parsed.
+
+    Tracking ids, pixel URLs, widths and hex colours all live in attributes or in
+    script/style bodies, so removing those leaves only text a human would have read.
+    `4839201` (a script variable) and `689196371` (a URL path) must not become loads.
+    """
+
+    from payment_bot.models import InboundEmail
+
+    email = InboundEmail(
+        message_id="<m>", thread_id="t", from_email="a@b.com", html=_SUMMAR_HTML
+    )
+    out = _run(ctx, html_text=email.html_text)
+
+    assert out.load_ids == ["2502262"]
+    assert "4839201" not in out.load_ids
+    assert "689196371" not in out.load_ids
+    # The PO Box is visible text, and the existing label rule still suppresses it.
+    assert "748841" not in out.load_ids
+
+
+@pytest.mark.unit
+def test_an_email_with_no_html_part_is_unaffected(ctx: ToolContext) -> None:
+    from payment_bot.models import InboundEmail
+
+    email = InboundEmail(
+        message_id="<m>", thread_id="t", from_email="a@b.com", body="Load 2462934 status?"
+    )
+    assert email.html_text == ""
+    assert _run(ctx, body=email.body, html_text=email.html_text).load_ids == ["2462934"]
+
+
+@pytest.mark.unit
+def test_a_repeated_id_on_one_line_still_binds_its_amount(ctx: ToolContext) -> None:
+    """A text-part table row prints the same number under two column headings."""
+
+    out = _run(ctx, body="2502262\t2502262\t07/14/2026\tD&Y USA Inc\t$1,300.00")
+
+    assert out.load_ids == ["2502262"]
+    assert [(r.load_id, str(r.amount)) for r in out.stated_rates] == [("2502262", "1300.00")]

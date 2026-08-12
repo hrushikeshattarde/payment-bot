@@ -257,6 +257,10 @@ class PreSendGate:
             DetectSensitiveChangeInput(
                 subject=email.subject,
                 body=email.body,
+                # Must match what the pipeline scanned, or the gate — which re-derives this
+                # as the source of truth rather than trusting the agent — would see LESS
+                # than the intake did and wave through what intake had flagged.
+                html_text=email.html_text,
                 attachments_metadata=[
                     AttachmentMeta(filename=a.filename, mime_type=a.mime_type)
                     for a in email.attachments

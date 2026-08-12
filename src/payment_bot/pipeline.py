@@ -232,6 +232,9 @@ class PaymentBotPipeline:
                 "attachments_text": "\n".join(
                     a.extracted_text for a in email.attachments if a.extracted_text
                 ),
+                # Portal collections mail puts its invoice table in the HTML only, so the
+                # load id can exist nowhere else. See InboundEmail.html_text.
+                "html_text": email.html_text,
             },
             ctx,
         )
@@ -248,6 +251,7 @@ class PaymentBotPipeline:
             {
                 "subject": email.subject,
                 "body": email.body,
+                "html_text": email.html_text,
                 "attachments_metadata": [
                     {"filename": a.filename, "mime_type": a.mime_type} for a in email.attachments
                 ],

@@ -76,6 +76,24 @@ _BULK_PORTAL_SKILL_ID = "bulk_portal"
 #: budget can never exceed what an operator could have set by hand.
 ITERATION_CEILING = 50
 
+
+def _group_by_reason(entries: list[tuple[str, str]]) -> str:
+    """Render ``(load_id, reason)`` pairs with the loads that share a reason grouped together.
+
+    An infrastructure failure gives every load in the email the same sentence. Live on a
+    five-load Tru Funding email whose CargoTel cookie could not be read: five copies of one
+    ~200-character credentials message, and the single fact a reviewer needed — *the AWS
+    credentials are missing* — was buried behind four repetitions of itself.
+
+    Per-load reasons still list per load, which is what makes the grouping safe to read: a
+    genuine mix of causes stays visible rather than being flattened into whichever came first.
+    """
+
+    grouped: dict[str, list[str]] = {}
+    for load_id, reason in entries:
+        grouped.setdefault(reason, []).append(load_id)
+    return "; ".join(f"{', '.join(loads)}={reason}" for reason, loads in grouped.items())
+
 #: The §3.3 bulk reply. Deliberately contains no amount, date or load id — see
 #: `_bulk_portal_draft` for why that is what makes it safe.
 #:
@@ -355,7 +373,7 @@ class PaymentBotPipeline:
         # a phantom id that Transport Pro 400s on ate all 12 iterations retrying it and
         # produced no draft. The gate stays authoritative over what the draft actually
         # discloses; this is an efficiency measure, not a replacement.
-        unauthorized: list[str] = []
+        unauthorized: list[tuple[str, str]] = []
         authorized_loads: list[str] = []
         prenoa_loads: list[str] = []
         #: Requested loads whose authorization could not be RESOLVED, as opposed to resolved
@@ -378,7 +396,7 @@ class PaymentBotPipeline:
             )
             if not auth_out.ok:
                 # Cannot resolve authorization → treat as denied (fail closed, like the gate).
-                unauthorized.append(f"{load_id}=ERROR({auth_out.payload.get('error')})")
+                unauthorized.append((load_id, f"ERROR({auth_out.payload.get('error')})"))
                 unresolved_loads.append(load_id)
                 continue
             auth = CheckAuthorizationOutput.model_validate(auth_out.payload)
@@ -386,7 +404,7 @@ class PaymentBotPipeline:
                 # Carry the tool's reason — it names the fix (e.g. a factoring domain to
                 # add to PAYBOT_FACTORING_DOMAINS), which is what the reviewer acts on.
                 detail = f" ({auth.reason})" if auth.reason else ""
-                unauthorized.append(f"{load_id}={auth.decision.value}{detail}")
+                unauthorized.append((load_id, f"{auth.decision.value}{detail}"))
                 continue
             authorized_loads.append(load_id)
             if auth.pre_noa:
@@ -395,7 +413,7 @@ class PaymentBotPipeline:
             return self._escalate(
                 email,
                 "review",
-                f"sender not authorized for any load: {unauthorized}",
+                f"sender not authorized for any load: {_group_by_reason(unauthorized)}",
                 tuple(load_ids),
                 correlation_id,
             )
@@ -404,7 +422,7 @@ class PaymentBotPipeline:
                 "authorization_precheck_partial",
                 extra={
                     "correlation_id": correlation_id,
-                    "unauthorized": unauthorized,
+                    "unauthorized": _group_by_reason(unauthorized),
                     "proceeding_with": authorized_loads,
                 },
             )

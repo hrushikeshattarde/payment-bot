@@ -90,14 +90,22 @@ class S3CookieSource:
     ``IndexError`` here would surface much later as an unexplained login page.
     """
 
-    def __init__(self, bucket: str, key: str) -> None:
+    def __init__(self, bucket: str, key: str, profile: str = "") -> None:
         self._bucket = bucket
         self._key = key
+        self._profile = profile
         self._cached: str | None = None
+        #: Remembered failure, so one broken credential chain costs one round trip rather
+        #: than one per load. A credentials or permissions error is never transient within a
+        #: single email — observed live as five identical two-second failures in one run,
+        #: producing five copies of the same message in the escalation.
+        self._error: str | None = None
 
     def cookie(self) -> str:
         if self._cached is not None:
             return self._cached
+        if self._error is not None:
+            raise ClientError(self._error)
         try:
             import boto3
         except ImportError as exc:  # pragma: no cover - declared in the extra
@@ -106,13 +114,24 @@ class S3CookieSource:
             ) from exc
 
         try:
-            response = boto3.client("s3").get_object(Bucket=self._bucket, Key=self._key)
+            session = boto3.Session(profile_name=self._profile) if self._profile else boto3
+            response = session.client("s3").get_object(Bucket=self._bucket, Key=self._key)
             payload = json.loads(response["Body"].read().decode("utf-8"))
         except Exception as exc:  # boto3 raises a wide family; all mean "no cookie"
-            raise ClientError(
-                f"CargoTel: could not read the session cookie from "
-                f"s3://{self._bucket}/{self._key}: {exc}"
-            ) from exc
+            self._error = _cookie_failure(exc, self._profile)
+            # The bucket and key go to the log, not into the message. The message is read in
+            # an escalation — once per unauthorized load — where the location is noise and
+            # the action is the point; the log is where someone debugging wants the path.
+            _log.error(
+                "cargotel_cookie_unavailable",
+                extra={
+                    "bucket": self._bucket,
+                    "key": self._key,
+                    "profile": self._profile or "(default chain)",
+                    "error": f"{type(exc).__name__}: {exc}"[:300],
+                },
+            )
+            raise ClientError(self._error) from exc
 
         value = _cookie_value(payload)
         if not value:
@@ -121,6 +140,64 @@ class S3CookieSource:
             )
         self._cached = value
         return value
+
+
+def _cookie_failure(exc: Exception, profile: str) -> str:
+    """Turn a boto3 failure into the one sentence an operator can act on.
+
+    "Could not read the cookie" has several distinct causes with different fixes, and they
+    are not interchangeable: a missing credential is the operator's to set, an expired one is
+    theirs to refresh, and a missing object means the login bot is not running and there is
+    nothing wrong on this side at all. The previous single hint named only one remedy — set
+    ``PAYBOT_AWS_PROFILE`` — which is not even how this deployment ended up credentialed
+    (a ``[default]`` profile in ``~/.aws/credentials``), so it pointed at the wrong fix while
+    sounding certain.
+
+    Classified on the exception name and, for an API error, the S3 error code, read
+    defensively so no botocore import is needed here — ``boto3`` is deliberately lazy.
+    """
+
+    name = type(exc).__name__
+    response = getattr(exc, "response", None)
+    code = ""
+    if isinstance(response, dict):
+        code = str((response.get("Error") or {}).get("Code") or "")
+
+    if name in {"NoCredentialsError", "PartialCredentialsError"} or code == "InvalidAccessKeyId":
+        return (
+            "CargoTel session unavailable: no usable AWS credentials, so the session cookie "
+            "could not be read. Any one of these fixes it — a [default] profile in "
+            "~/.aws/credentials, AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / "
+            "AWS_SESSION_TOKEN set in the environment the bot runs in, or PAYBOT_AWS_PROFILE "
+            "naming a profile. Note .env is not a credential source — boto3 never reads it."
+        )
+    if code in {"ExpiredToken", "ExpiredTokenException", "RequestExpired", "InvalidClientTokenId"}:
+        return (
+            "CargoTel session unavailable: the AWS credentials have expired, so the session "
+            "cookie could not be read. Refresh them. Temporary credentials and SSO sessions "
+            "both lapse, and boto3 cannot renew ones written to ~/.aws/credentials by hand — "
+            "so this recurs on a schedule until a non-expiring credential is used."
+        )
+    if name == "ProfileNotFound":
+        return (
+            f"CargoTel session unavailable: AWS profile {profile or '(unset)'!r} does not "
+            "exist, so the session cookie could not be read. Check PAYBOT_AWS_PROFILE "
+            "against the profiles in ~/.aws/config."
+        )
+    if code in {"NoSuchKey", "NoSuchBucket", "404"}:
+        return (
+            "CargoTel session unavailable: the stored session cookie is missing. The login "
+            "bot that maintains it has not written it — nothing here needs fixing, that does."
+        )
+    if code in {"AccessDenied", "403"}:
+        return (
+            "CargoTel session unavailable: these AWS credentials are valid but cannot read "
+            "the stored session cookie — they are missing s3:GetObject on it."
+        )
+    return (
+        f"CargoTel session unavailable: the session cookie could not be read ({name}). "
+        "See the cargotel_cookie_unavailable log entry for the location and raw error."
+    )
 
 
 def _cookie_value(payload: Any) -> str | None:
@@ -287,12 +364,14 @@ class CargoTelSettings:
     cookie_bucket: str
     cookie_key: str
     timeout: float = 60.0
+    #: Named AWS profile for the cookie read. Blank = default chain (correct in Lambda).
+    aws_profile: str = ""
 
     def build_client(self, transport: HttpTransport | None = None) -> CargoTelHttpClient:
         return CargoTelHttpClient(
             base_url=self.base_url,
             client_url=self.client_url,
-            cookies=S3CookieSource(self.cookie_bucket, self.cookie_key),
+            cookies=S3CookieSource(self.cookie_bucket, self.cookie_key, self.aws_profile),
             transport=transport,
             timeout=self.timeout,
         )
@@ -319,6 +398,7 @@ class CargoTelSettings:
             cookie_bucket=resolved.cargotel_cookie_bucket,
             cookie_key=resolved.cargotel_cookie_key,
             timeout=resolved.cargotel_timeout_seconds,
+            aws_profile=resolved.aws_profile,
         )
 
 

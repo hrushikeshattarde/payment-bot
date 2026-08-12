@@ -12,6 +12,7 @@ carry customer data and are gitignored.
 
 from __future__ import annotations
 
+import sys
 from datetime import date
 from decimal import Decimal
 
@@ -423,3 +424,161 @@ def test_an_id_that_is_not_a_load_is_not_reported_as_an_expired_cookie() -> None
     # …and the systemic case still says what it means.
     with pytest.raises(ClientError, match="session cookie is probably expired"):
         parse_load_html(LOGIN_PAGE, "296006")
+
+
+# --- the cookie source ------------------------------------------------------
+class NoCredentialsError(Exception):
+    """Stands in for botocore's.
+
+    Named exactly as botocore names it, because that is what the classification keys on —
+    a stand-in called ``_NoCredentialsError`` silently falls through to the generic message.
+    """
+
+
+def _s3_error(code: str) -> Exception:
+    """An exception shaped like botocore's ``ClientError`` for one S3 error code."""
+
+    exc = Exception(f"An error occurred ({code})")
+    exc.response = {"Error": {"Code": code}}  # type: ignore[attr-defined]
+    return exc
+
+
+class _FakeS3:
+    def __init__(self, owner: _FakeBoto3) -> None:
+        self._owner = owner
+
+    def get_object(self, **_kwargs: object) -> dict[str, object]:
+        self._owner.calls += 1
+        raise self._owner.exc
+
+
+class _FakeBoto3:
+    """Enough of the boto3 module surface for both the profile and default-chain paths."""
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    def Session(self, **_kwargs: object) -> _FakeBoto3:  # noqa: N802 - mirrors boto3
+        return self
+
+    def client(self, _name: str) -> _FakeS3:
+        return _FakeS3(self)
+
+
+def _with_fake_boto3(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> _FakeBoto3:
+    fake = _FakeBoto3(exc)
+    monkeypatch.setitem(sys.modules, "boto3", fake)
+    return fake
+
+
+def test_a_credentials_failure_is_attempted_once_not_once_per_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Observed live: five loads in one email produced five identical two-second failures.
+
+    A credentials error is never transient inside a single run, so re-attempting it per load
+    only slows the escalation down. Counts the calls that actually reach the SDK rather than
+    timing them, so the guarantee is exact and the test needs no network.
+    """
+
+    from payment_bot.clients.cargotel_http import S3CookieSource
+
+    fake = _with_fake_boto3(monkeypatch, NoCredentialsError("Unable to locate credentials"))
+    source = S3CookieSource("bucket", "key")
+
+    for _ in range(5):  # five loads in one email
+        with pytest.raises(ClientError, match="CargoTel session unavailable"):
+            source.cookie()
+
+    assert fake.calls == 1, "the remembered failure must be replayed, not re-attempted"
+
+
+def test_a_successful_cookie_is_also_read_only_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The caching must not be failure-only, or the happy path pays one S3 read per load."""
+
+    import json as _json
+
+    from payment_bot.clients.cargotel_http import S3CookieSource
+
+    class _Body:
+        @staticmethod
+        def read() -> bytes:
+            return _json.dumps([{"name": "cgt-browser-session", "value": "abc123"}]).encode()
+
+    class _OkS3:
+        def __init__(self, owner: _FakeBoto3) -> None:
+            self._owner = owner
+
+        def get_object(self, **_kwargs: object) -> dict[str, object]:
+            self._owner.calls += 1
+            return {"Body": _Body()}
+
+    fake = _FakeBoto3(RuntimeError("unused"))
+    monkeypatch.setattr(_FakeBoto3, "client", lambda self, _n: _OkS3(self))
+    monkeypatch.setitem(sys.modules, "boto3", fake)
+
+    source = S3CookieSource("bucket", "key")
+    assert [source.cookie() for _ in range(4)] == ["abc123"] * 4
+    assert fake.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (NoCredentialsError("Unable to locate credentials"), "no usable AWS credentials"),
+        (_s3_error("ExpiredToken"), "have expired"),
+        (_s3_error("NoSuchKey"), "login bot"),
+        (_s3_error("AccessDenied"), "s3:GetObject"),
+    ],
+)
+def test_each_cookie_failure_names_its_own_fix(exc: Exception, expected: str) -> None:
+    """One message per cause, because the fixes are not interchangeable.
+
+    The previous single hint said "set PAYBOT_AWS_PROFILE" for every failure — including a
+    missing cookie object, where nothing on this side is broken and the login bot is what
+    needs starting. It also named the one remedy this deployment does not use: credentials
+    arrived as a ``[default]`` profile in ``~/.aws/credentials``.
+    """
+
+    from payment_bot.clients.cargotel_http import _cookie_failure
+
+    message = _cookie_failure(exc, profile="")
+    assert expected in message
+    assert message.startswith("CargoTel session unavailable")
+
+
+def test_a_missing_profile_is_reported_as_such(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Distinct from absent credentials: the profile named does not exist."""
+
+    from payment_bot.clients.cargotel_http import _cookie_failure
+
+    # Named exactly as botocore names it — no "Error" suffix — because the classification
+    # matches on the class name, so renaming it to satisfy N818 would stop testing anything.
+    class ProfileNotFound(Exception):  # noqa: N818
+        pass
+
+    message = _cookie_failure(ProfileNotFound("nope"), profile="typo-profile")
+    assert "typo-profile" in message
+    assert "~/.aws/config" in message
+
+
+def test_the_failure_message_does_not_leak_the_cookie_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bucket and key belong in the log, not in an escalation read by a human.
+
+    The live escalation carried ``s3://circle-bot-cookies/rubicon/cargotel.json`` five times
+    — internal infrastructure repeated into a message whose job is to say what to do.
+    """
+
+    from payment_bot.clients.cargotel_http import S3CookieSource
+
+    _with_fake_boto3(monkeypatch, NoCredentialsError("Unable to locate credentials"))
+    with pytest.raises(ClientError) as excinfo:
+        S3CookieSource("circle-bot-cookies", "rubicon/cargotel.json").cookie()
+
+    message = str(excinfo.value)
+    assert "circle-bot-cookies" not in message
+    assert "rubicon/cargotel.json" not in message
+    assert "s3://" not in message

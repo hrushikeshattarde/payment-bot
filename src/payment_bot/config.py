@@ -311,6 +311,19 @@ class Settings(BaseSettings):
 
     # --- Amazon Bedrock (§8.1) — the deployed LLM provider -------------------
     aws_region: str = "us-east-1"
+
+    #: Named AWS profile to use for boto3 calls. Blank means the default credential chain.
+    #:
+    #: This setting exists because ``.env`` is not a credential source for boto3 and never
+    #: will be: boto3 reads the *process environment*, so a developer who has put everything
+    #: else in ``.env`` still gets "Unable to locate credentials" unless they separately
+    #: export ``AWS_PROFILE`` in whichever shell happens to run the bot. Observed exactly
+    #: that way on a live run — every 6-digit load in one email failed to read the CargoTel
+    #: cookie while the same profile worked fine from the command line moments earlier.
+    #:
+    #: Leave blank in Lambda. There is no profile there: the function's execution role is
+    #: the credential source, and naming a profile that does not exist would break it.
+    aws_profile: str = ""
     #: Bedrock model / inference-profile id used to drive the agent loop in AWS.
     #: Verify availability in your region with `aws bedrock list-inference-profiles`.
     model_draft: str = "us.anthropic.claude-sonnet-5-v1:0"

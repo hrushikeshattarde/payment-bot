@@ -336,3 +336,57 @@ def test_confirming_existing_payment_details_is_not_a_change(ctx: ToolContext) -
         ),
     )
     assert out.hard is False
+
+
+def test_a_change_announcement_with_new_account_details_is_hard(ctx: ToolContext) -> None:
+    """The live miss this closes.
+
+    A TRU Funding rate-verification email carried "our banking and address details have
+    recently changed" followed by a full account and routing number, and scored **no flags at
+    all**. Two independent gaps let it through: the word boundaries that stop "ach" matching
+    inside "each" also stop "bank" matching inside "banking", and the credentials sat some
+    thirty words from any change verb — well outside the proximity window.
+
+    Every other check would have passed it. The five loads were real, the amounts matched,
+    and the sender was the factor of record on the roster, so the bot would have answered
+    cheerfully while nobody was told the payment details had changed.
+    """
+
+    body = (
+        "We would like to verify the rates on load 316039 for $2150.\n\n"
+        "Important Notice: Updated Company Information\n"
+        "Please note that our banking and address details have recently changed.\n\n"
+        "Electronic Payments:\n"
+        "Bank Name: Wells Fargo Bank\n"
+        "Account Number: 4941701385\n"
+        "Routing Number: 121000248\n"
+    )
+
+    out = DetectSensitiveChange().run(
+        DetectSensitiveChangeInput(subject="Rate verification", body=body), ctx
+    )
+
+    assert out.action is SensitiveAction.ESCALATE
+    assert SensitiveFlag.BANK_CHANGE in out.flags
+    # Hard, so it escalates regardless of the sensitive_bank_replies policy.
+    assert out.hard_bank is True
+
+
+def test_a_standing_remittance_block_alone_is_still_not_a_change(ctx: ToolContext) -> None:
+    """The other half of the discrimination, and the reason §7 narrowed this in the first
+    place: factoring signatures carry account numbers on every email they ever send. An
+    account number without a change announcement must stay silent, or the narrowing is
+    undone."""
+
+    body = (
+        "What is the pay date for load 2462934?\n\n"
+        "RTS Financial\nRemit to: PO Box 840267\n"
+        "Account Number: 2657147\nBank: Fifth Third\n"
+    )
+
+    out = DetectSensitiveChange().run(
+        DetectSensitiveChangeInput(subject="Payment status", body=body), ctx
+    )
+
+    assert out.action is SensitiveAction.CONTINUE
+    assert out.hard_bank is False

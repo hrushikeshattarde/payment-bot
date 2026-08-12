@@ -535,9 +535,16 @@ _BANK_REQUEST_PHRASES = (
 #: Bare "bank" belongs here rather than in the request list: "update our bank account" must
 #: escalate, while "Bank Name: Fifth Third Bank" in a remit-to footer must not. Requiring a
 #: nearby change word is what separates those.
+#: "banking" is listed separately from "bank" because the word boundaries that stopped "ach"
+#: matching inside "each" also stop "bank" matching inside "banking" — and "our banking
+#: details have changed" is one of the commonest ways a redirect is announced. Missed live:
+#: a TRU Funding rate-verification email whose body read "our banking and address details
+#: have recently changed", followed by a full account and routing number, scored no flags at
+#: all and would have been answered with nobody alerted.
 _BANK_DETAIL_PHRASES = (
     "routing number", "account number", "ach", "direct deposit", "remittance",
-    "payment method", "remit to", "remit-to", "bank", "bank account", "bank details",
+    "payment method", "remit to", "remit-to", "bank", "banking", "bank account",
+    "bank details", "banking details",
 )  # fmt: skip
 #: Words that turn a payment-detail mention into an instruction aimed at us.
 _CHANGE_WORDS = (
@@ -573,6 +580,21 @@ _BANK_CHANGE_PASSIVE_RE = re.compile(
 _BANK_CHANGE_REQUEST_RE = re.compile(
     rf"(?:{_BANK_CHANGE_ACTIVE_RE.pattern}|{_BANK_CHANGE_PASSIVE_RE.pattern})", re.IGNORECASE
 )
+#: An account or routing number actually supplied in the message — "Account Number:
+#: 4941701385", "Routing Number: 121000248".
+#:
+#: This is what separates a redirect from the boilerplate the §7 narrowing deliberately lets
+#: through. A factor's standing signature carries the numbers but no change verb. Template
+#: boilerplate carries the change verb but names a *company* ("remittance is updated to OTR
+#: Solutions"), not an account. **Both together — "our banking details have changed" plus
+#: fresh credentials — is the payment-redirect shape**, and it is treated as hard evidence
+#: however passive the grammar, because that combination is not something a routine
+#: signature block produces.
+_SUPPLIED_ACCOUNT_RE = re.compile(
+    r"\b(?:routing|account|acct)\s*(?:number|no\.?|#)?\s*[:#-]?\s*\d{6,17}\b",
+    re.IGNORECASE,
+)
+
 _CONTACT_PHRASES = (
     "change email", "update email", "new email address", "change our email",
     "update contact", "new contact email", "change of email",
@@ -762,11 +784,24 @@ class DetectSensitiveChange(Tool):
             _add(flags, SensitiveFlag.BANK_CHANGE)
             evidence.append(f"bank: change instructed — {' '.join(match.group(0).split())!r}")
             hard_bank = True
+        # A change announcement plus supplied credentials is a redirect, whatever the
+        # grammar. Detail-first wording is normally SOFT (§7: factoring templates all say
+        # "remittance is updated to X"), but those templates name a company — they do not
+        # hand over an account and routing number. See `_SUPPLIED_ACCOUNT_RE`.
+        credentials_supplied = _SUPPLIED_ACCOUNT_RE.search(written)
         for match in _BANK_CHANGE_PASSIVE_RE.finditer(written):
             if _within_negation(match.span(), negated):
                 continue
             _add(flags, SensitiveFlag.BANK_CHANGE)
-            evidence.append(f"bank: change requested — {' '.join(match.group(0).split())!r}")
+            if credentials_supplied:
+                hard_bank = True
+                evidence.append(
+                    f"bank: change announced with new account details — "
+                    f"{' '.join(match.group(0).split())!r} + "
+                    f"{' '.join(credentials_supplied.group(0).split())!r}"
+                )
+            else:
+                evidence.append(f"bank: change requested — {' '.join(match.group(0).split())!r}")
 
         # Asking us to *ratify* a change is hard, whatever shape the wording takes.
         if _CONFIRM_CHANGE_RE.search(written):

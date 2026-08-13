@@ -789,6 +789,7 @@ class PaymentBotPipeline:
         try:
             factors: dict[str, list[str]] = {}
             carriers: set[str] = set()
+            on_file: set[str] = set()
             for load_id in load_ids:
                 system = route_load(load_id).system
                 if system is System.QUICKBOOKS:
@@ -799,6 +800,7 @@ class PaymentBotPipeline:
                     auth = ctx.tp.get_authorization_context(load_id)
                 else:
                     continue
+                on_file.update(auth.authorized_emails)
                 if not auth.factoring_company:
                     continue
                 factors.setdefault(auth.factoring_company, []).append(load_id)
@@ -813,6 +815,7 @@ class PaymentBotPipeline:
                     load_ids=tuple(loads),
                     settings=self._settings,
                     carrier_companies=tuple(sorted(carriers)),
+                    carrier_on_file_emails=tuple(sorted(on_file)),
                 )
                 if candidate is None:
                     continue

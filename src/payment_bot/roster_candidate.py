@@ -31,6 +31,7 @@ from typing import Any
 from payment_bot.config import Settings
 from payment_bot.logging import get_logger
 from payment_bot.tools.shared import (
+    _FREE_MAIL_DOMAINS,
     _factor_names_match,
     _sender_domain,
     company_acronym,
@@ -62,6 +63,12 @@ class RosterCandidate:
     #: How the domain resembles the factor name, or "" when it does not resemble it at all.
     #: A hint for the reviewer, never evidence: resemblance is what an attacker manufactures.
     resemblance: str = ""
+    #: True when the sender is on a free-mail domain. A roster entry is then **impossible**,
+    #: not merely inadvisable — see :meth:`render`.
+    free_mail: bool = False
+    #: The addresses already authorised on the carrier's own record. Printed so a near-miss
+    #: is visible at a glance, which is the whole diagnosis in the free-mail case.
+    carrier_on_file_emails: tuple[str, ...] = ()
 
     @property
     def conflicting_domains(self) -> tuple[str, ...]:
@@ -94,7 +101,10 @@ class RosterCandidate:
             )
         lines.append(f"  resemblance   : {self.resemblance or 'none — the domain does not echo the name'}")
 
-        if self.conflicting_domains:
+        # Suppressed on free-mail: "we hold apexcapitalcorp.com, they wrote from gmail.com"
+        # invites comparing two things that were never comparable, and the block below says
+        # something more useful about the same sender.
+        if self.conflicting_domains and not self.free_mail:
             lines += [
                 "",
                 "  ** WE ALREADY HOLD A DIFFERENT DOMAIN FOR THIS FACTOR **",
@@ -104,12 +114,50 @@ class RosterCandidate:
                 "     ordinary. So is a lookalike. Ask the company which domains are theirs,",
                 "     using a contact from OUR records, never one from the mail in question.",
             ]
-        else:
+        elif not self.free_mail:
             lines += [
                 "",
                 "  We hold no other domain for this factor, so nothing corroborates this one",
                 "  except the mail that is asking to be trusted. Verify out of band.",
             ]
+
+        if self.free_mail:
+            # A roster entry keys a DOMAIN to a factor, so "gmail.com" for Apex Capital
+            # Corp would authorise every Gmail user on earth as that factor. The generator
+            # excludes free-mail for this exact reason and so must this packet — the
+            # dangerous thing about a paste-ready instruction is that it gets pasted.
+            lines += [
+                "",
+                f"  NO ROSTER ENTRY IS POSSIBLE — {self.sender_domain} is a free-mail domain.",
+                "  A roster entry authorises a DOMAIN for a factor, so this one would",
+                f"  authorise every {self.sender_domain} address on earth as"
+                f" {self.factor_on_file}.",
+                "",
+                "  This shape is usually the CARRIER writing in, not the factor, from an",
+                "  address that is not on their record. The fix is on the carrier record,",
+                "  not in the roster: add the address there and the bot answers this sender",
+                "  from then on, with no code or roster change.",
+            ]
+            if self.carrier_on_file_emails:
+                lines += [
+                    "",
+                    "  Authorised on the carrier's record today:",
+                    *(f"     {addr}" for addr in self.carrier_on_file_emails),
+                    f"     sender: {self.sender_email}",
+                    "",
+                    "  COMPARE THOSE CAREFULLY. A free-mail address one word away from a",
+                    "  genuine one is both what a carrier's new billing alias looks like and",
+                    "  what someone who read the genuine one would register. Nothing in the",
+                    "  mail can tell them apart — confirm with the carrier on a number from",
+                    "  OUR records before adding it.",
+                ]
+            else:
+                lines += [
+                    "",
+                    "  The carrier's record carries no addresses at all, so there is nothing",
+                    "  to compare this against. Confirm with the carrier before adding it.",
+                ]
+            return "\n".join(lines)
 
         lines += [
             "",
@@ -193,6 +241,7 @@ def build_candidate(
     load_ids: tuple[str, ...],
     settings: Settings,
     carrier_companies: tuple[str, ...] = (),
+    carrier_on_file_emails: tuple[str, ...] = (),
 ) -> RosterCandidate | None:
     """Assemble the packet, or ``None`` when a roster entry is not the missing piece.
 
@@ -234,6 +283,8 @@ def build_candidate(
         recorded_domains=recorded,
         carrier_count=count,
         resemblance=_describe_resemblance(domain, factor),
+        free_mail=domain in _FREE_MAIL_DOMAINS,
+        carrier_on_file_emails=carrier_on_file_emails,
     )
 
 

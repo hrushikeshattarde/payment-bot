@@ -255,3 +255,96 @@ def test_the_proposed_key_links_to_the_factor_on_the_load() -> None:
     assert json.loads("{" + candidate.entry_json().rstrip(",") + "}") == {
         candidate.roster_key: ["getpartnersfunding.com"]
     }
+
+
+# --- free-mail: the packet must not propose authorising the world ------------
+FREE_MAIL_SENDER = "alwaystherelogisticsbilling@gmail.com"
+ON_FILE = ("alwaystherelogistics@gmail.com", "loads4logistics@gmail.com")
+
+
+def _free_mail_candidate() -> Any:
+    return build_candidate(
+        sender_email=FREE_MAIL_SENDER,
+        factor_on_file="Apex Capital Corp",
+        load_ids=("2487173", "2476175"),
+        settings=_settings(factoring_domains={"apex capital corp": ("apexcapitalcorp.com",)}),
+        carrier_companies=("ALWAYS THERE LOGISTICS INC",),
+        carrier_on_file_emails=ON_FILE,
+    )
+
+
+def test_a_free_mail_sender_is_never_offered_as_a_roster_entry() -> None:
+    """The bug this pins was mine, and it was the dangerous kind: paste-ready and wrong.
+
+    A roster entry keys a DOMAIN to a factor. Proposing ``"apex capital corp":
+    ["gmail.com"]`` would have authorised every Gmail address on earth as Apex Capital
+    Corp — and it was rendered as a line to copy, under a heading saying a human decides,
+    which is exactly the presentation that gets a thing pasted.
+
+    The roster generator has excluded free-mail from the start for this reason. The packet
+    proposing what the generator refuses to produce is the inconsistency being closed.
+    """
+
+    candidate = _free_mail_candidate()
+    assert candidate is not None
+    rendered = candidate.render()
+
+    assert candidate.free_mail is True
+    assert "NO ROSTER ENTRY IS POSSIBLE" in rendered
+    # The paste-ready line must be absent entirely, not merely discouraged.
+    assert '"apex capital corp"' not in rendered
+    assert "gmail.com\"]" not in rendered
+    assert "factoring_domains_manual.json" not in rendered
+
+
+def test_the_free_mail_packet_shows_the_addresses_already_on_the_record() -> None:
+    """The near-miss is the whole diagnosis, and only a side-by-side makes it visible.
+
+    Live: the carrier's record carries ``alwaystherelogistics@gmail.com`` and the sender
+    wrote from ``alwaystherelogisticsbilling@gmail.com`` — one inserted word apart, on a
+    domain where anyone may register any handle. Both a new billing alias and an
+    impersonation look precisely like this, and nothing in the mail separates them.
+    """
+
+    rendered = _free_mail_candidate().render()
+
+    for addr in ON_FILE:
+        assert addr in rendered
+    assert FREE_MAIL_SENDER in rendered
+    assert "COMPARE THOSE CAREFULLY" in rendered
+    # And it must point at the remedy that actually works for a carrier sender.
+    assert "carrier record" in rendered
+
+
+def test_the_free_mail_packet_drops_the_domain_conflict_block() -> None:
+    """"We hold apexcapitalcorp.com, they wrote from gmail.com" compares two unlike things."""
+
+    assert "WE ALREADY HOLD A DIFFERENT DOMAIN" not in _free_mail_candidate().render()
+
+
+def test_a_carrier_record_with_no_addresses_says_so() -> None:
+    """Silence would read as "nothing to compare, so nothing to worry about"."""
+
+    candidate = build_candidate(
+        sender_email=FREE_MAIL_SENDER,
+        factor_on_file="Apex Capital Corp",
+        load_ids=("2487173",),
+        settings=_settings(),
+        carrier_on_file_emails=(),
+    )
+    assert candidate is not None
+    assert "no addresses at all" in candidate.render()
+
+
+def test_a_corporate_domain_still_gets_its_paste_ready_entry() -> None:
+    """The free-mail branch must not swallow the ordinary case."""
+
+    candidate = build_candidate(
+        sender_email=SENDER,
+        factor_on_file=FACTOR,
+        load_ids=("298891",),
+        settings=_settings(),
+    )
+    assert candidate is not None and candidate.free_mail is False
+    assert "factoring_domains_manual.json" in candidate.render()
+    assert "NO ROSTER ENTRY IS POSSIBLE" not in candidate.render()

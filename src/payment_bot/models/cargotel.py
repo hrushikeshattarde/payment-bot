@@ -289,13 +289,42 @@ class CargoTelLoad(BaseModel):
 _CO_SUFFIX_RE = re.compile(r"\s+c\s*[/.]\s*o\.?\s+", re.IGNORECASE)
 
 
-#: "Check Net 30" → 30. Tolerant of the payment method sharing the field, because it does:
-#: the live values are "Check Net 30", not "Net 30".
-_NET_TERMS_RE = re.compile(r"\bnet\s*(\d{1,3})\b", re.IGNORECASE)
+#: The day count in a terms string. Two spellings, because CargoTel's ``ap_terms`` dropdown
+#: uses both — read off the live carrier record, its whole option list is:
+#:
+#:     ACH 2 Day QuickPay      Check 2 Day QuickPay
+#:     ACH 7 Day QuickPay      Check 7 Day QuickPay
+#:     ACH Net 30              Check Net 30
+#:
+#: so the universe is three terms (2 Day QuickPay, 7 Day QuickPay, Net 30) crossed with two
+#: payment methods (ACH, Check) — six values, and the list is closed. Only the
+#: ``Net`` pair used to parse, which left FOUR of the six terms yielding no day count at
+#: all: they fell through to ``INVOICED_NO_TERMS`` and the reply said the invoice was being
+#: processed and gave no date, on loads whose terms said 2 or 7 days.
+#:
+#: The method prefix is ignored on purpose — ACH and Check differ in how the money moves,
+#: not in when it is due, and the field has always carried both.
+_TERM_DAYS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bnet\s*(\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"\b(\d{1,3})\s*day\b", re.IGNORECASE),
+)
 
 
 def net_days_in(terms: str | None) -> int | None:
     """Extract the day count from a terms string, or ``None`` if there isn't one.
+
+    Both "Check Net 30" → 30 and "Check 2 Day QuickPay" → 2. The count is applied by
+    :func:`~payment_bot.domain.cargotel.resolve_payment` the same way whichever spelling it
+    came from: ``invoice_received + days``, calendar days, returned exactly as the arithmetic
+    gives it — the established rule on this path, which never shifts a date to a pay day.
+
+    That equivalence is an assumption about QuickPay, and the one thing here nobody has
+    confirmed against the business: whether a QuickPay term counts from invoice receipt like
+    Net 30 does, and whether "2 Day" means calendar or business days. The two answers agree
+    for a Monday invoice and diverge for a Thursday one, and a two-day term makes a weekend
+    landing far more visible than a thirty-day term ever did. Left identical to Net rather
+    than given an invented business-day rule, because a rule nobody verified is worse than
+    an arithmetic everyone can check.
 
     "Due On Receipt" deliberately returns ``None`` rather than 0. Zero would flow through
     the arithmetic and produce "payable today", which reads as a promise; ``None`` routes to
@@ -304,5 +333,8 @@ def net_days_in(terms: str | None) -> int | None:
 
     if not terms:
         return None
-    match = _NET_TERMS_RE.search(terms)
-    return int(match.group(1)) if match else None
+    for pattern in _TERM_DAYS_PATTERNS:
+        match = pattern.search(terms)
+        if match:
+            return int(match.group(1))
+    return None

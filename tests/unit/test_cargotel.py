@@ -190,6 +190,76 @@ def test_terms_are_read_per_carrier_not_assumed(terms: str | None, expected: int
     assert net_days_in(terms) == expected
 
 
+#: Every option in CargoTel's `ap_terms` dropdown, read off the live carrier record for
+#: client 81146 on 2026-08-13 rather than assembled from memory. The list is closed: three
+#: terms, two payment methods, and the two group separators the select uses as headings.
+LIVE_AP_TERMS_OPTIONS: tuple[tuple[str, int | None], ...] = (
+    ("--- ACH ---", None),
+    ("ACH 2 Day QuickPay", 2),
+    ("ACH 7 Day QuickPay", 7),
+    ("ACH Net 30", 30),
+    ("--- Check ---", None),
+    ("Check 2 Day QuickPay", 2),
+    ("Check 7 Day QuickPay", 7),
+    ("Check Net 30", 30),
+)
+
+
+@pytest.mark.parametrize(("terms", "expected"), LIVE_AP_TERMS_OPTIONS)
+def test_every_option_the_dropdown_offers_resolves(terms: str, expected: int | None) -> None:
+    """Four of the six real terms used to yield nothing at all.
+
+    Only the ``Net`` pair parsed, so a load on any QuickPay term fell through to
+    INVOICED_NO_TERMS and the reply told the sender their invoice was being processed and
+    gave no date — on a load whose terms said two days. Not a wrong date; a withheld one,
+    which is quieter and just as unhelpful.
+
+    Parametrised over the whole dropdown rather than the two spellings that were broken, so
+    a future option added to the select fails here as an untested value rather than silently
+    becoming another no-date load.
+    """
+
+    assert net_days_in(terms) == expected
+
+
+def test_the_group_headings_in_the_select_are_not_terms() -> None:
+    """"--- ACH ---" is a heading. It must not read as a term, and has no digits to find."""
+
+    assert net_days_in("--- ACH ---") is None
+    assert net_days_in("--- Check ---") is None
+
+
+@pytest.mark.parametrize(
+    ("method_a", "method_b"),
+    [("ACH 2 Day QuickPay", "Check 2 Day QuickPay"), ("ACH Net 30", "Check Net 30")],
+)
+def test_the_payment_method_never_changes_the_day_count(method_a: str, method_b: str) -> None:
+    """ACH and Check differ in how the money moves, not in when it is due."""
+
+    assert net_days_in(method_a) == net_days_in(method_b)
+
+
+def test_quickpay_counts_from_the_invoice_like_net_does() -> None:
+    """The assumption this rests on, made explicit so it can be found and challenged.
+
+    Nobody has confirmed with the business whether a QuickPay term counts from invoice
+    receipt (as Net 30 does) or from something else, nor whether "2 Day" means calendar or
+    business days. It is implemented identically to Net — invoice_received + N calendar
+    days, returned exactly as the arithmetic gives it, which is this path's documented rule
+    — rather than given an invented business-day adjustment.
+
+    If that turns out to be wrong this test is the one that should fail, and it names what
+    to change.
+    """
+
+    load = _load(invoice_received="07/13/2026", ap_terms="Check 2 Day QuickPay")
+    state = resolve_payment(load)
+
+    assert state.state is BillingState.SCHEDULED
+    assert state.expected_payment_date == date(2026, 7, 15)  # +2 calendar days, no shift
+    assert state.net_days == 2
+
+
 def test_no_invoice_means_no_date_and_a_paperwork_answer() -> None:
     state = resolve_payment(_load(invoice_received=None, bol05=False, carrier_invoices=None))
 

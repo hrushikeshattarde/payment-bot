@@ -140,3 +140,60 @@ def test_the_tld_is_excluded_from_the_acronym_search(sender: str, expected: str)
     # "National Equipment Transport" really does abbreviate to a TLD, which is the point.
     assert company_acronym("National Equipment Transport") == "net"
     assert "net" not in _domain_without_tld("a@bwc.fleetsmarts.net")
+
+
+# ---------------------------------------------------------------------------
+# `exact:` keys — for a factor whose one distinctive word belongs to somebody else.
+#
+# "G Squared Funding, LLC" reduces to the single token "squared" once the generic
+# ones are dropped, so an ordinary roster key for it also matches "DB Squared,
+# Inc." — 11 carriers under an unrelated factor. No choice of key avoids that:
+# the collision is in the matching, not in the keys.
+# ---------------------------------------------------------------------------
+EXACT_KEY = "exact:g squared funding, llc"
+
+
+@pytest.mark.unit
+def test_an_exact_key_matches_only_that_factor() -> None:
+    assert _factor_names_match(EXACT_KEY, "G Squared Funding, LLC") is True
+    # The same company's second record in Transport Pro, spelled without the comma.
+    assert _factor_names_match(EXACT_KEY, "G Squared Funding LLC") is True
+
+
+@pytest.mark.unit
+def test_an_exact_key_does_not_link_on_a_shared_token() -> None:
+    """The whole point. A plain key here would authorise a different company's loads."""
+
+    assert _factor_names_match(EXACT_KEY, "DB Squared, Inc.") is False
+    assert _factor_names_match(EXACT_KEY, "Squared Away Logistics") is False
+    # And for contrast, the plain key really does collide — this is what is being avoided.
+    assert _factor_names_match("g squared funding, llc", "DB Squared, Inc.") is True
+
+
+@pytest.mark.unit
+def test_the_exactness_is_after_normalisation_not_byte_for_byte() -> None:
+    """Punctuation and case still vary between the export and the load."""
+
+    assert _factor_names_match("exact:G SQUARED FUNDING LLC", "g squared funding, llc") is True
+
+
+@pytest.mark.unit
+def test_an_exact_key_is_narrower_than_a_plain_one_and_that_costs_something() -> None:
+    """Recorded so the trade-off is visible: a spelling it does not cover simply misses.
+
+    The fuzzy match exists because the export and the load spell factors differently, and an
+    exact key gives that up. If a third G Squared record appears without "LLC", it will not
+    match and the load will escalate — which is the failure to look for first.
+    """
+
+    assert _factor_names_match(EXACT_KEY, "G Squared Funding") is False
+    assert _factor_names_match("g squared funding, llc", "G Squared Funding") is True
+
+
+@pytest.mark.unit
+def test_plain_keys_are_completely_unaffected() -> None:
+    """The prefix is opt-in; nothing else in the roster changes behaviour."""
+
+    assert _factor_names_match("rts financial", "RTS Financial Service, Inc") is True
+    assert _factor_names_match("far west capital", "Far West Capital") is True
+    assert _factor_names_match("cashway funding", "CT Cash LLC") is False

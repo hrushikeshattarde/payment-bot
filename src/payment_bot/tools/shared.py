@@ -426,6 +426,22 @@ def _normalize_company_name(name: str) -> str:
     return " ".join(_NAME_PUNCT_RE.sub("", name.lower()).split())
 
 
+#: Roster-key prefix meaning "this key matches ONLY this factor name, exactly".
+#:
+#: The escape hatch for a company whose one distinctive word is shared with an unrelated
+#: company. "G Squared Funding, LLC" reduces to the single token ``squared`` once the
+#: generic ones are dropped — so an ordinary key for it also matches "DB Squared, Inc.",
+#: eleven carriers under a different factor, and would let G Squared's domain vouch for
+#: their loads. Neither name can be spelled to avoid the other; the roster README's usual
+#: advice ("use a new key") does not reach this, because the collision is in the matching
+#: rather than in the keys.
+#:
+#: Use it only when the collision is real and named in the entry's evidence note. A plain
+#: key remains right for almost everything: the fuzzy match exists because the export and
+#: the load spell the same factor differently, and exactness costs that.
+_EXACT_FACTOR_PREFIX = "exact:"
+
+
 def _factor_names_match(configured_name: str, on_file: str) -> bool:
     """Does a configured factor entry name the factor recorded on the load?
 
@@ -443,6 +459,10 @@ def _factor_names_match(configured_name: str, on_file: str) -> bool:
     That widens nothing about which words may link — the generic-token rule is untouched
     — it only stops one spelling of the same name reading as a different company.
     """
+
+    if configured_name.lower().startswith(_EXACT_FACTOR_PREFIX):
+        wanted = _normalize_company_name(configured_name[len(_EXACT_FACTOR_PREFIX) :])
+        return bool(wanted) and wanted == _normalize_company_name(on_file)
 
     key = _normalize_company_name(configured_name)
     name = _normalize_company_name(on_file)

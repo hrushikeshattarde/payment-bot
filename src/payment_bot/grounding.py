@@ -14,7 +14,10 @@ The extraction is deliberately conservative and format-driven:
 
 A weekday *name* is not a groundable token — nothing in a tool result is a weekday word to
 compare against — so :func:`find_weekday_mismatches` checks it arithmetically instead, from
-the date it is printed beside.
+the date it is printed beside. Neither is the *tense* a date is written in: "payment is
+scheduled for August 8" and "payment was scheduled for August 8" ground identically, and
+only a calendar says which one is a lie. :func:`find_tense_mismatches` takes today as an
+argument and checks that too.
 
 Money is compared as :class:`~decimal.Decimal`, so ``$4,650`` and ``4650.00`` match.
 This is a heuristic that errs toward *blocking*; it is not a natural-language checker.
@@ -151,13 +154,18 @@ def find_weekday_mismatches(text: str) -> list[WeekdayMismatch]:
     return out
 
 
-def extract_date_tokens(text: str) -> set[date]:
-    """Return the distinct calendar dates appearing in ``text`` (ISO or ``Month DD, YYYY``)."""
+def _iter_dates(text: str) -> list[tuple[date, int]]:
+    """Every date in ``text`` as ``(value, start_offset)``, in the order it is written.
 
-    out: set[date] = set()
+    The offset is what :func:`find_tense_mismatches` needs — the wording that governs a date
+    sits in front of it — and carrying it here keeps one date parser in this module rather
+    than two that could drift on which spellings they accept.
+    """
+
+    found: list[tuple[date, int]] = []
     for iso in _ISO_DATE_RE.finditer(text):
         try:
-            out.add(date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3))))
+            found.append((date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3))), iso.start()))
         except ValueError:
             continue
     for textual in _TEXT_DATE_RE.finditer(text):
@@ -165,9 +173,123 @@ def extract_date_tokens(text: str) -> set[date]:
         if month_num is None:
             continue
         try:
-            out.add(date(int(textual.group(3)), month_num, int(textual.group(2))))
+            found.append(
+                (date(int(textual.group(3)), month_num, int(textual.group(2))), textual.start())
+            )
         except ValueError:
             continue
+    return sorted(found, key=lambda item: item[1])
+
+
+def extract_date_tokens(text: str) -> set[date]:
+    """Return the distinct calendar dates appearing in ``text`` (ISO or ``Month DD, YYYY``)."""
+
+    return {value for value, _ in _iter_dates(text)}
+
+
+# --- tense ------------------------------------------------------------------
+#: An outright future modal. Read before anything else, because it governs whatever follows
+#: it: "will be issued" is a promise, however past-tense the participle looks on its own.
+_MODAL_FUTURE_RE = re.compile(r"\bwill\b|\bshall\b|\bgoing\s+to\b", re.IGNORECASE)
+
+#: Wording that puts a date in the future. Deliberately the phrasings a payment reply
+#: actually uses, not a general grammar: this fires on real drafts or not at all.
+_FUTURE_CUE_RE = re.compile(
+    r"\b(?:is|are|remains?|stays?)\s+(?:currently\s+|still\s+|being\s+|now\s+)*"
+    r"(?:scheduled|set|due|expected|planned|slated|going)\b"
+    r"|\b(?:scheduled|expected|slated|planned|set)\s+(?:for|on)\b"
+    r"|\bdue\s+(?:on|for|to\s+be)\b"
+    r"|\b(?:goes|go|going)\s+out\b",
+    re.IGNORECASE,
+)
+
+#: Wording that already places the date in the past. Checked first, so the fix for a
+#: mismatch — "was scheduled for Friday, August 7" — is not itself flagged.
+_PAST_CUE_RE = re.compile(
+    r"\b(?:was|were|had|has\s+been|have\s+been)\b"
+    r"|\b(?:paid|delivered|invoiced|billed|issued|sent|received|processed|cleared"
+    r"|released|went|posted|settled|completed)\b",
+    re.IGNORECASE,
+)
+
+#: Clause boundaries. Tense is a property of a date's own clause: "the invoice was received
+#: on July 9 and payment is scheduled for August 7" carries both tenses in one sentence, and
+#: a window that ran back past the "and" would find "was" and wave the second half through.
+_CLAUSE_BREAK_RE = re.compile(
+    r"[.;:!?\n]|\b(?:and|but|while|though|although|however|whereas|then)\b", re.IGNORECASE
+)
+
+#: How far back to read for the wording that governs a date. Long enough for "payment is
+#: currently scheduled for Friday, " and no longer — a wider window starts borrowing verbs
+#: from whatever came before.
+_TENSE_WINDOW = 56
+
+
+@dataclass(frozen=True, slots=True)
+class TenseMismatch:
+    """A date already in the past that the draft describes as still to come."""
+
+    value: date
+    phrase: str  # the future-tense wording, as written in the draft
+    days_past: int
+
+
+def _governing_clause(text: str, start: int) -> str:
+    """The run-up to the date at ``start``, cut back to its own clause."""
+
+    window = text[max(0, start - _TENSE_WINDOW) : start]
+    breaks = list(_CLAUSE_BREAK_RE.finditer(window))
+    return window[breaks[-1].end() :] if breaks else window
+
+
+def _future_cue(clause: str) -> re.Match[str] | None:
+    """The wording placing ``clause`` in the future, or ``None`` if it is already past.
+
+    Three questions in order, and the order is the whole of it. A modal outranks everything
+    after it, so "will be issued" is not read as past on the strength of "issued". Failing
+    that, an explicit past marker settles it — otherwise "was scheduled for" would be caught
+    by the very check whose fix it is. Only then does the present-tense promise count.
+    """
+
+    modal = _MODAL_FUTURE_RE.search(clause)
+    if modal is not None:
+        return modal
+    if _PAST_CUE_RE.search(clause):
+        return None
+    return _FUTURE_CUE_RE.search(clause)
+
+
+def find_tense_mismatches(text: str, today: date) -> list[TenseMismatch]:
+    """Return every past date in ``text`` written as though it were still ahead.
+
+    The gap this closes is the one grounding and the weekday check both leave open: the date
+    is real, the date is cited, the weekday beside it is right, and the sentence is still
+    false because the day has been and gone. Observed live on load 302866 — "Payment is
+    scheduled for Friday, August 8, 2026", drafted on August 13 — and on load 303355,
+    "scheduled for payment on Friday, August 7, 2026", drafted on the 13th as well. A carrier
+    reads that as money still on its way.
+
+    Only this direction is checked. Past wording on a *future* date reads fine far more often
+    than not ("payment was scheduled for August 21" is a scheduling decision already taken),
+    and a check that fires on a correct reply costs more than the one it catches.
+    """
+
+    out: list[TenseMismatch] = []
+    seen: set[date] = set()
+    for value, start in _iter_dates(text):
+        if value >= today or value in seen:
+            continue
+        cue = _future_cue(_governing_clause(text, start))
+        if cue is None:
+            continue
+        seen.add(value)
+        out.append(
+            TenseMismatch(
+                value=value,
+                phrase=cue.group().strip(),
+                days_past=(today - value).days,
+            )
+        )
     return out
 
 

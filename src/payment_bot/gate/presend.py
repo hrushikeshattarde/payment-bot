@@ -26,6 +26,9 @@ Checks (all must pass):
 12. **Weekday consistency** — every weekday named in the reply is the real weekday of the
     date beside it. Grounding checks dates, not the adjectives attached to them, so a
     correct-and-grounded date carrying a wrong weekday passed all eleven checks above.
+13. **Tense consistency** — no date that has already passed is written as though it were
+    still ahead. Same blind spot one step further out: checks 3 and 12 settle that a date
+    is real and correctly named, and neither of them knows what today is.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from payment_bot.errors import ClientError, ToolError
 from payment_bot.grounding import (
     extract_date_tokens,
     extract_money_tokens,
+    find_tense_mismatches,
     find_weekday_mismatches,
 )
 from payment_bot.logging import get_logger
@@ -169,6 +173,7 @@ class PreSendGate:
             self._check_placeholders(draft),
             self._check_grounding(draft, ctx),
             self._check_weekday_consistency(draft),
+            self._check_tense_consistency(draft, ctx),
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
             self._check_carrier_consistency(draft, email, ctx),
@@ -575,4 +580,33 @@ class PreSendGate:
             name="weekday_consistency",
             passed=True,
             detail="every weekday named matches its date",
+        )
+
+    def _check_tense_consistency(self, draft: SubmitDraftOutput, ctx: ToolContext) -> GateCheck:
+        """Companion to weekday consistency: the date is named right, but is it still ahead?
+
+        Blocks the load-302866 shape — "Payment is scheduled for Friday, August 8, 2026" in a
+        draft written on August 13. Every other check is satisfied: the date came from
+        `cgt_get_load_status`, it is in the ledger, and it is cited. What none of them holds
+        is a calendar, so a promise about a day already gone reads as a promise still good.
+        """
+
+        mismatches = find_tense_mismatches(draft.reply_body, ctx.today)
+        if mismatches:
+            stated = "; ".join(
+                f'"{m.phrase}" for {m.value.isoformat()}, {m.days_past} day(s) ago'
+                for m in mismatches
+            )
+            return GateCheck(
+                name="tense_consistency",
+                passed=False,
+                detail=(
+                    f"draft writes a past date as still upcoming (today is "
+                    f"{ctx.today.isoformat()}): {stated}"
+                ),
+            )
+        return GateCheck(
+            name="tense_consistency",
+            passed=True,
+            detail="no past date is described as upcoming",
         )

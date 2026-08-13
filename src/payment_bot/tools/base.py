@@ -16,6 +16,7 @@ from __future__ import annotations
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, ValidationError
@@ -50,6 +51,13 @@ class ToolContext:
     #: reached with this unset reports a wiring error rather than a missing load, because
     #: those two need different fixes.
     cargotel: CargoTelClient | None = None
+    #: The calendar date this run is answering on. Nothing else in the system knew what day
+    #: it was, which is why a draft could say "payment is scheduled for Friday, August 8"
+    #: five days after August 8 had passed and clear every check. One value per run, held
+    #: here rather than read from the clock at each call site, so a tool that renders a date
+    #: and the gate that judges its tense cannot disagree across a midnight boundary.
+    #: Injected — tests pin it, because fixture dates are fixed and "today" is not.
+    today: date = field(default_factory=date.today)
 
 
 class Tool(ABC):

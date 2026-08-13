@@ -20,6 +20,7 @@ Anything unexpected escalates rather than sends: the system fails closed.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 
 from payment_bot.agent import (
@@ -153,8 +154,14 @@ class PaymentBotPipeline:
         audit_sink: AuditSink | None = None,
         registry: ToolRegistry | None = None,
         allow_factoring: bool | None = None,
+        today: date | None = None,
     ) -> None:
         self._tp = tp
+        # Resolved once per pipeline rather than per email so a long-running processor cannot
+        # render a date under one day and judge its tense under the next. Injectable because
+        # fixture data has fixed dates: a test asserting "Thursday, August 6, 2026" is only
+        # meaningful against a pinned today.
+        self._today = today or date.today()
         # Optional and defaulted so every existing caller — the demo runner, the local
         # runner, the integration tests — keeps working without a CargoTel client. Unset,
         # 6-digit loads behave exactly as they did before this path existed.
@@ -207,6 +214,7 @@ class PaymentBotPipeline:
             ledger=ledger,
             correlation_id=correlation_id,
             settings=self._settings,
+            today=self._today,
         )
 
         # 1. Shared intake & safety (deterministic, §3.3) --------------------

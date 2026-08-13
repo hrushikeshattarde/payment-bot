@@ -25,10 +25,13 @@ from payment_bot.clients import (
 from payment_bot.clients.cargotel_html import parse_carrier_html, parse_load_html
 from payment_bot.clients.llm import LlmResponse, ToolUseBlock
 from payment_bot.config import Settings
+from payment_bot.grounding import GroundingLedger, find_weekday_mismatches
 from payment_bot.logging import InMemoryAuditSink
 from payment_bot.models import InboundEmail
 from payment_bot.pipeline import Outcome, PaymentBotPipeline
 from payment_bot.sample_data import sample_transport_pro_client
+from payment_bot.tools.base import ToolContext
+from payment_bot.tools.cargotel import CgtGetLoadStatus, CgtLoadIdInput, CgtLoadStatusOutput
 
 pytestmark = pytest.mark.integration
 
@@ -107,6 +110,14 @@ def _email(subject: str = f"Payment status for load {LOAD_ID}", body: str = "") 
     )
 
 
+#: The day these fixtures are answered on. The page data is dated early August 2026 and the
+#: draft says payment "is expected on Thursday, August 6" — true on the 3rd, a false promise
+#: on the 13th. Pinned rather than left to the clock so the tense check judges the draft
+#: against the calendar the fixture was written for; `test_tense_consistency.py` covers the
+#: passed-date case deliberately.
+TODAY = date(2026, 8, 3)
+
+
 def _pipeline(
     gmail: MockGmailClient,
     slack: MockSlackClient,
@@ -124,6 +135,7 @@ def _pipeline(
         approval_resolver=ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)),
         audit_sink=audit,
         settings=settings or _settings(),
+        today=TODAY,
     )
 
 
@@ -225,10 +237,6 @@ def test_a_load_awaiting_paperwork_is_not_given_a_date() -> None:
 
     cargotel = _clients(invoice_received=None, bol05=False, carrier_invoices=None)
 
-    from payment_bot.grounding import GroundingLedger
-    from payment_bot.tools.base import ToolContext
-    from payment_bot.tools.cargotel import CgtGetLoadStatus, CgtLoadIdInput
-
     ctx = ToolContext(
         tp=sample_transport_pro_client(),
         cargotel=cargotel,
@@ -241,6 +249,68 @@ def test_a_load_awaiting_paperwork_is_not_given_a_date() -> None:
     assert out.expected_payment_date is None
     assert out.missing_documents == ["BOL 05", "carrier invoice"]
     assert date(2026, 8, 6) not in ctx.ledger.grounded_dates
+
+
+def _status(*, today: date = TODAY, **page_kwargs: object) -> CgtLoadStatusOutput:
+    """Run ``cgt_get_load_status`` against the fixture page, as of ``today``."""
+
+    ctx = ToolContext(
+        tp=sample_transport_pro_client(),
+        cargotel=_clients(**page_kwargs),
+        ledger=GroundingLedger(),
+        correlation_id="t",
+        settings=_settings(),
+        today=today,
+    )
+    return CgtGetLoadStatus().run(CgtLoadIdInput(load_id=LOAD_ID), ctx)
+
+
+def test_every_date_leaves_the_tool_already_written_out() -> None:
+    """Load 302866: a bare `date` is a request for the model to name the weekday itself.
+
+    It named two, and got both wrong by a day — Saturday 2026-08-08 as "Friday" and
+    Thursday 2026-07-09 as "Wednesday" — while citing this tool for each. The reply now has
+    a string to copy for every date it may print, as the Transport Pro path has had since
+    `compute_scheduled_pay_date` grew `scheduled_pay_date_display`.
+    """
+
+    out = _status()
+
+    assert out.expected_payment_date_display == "Thursday, August 6, 2026"
+    assert out.delivered_date_display == "Thursday, July 2, 2026"
+    assert out.invoice_received_display == "Tuesday, July 7, 2026"
+
+
+def test_the_written_out_date_is_the_date() -> None:
+    """The display string and the field it renders can never be allowed to drift apart."""
+
+    out = _status()
+    for value, display in (
+        (out.expected_payment_date, out.expected_payment_date_display),
+        (out.delivered_date, out.delivered_date_display),
+        (out.invoice_received, out.invoice_received_display),
+    ):
+        assert display is not None and value is not None
+        assert find_weekday_mismatches(display) == [], display
+        assert value.strftime("%Y") in display
+
+
+def test_a_date_the_tool_does_not_have_is_rendered_as_nothing() -> None:
+    """No date must never become a string — an empty rendering is a date to be invented."""
+
+    out = _status(invoice_received=None, bol05=False, carrier_invoices=None)
+
+    assert out.expected_payment_date_display is None
+    assert out.invoice_received_display is None
+    assert out.expected_payment_date_is_past is False
+
+
+def test_a_pay_date_that_has_gone_by_says_so() -> None:
+    """The flag the reply's tense hangs on. August 6 read differently on the 13th."""
+
+    assert _status(today=date(2026, 8, 3)).expected_payment_date_is_past is False
+    assert _status(today=date(2026, 8, 6)).expected_payment_date_is_past is False
+    assert _status(today=date(2026, 8, 13)).expected_payment_date_is_past is True
 
 
 # ---------------------------------------------------------------------------
@@ -330,4 +400,28 @@ def test_the_prompt_requires_the_amount_and_forbids_a_breakdown() -> None:
     assert "Give each load's `amount`" in prompt
     assert "State it even when the load is not yet scheduled" in prompt
     assert "no line items" in prompt
-    assert CARGOTEL_PAYMENT_STATUS_SKILL.version == "1.1.0"
+    assert CARGOTEL_PAYMENT_STATUS_SKILL.version == "1.2.0"
+
+
+@pytest.mark.integration
+def test_the_prompt_hands_dates_over_rather_than_asking_for_them() -> None:
+    """1.2.0: neither the weekday nor the tense of a date may be the model's to work out.
+
+    The formatting rule this replaced ("write dates as Thursday, August 6, 2026") named a
+    shape no tool produced, which is a rule the model can only satisfy by deriving the very
+    thing the same prompt forbids it to derive.
+    """
+
+    from payment_bot.agent.skills import CARGOTEL_PAYMENT_STATUS_SKILL
+
+    prompt = CARGOTEL_PAYMENT_STATUS_SKILL.system_prompt
+
+    for field in (
+        "expected_payment_date_display",
+        "delivered_date_display",
+        "invoice_received_display",
+    ):
+        assert field in prompt, f"{field} is not offered to the model"
+    assert "Never work out a weekday yourself" in prompt
+    assert "expected_payment_date_is_past" in prompt
+    assert "does not mean the load was paid" in prompt

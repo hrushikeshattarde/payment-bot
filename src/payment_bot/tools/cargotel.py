@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from payment_bot.clients.cargotel import CargoTelClient
 from payment_bot.domain.cargotel import BillingState, resolve_payment
+from payment_bot.domain.pay_schedule import format_pay_date
 from payment_bot.errors import ToolError
 from payment_bot.models.cargotel import CargoTelCarrier
 from payment_bot.tools.base import Tool, ToolContext
@@ -43,6 +44,12 @@ class CgtLoadIdInput(BaseModel):
     load_id: LoadIdStr = CGT_LOAD_ID_FIELD
 
 
+def _display(value: date | None) -> str | None:
+    """``value`` rendered for a reply, weekday included, or ``None`` if there is no date."""
+
+    return None if value is None else format_pay_date(value)
+
+
 class CgtLoadStatusOutput(BaseModel):
     ok: bool = True
     load_id: str
@@ -50,6 +57,8 @@ class CgtLoadStatusOutput(BaseModel):
     #: Delivered / In-Route / Cancelled, and the date on the banner.
     load_status: str | None = None
     delivered_date: date | None = None
+    #: :attr:`delivered_date` written exactly as the reply must render it — copy it verbatim.
+    delivered_date_display: str | None = None
 
     #: open / awaiting paperwork / awaiting billing / scheduled / on hold. Read this rather
     #: than inferring a state from the other fields.
@@ -57,8 +66,25 @@ class CgtLoadStatusOutput(BaseModel):
     #: The date to quote. Present only when a term could be applied to a received invoice —
     #: never estimated. Report it exactly; do not move it to a Monday or Thursday.
     expected_payment_date: date | None = None
+    #: The pay date written exactly as the reply must render it — copy it verbatim.
+    #:
+    #: The Transport Pro path has had this since `compute_scheduled_pay_date` grew
+    #: ``scheduled_pay_date_display``; this path had nothing but a bare ``date``, so the only
+    #: way to write "Friday, August 8, 2026" was for the model to work the weekday out — the
+    #: one thing both prompts forbid. Live on load 302866: the tool returned 2026-08-08 and
+    #: the draft called it Friday (a Saturday) and 2026-07-09 Wednesday (a Thursday), both
+    #: cited to this tool, both off by exactly one day. Nothing is left to derive.
+    expected_payment_date_display: str | None = None
+    #: True when :attr:`expected_payment_date` has already passed. A date can be correct,
+    #: correctly spelled and still described wrongly — "payment is scheduled for" a date five
+    #: days gone. It says nothing about whether the payment actually went out: this is a
+    #: scheduling record, and a passed date with `billing_state` still `scheduled` is exactly
+    #: the case where claiming settlement would be the invention.
+    expected_payment_date_is_past: bool = False
     #: What the term was counted from, so the reply can explain the date if asked.
     invoice_received: date | None = None
+    #: :attr:`invoice_received` written exactly as the reply must render it — copy it verbatim.
+    invoice_received_display: str | None = None
     payment_terms: str | None = None
     amount: Decimal | None = None
     invoice_number: str | None = None
@@ -81,7 +107,10 @@ class CgtGetLoadStatus(Tool):
         "Return a 6-digit load's billing state, the expected payment date when one can be "
         "given, the amount, the payment terms, and which required documents (BOL 05, "
         "carrier invoice) are missing. Read `billing_state` and `note` rather than inferring "
-        "anything. The date is already final - never adjust it to a Monday or Thursday."
+        "anything. The date is already final - never adjust it to a Monday or Thursday. "
+        "Write dates in the reply by copying the *_display fields verbatim; never assemble a "
+        "weekday yourself. If expected_payment_date_is_past is true, that date has already "
+        "gone by - write it in the past tense."
     )
     input_model = CgtLoadIdInput
 
@@ -124,14 +153,23 @@ class CgtGetLoadStatus(Tool):
         if load.ap_invoice_number:
             ctx.ledger.record_text("check_ref", load.ap_invoice_number, self.name, load_id)
 
+        # --- rendering: one string per date, assembled here ------------------
+        # A date and its weekday must leave this tool already joined. Handing the model a
+        # bare `date` is handing it the job of naming the weekday, and the prompt forbidding
+        # that cannot be enforced by a prompt.
+        expected = state.expected_payment_date
         return CgtLoadStatusOutput(
             load_id=load_id,
             carrier_company=carrier_name,
             load_status=load.status,
             delivered_date=load.status_date,
+            delivered_date_display=_display(load.status_date),
             billing_state=state.state,
-            expected_payment_date=state.expected_payment_date,
+            expected_payment_date=expected,
+            expected_payment_date_display=_display(expected),
+            expected_payment_date_is_past=expected is not None and expected < ctx.today,
             invoice_received=state.invoice_received,
+            invoice_received_display=_display(state.invoice_received),
             payment_terms=load.ap_terms or (carrier.ap_terms if carrier else None),
             amount=load.payable,
             invoice_number=load.ap_invoice_number,

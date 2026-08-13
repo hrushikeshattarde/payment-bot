@@ -5,9 +5,9 @@ The actionable, phased plan for moving the bot from the workstation to AWS. The 
 split, credential flow); this document is the *plan*: what to do, in what order, what each
 step needs, how to verify it, and how to roll back.
 
-Written 2026-08-03, revised 2026-08-12, reflecting the system as it runs today: the
+Written 2026-08-03, revised 2026-08-13, reflecting the system as it runs today: the
 authorization pre-check, the 272-factor trust roster, spreadsheet-attachment intake, the
-twelve-check pre-send gate, the bank/NOA wording policies, **the CargoTel path for 6-digit
+thirteen-check pre-send gate, the bank/NOA wording policies, **the CargoTel path for 6-digit
 loads**, and 20-minute scheduling via Windows Task Scheduler.
 
 The 2026-08-12 revision is mostly about CargoTel. It is the first dependency that is neither
@@ -34,6 +34,23 @@ because each is picked up where it lands:
   new risk row in §6, and `payment_bot.domain.routing` for the evidence.
 * **`PAYBOT_AWS_PROFILE`** is now a setting rather than a shell export, which matters for the
   Lambda: it must be left blank there (§3.2).
+
+The 2026-08-13 pass adds one thing, and it has a deployment consequence worth stating up
+front: **the bot now knows what day it is.**
+
+* **A thirteenth gate check, `tense_consistency`**, blocks a draft that writes a date already
+  past as though it were still ahead — "payment is scheduled for Friday, August 8" sent on
+  the 13th. Checks 3 and 12 settle that a date is real and correctly named; neither holds a
+  calendar, so a stale promise cleared them both.
+* **`ToolContext.today` is the calendar**, resolved once per pipeline and injected, and
+  `cgt_get_load_status` / `compute_scheduled_pay_date` now return an `*_is_past` flag beside
+  each date. Nothing reads the system clock at the point of use. In the Lambda this makes the
+  container's timezone a *correctness* input rather than a logging detail: **set `TZ` to the
+  business timezone**, or a run just after midnight UTC will judge a same-day pay date as
+  yesterday's broken promise and block a good reply (§3.2).
+* **CargoTel dates now leave the tool preformatted** (`expected_payment_date_display` and
+  friends), closing on the 6-digit path the same gap the pay-date tool closed on the 7-digit
+  one. No deployment impact; noted because the prompt versions moved with it.
 
 ---
 
@@ -214,6 +231,7 @@ Lambda env for the boring constants.
 | `PAYBOT_AWS_PROFILE` | Lambda env, **blank** | Exists because boto3 reads the *process environment* and never `.env`, so on a workstation the CargoTel cookie read fails with "Unable to locate credentials" unless a profile is named. **Leave it empty in Lambda**: there are no profiles there, the execution role is the credential source, and naming one that does not exist would break the cookie read outright |
 | `PAYBOT_GROQ_*` | **dropped** | Local-only provider |
 | `PAYBOT_DRAFT_ONLY` | Lambda env, `true` in Stage 1 | Stage 2 keeps it `true` in the processor; only the Slack callback sends |
+| `TZ` | Lambda env, **`America/Chicago`** | Not ours, and easy to leave unset — Lambda defaults to UTC. Since 2026-08-13 it is a correctness input: `ToolContext.today` resolves the calendar date the gate's tense check judges against, so between 19:00 and midnight Central the container is already on tomorrow's date. A pay date of *today* would be scored a day late and a correct reply blocked. Set it explicitly rather than relying on the default |
 
 ### 3.3 Trust roster pipeline
 
@@ -295,7 +313,7 @@ roster and checks are keeping up with real mail.
 
 GitHub Actions on the repo (branches already in use):
 
-1. **On PR**: `ruff check` + `mypy` + `pytest` (624 tests, no network — the suite is already
+1. **On PR**: `ruff check` + `mypy` + `pytest` (693 tests, no network — the suite is already
    hermetic thanks to `isolate_settings`). The CargoTel parser tests run against a synthetic
    page fixture rather than saved real pages: real ones carry carrier names, contact emails,
    VINs and payable amounts, and this repository is public. The blank-form fixture is built
@@ -387,6 +405,8 @@ it without pipeline changes).
 | **A 6-digit id that exists in BOTH systems** | Real and measured: Transport Pro numbered loads with six digits years ago and still serves them, so 316040 is Ma Trucks in Transport Pro *and* Continental Autoshipping in CargoTel. Every 6-digit Transport Pro load found had settled in 2018–19 while the CargoTel loads sharing those numbers were delivered 2026-08-10 and unpaid, so preferring CargoTel is correct for any live question and routing is unchanged. **The trap is the obvious-looking fix**: adding a Transport Pro fallback when CargoTel has no such load would resolve arbitrary numbers onto strangers' archived loads — 999998, 111111, 222222 and 555555 are all real, distinct Transport Pro loads — and answering one would disclose an unrelated carrier's payment history. Ruled out with the evidence in `payment_bot.domain.routing`, and locked by a test asserting `route_load` consults no client |
 | A wrong weekday on a correct date | Closed by gate check 12. Grounding compares dates and never the words beside them, so a fabricated weekday on a grounded date passed all eleven earlier checks and reached Drafts. The pay-date tool now emits one preformatted string for the reply to copy, so there are no longer two fields to mis-pair |
 | A load id that exists only in an email's HTML | Closed. `InboundEmail.html_text` strips tags — never parses them — so attribute values (URLs, tracking ids, widths, colours) are discarded and only text a human would have read is scanned. Feeds the sensitive-change scan too, since the mirror case is the dangerous one: a bank instruction present only in the HTML would otherwise pass unseen |
+| A promise about a date that has already passed | Closed by gate check 13. The root cause was smaller than it looks: nothing in the system knew today's date, so "payment is scheduled for August 8" and "payment was scheduled for August 8" were indistinguishable to every check. `ToolContext.today` is now injected and the date tools flag a passed date, so the model has the fact and the gate has the calendar. Residual risk is a *timezone* one, not a logic one — see `TZ` in §3.2 |
+| A carrier told a load was paid because its pay date passed | Not closed by code, and cannot be: a passed pay date on a still-`scheduled` load means the schedule slipped, and no tool reports settlement on that path. Both prompts state it outright — the day passing is not evidence of payment — and the required answer is the date it was scheduled for plus a follow-up. Worth a spot-check in the review digest while the tense rule beds in |
 
 ---
 

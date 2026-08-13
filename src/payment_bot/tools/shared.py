@@ -1436,6 +1436,13 @@ class ComputeScheduledPayDateOutput(BaseModel):
     #: fields wrote e.g. "Friday, August 10, 2026" for a Monday. Nothing is left to pair:
     #: there is one date and one rendering of it.
     scheduled_pay_date_display: str
+    #: True when :attr:`scheduled_pay_date` has already passed. Companion to the display
+    #: string: that one settles how the date is *spelled*, this one how it is *spoken*. A
+    #: reply saying payment "is scheduled for" a date already gone reads as a promise still
+    #: to come, and neither the ledger nor the weekday check can see it — both compare the
+    #: date, and the date is right. On the ESTIMATED basis this being true means the pay day
+    #: passed with the line still unpaid; it is never licence to report the line as paid.
+    scheduled_pay_date_is_past: bool = False
     basis: str
     rule_applied: str
 
@@ -1502,6 +1509,7 @@ class ComputeScheduledPayDate(Tool):
         return ComputeScheduledPayDateOutput(
             scheduled_pay_date=result.scheduled_pay_date,
             scheduled_pay_date_display=result.display,
+            scheduled_pay_date_is_past=result.scheduled_pay_date < ctx.today,
             basis=result.basis.value,
             rule_applied=result.rule_applied,
         )

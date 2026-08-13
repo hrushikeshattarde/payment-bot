@@ -239,25 +239,90 @@ def test_the_payment_method_never_changes_the_day_count(method_a: str, method_b:
     assert net_days_in(method_a) == net_days_in(method_b)
 
 
-def test_quickpay_counts_from_the_invoice_like_net_does() -> None:
-    """The assumption this rests on, made explicit so it can be found and challenged.
+def test_quickpay_counts_business_days_from_the_invoice_received_date() -> None:
+    """Both rules confirmed with the business on 2026-08-13.
 
-    Nobody has confirmed with the business whether a QuickPay term counts from invoice
-    receipt (as Net 30 does) or from something else, nor whether "2 Day" means calendar or
-    business days. It is implemented identically to Net — invoice_received + N calendar
-    days, returned exactly as the arithmetic gives it, which is this path's documented rule
-    — rather than given an invented business-day adjustment.
-
-    If that turns out to be wrong this test is the one that should fail, and it names what
-    to change.
+    The anchor is the A/P *Invoice Received* date — the same field Net 30 counts from, not
+    the A/R customer invoice date (which on load 298891 is a week later, 07/20 against
+    07/13) and not the document upload timestamp. QuickPay's "2 Day" is **business** days.
     """
 
     load = _load(invoice_received="07/13/2026", ap_terms="Check 2 Day QuickPay")
     state = resolve_payment(load)
 
     assert state.state is BillingState.SCHEDULED
-    assert state.expected_payment_date == date(2026, 7, 15)  # +2 calendar days, no shift
+    assert state.invoice_received == date(2026, 7, 13)  # the anchor, not the A/R date
+    assert state.expected_payment_date == date(2026, 7, 15)
     assert state.net_days == 2
+
+
+@pytest.mark.parametrize(
+    ("received", "expected", "note"),
+    [
+        ("07/13/2026", date(2026, 7, 15), "Mon -> Wed, same as calendar"),
+        ("07/15/2026", date(2026, 7, 17), "Wed -> Fri, same as calendar"),
+        # Where the two rules part company. Calendar would land on the weekend.
+        ("07/16/2026", date(2026, 7, 20), "Thu -> Mon, calendar would say Saturday"),
+        ("07/17/2026", date(2026, 7, 21), "Fri -> Tue, calendar would say Sunday"),
+        # An invoice recorded at a weekend starts counting on the next working day.
+        ("07/18/2026", date(2026, 7, 21), "Sat -> Tue"),
+    ],
+)
+def test_a_quickpay_date_never_lands_on_a_weekend(
+    received: str, expected: date, note: str
+) -> None:
+    """The reason business days matter here and never mattered for Net 30.
+
+    A thirty-day term hides the question — one day in seven lands badly and nobody reads a
+    month-out date that closely. A two-day term surfaces it constantly: under calendar
+    counting, every Thursday and Friday invoice on this path would have promised a carrier
+    payment on a Saturday or Sunday.
+    """
+
+    state = resolve_payment(_load(invoice_received=received, ap_terms="ACH 2 Day QuickPay"))
+
+    assert state.expected_payment_date == expected, note
+    assert state.expected_payment_date is not None
+    assert state.expected_payment_date.weekday() < 5
+
+
+def test_net_terms_still_count_calendar_days_and_are_never_shifted() -> None:
+    """The other half of the rule, and the regression this rework could most easily cause.
+
+    Net is unchanged: calendar days, returned exactly as the arithmetic gives it, weekend or
+    not. Rolling a Net date onto a working day would move a date the payment terms had
+    already settled — the same reason this path never shifts to a Monday or Thursday.
+    """
+
+    # 2026-07-10 is a Friday; +7 calendar days is Friday the 17th.
+    state = resolve_payment(_load(invoice_received="07/10/2026", ap_terms="Net 7"))
+    assert state.expected_payment_date == date(2026, 7, 17)
+
+    # A Net date is allowed to land on a weekend and must not be nudged off it.
+    weekend = resolve_payment(_load(invoice_received="07/11/2026", ap_terms="Check Net 30"))
+    assert weekend.expected_payment_date == date(2026, 8, 10)
+
+    # And the live load's real figures still resolve as they did before this change.
+    live = resolve_payment(_load(invoice_received="07/13/2026", ap_terms="Check Net 30"))
+    assert live.expected_payment_date == date(2026, 8, 12)
+
+
+def test_the_two_kinds_of_day_are_carried_together_not_inferred() -> None:
+    """A bare day count cannot say which kind of day it is, so nothing may compute from one.
+
+    This is why `payment_term` exists beside `net_days`: reading the number alone and adding
+    it as calendar days is exactly the bug this rework fixes, and it would be invisible for
+    any invoice received Monday to Wednesday.
+    """
+
+    from payment_bot.models.cargotel import parse_terms
+
+    quickpay = parse_terms("Check 2 Day QuickPay")
+    net = parse_terms("Check Net 30")
+
+    assert quickpay is not None and quickpay.days == 2 and quickpay.business_days is True
+    assert net is not None and net.days == 30 and net.business_days is False
+    assert parse_terms("Due On Receipt") is None
 
 
 def test_no_invoice_means_no_date_and_a_paperwork_answer() -> None:

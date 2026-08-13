@@ -38,6 +38,7 @@ Verified across the three sample loads: 296993 and 296006 carry ``AttachDoc_Invo
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
@@ -156,6 +157,12 @@ class CargoTelCarrier(BaseModel):
         """The N in the carrier's terms, or ``None``."""
 
         return net_days_in(self.ap_terms)
+
+    @property
+    def payment_term(self) -> PaymentTerm | None:
+        """The carrier's default terms, day count and day *kind* together."""
+
+        return parse_terms(self.ap_terms)
 
 
 class CargoTelLoad(BaseModel):
@@ -280,6 +287,16 @@ class CargoTelLoad(BaseModel):
 
         return net_days_in(self.ap_terms)
 
+    @property
+    def payment_term(self) -> PaymentTerm | None:
+        """The load's own terms, day count and day *kind* together.
+
+        What :func:`~payment_bot.domain.cargotel.resolve_payment` computes from. Reading
+        :attr:`net_days` there instead would silently count a QuickPay term in calendar days.
+        """
+
+        return parse_terms(self.ap_terms)
+
 
 #: The ``C/O`` that separates the factor from the carrier it is collecting for.
 #:
@@ -287,6 +304,24 @@ class CargoTelLoad(BaseModel):
 #: truncates ordinary company names — "COASTAL CO TRANSPORT" became "COASTAL" — and "Co" is
 #: everywhere in this industry. Whitespace on both sides for the same reason.
 _CO_SUFFIX_RE = re.compile(r"\s+c\s*[/.]\s*o\.?\s+", re.IGNORECASE)
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentTerm:
+    """A parsed ``ap_terms`` value: how many days, and which kind of day.
+
+    The two kinds are not interchangeable and the field does not distinguish them, which is
+    the whole reason this is a type rather than an ``int``. "Net 30" runs 30 **calendar**
+    days; "2 Day QuickPay" runs 2 **business** days — confirmed with the business on
+    2026-08-13, along with the anchor, which is the A/P *Invoice Received* date for both.
+    """
+
+    days: int
+    #: True for QuickPay. Weekends are skipped; US federal holidays deliberately are not —
+    #: a hard-coded holiday calendar has to be extended every year and a stale one produces
+    #: wrong dates silently, which is the failure mode this path keeps closing. The cost is
+    #: bounded and known: a date quoted across Thanksgiving or July 4th can be a day early.
+    business_days: bool = False
 
 
 #: The day count in a terms string. Two spellings, because CargoTel's ``ap_terms`` dropdown
@@ -304,37 +339,43 @@ _CO_SUFFIX_RE = re.compile(r"\s+c\s*[/.]\s*o\.?\s+", re.IGNORECASE)
 #:
 #: The method prefix is ignored on purpose — ACH and Check differ in how the money moves,
 #: not in when it is due, and the field has always carried both.
-_TERM_DAYS_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bnet\s*(\d{1,3})\b", re.IGNORECASE),
-    re.compile(r"\b(\d{1,3})\s*day\b", re.IGNORECASE),
+#: ``(pattern, business_days)``. Order matters only in that Net is tried first; the two
+#: cannot both match a real option, since no value carries "Net" and "Day" together.
+_TERM_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
+    (re.compile(r"\bnet\s*(\d{1,3})\b", re.IGNORECASE), False),
+    (re.compile(r"\b(\d{1,3})\s*day\b", re.IGNORECASE), True),
 )
 
 
-def net_days_in(terms: str | None) -> int | None:
-    """Extract the day count from a terms string, or ``None`` if there isn't one.
+def parse_terms(terms: str | None) -> PaymentTerm | None:
+    """Parse an ``ap_terms`` value, or ``None`` when it carries no day count.
 
-    Both "Check Net 30" → 30 and "Check 2 Day QuickPay" → 2. The count is applied by
-    :func:`~payment_bot.domain.cargotel.resolve_payment` the same way whichever spelling it
-    came from: ``invoice_received + days``, calendar days, returned exactly as the arithmetic
-    gives it — the established rule on this path, which never shifts a date to a pay day.
+    "Check Net 30" → 30 calendar days. "Check 2 Day QuickPay" → 2 business days. Both are
+    counted from the A/P *Invoice Received* date; the difference is only in which days
+    count, which is why the "Day" spelling is what marks a term as QuickPay rather than the
+    word itself — ACH and Check both prefix it, and neither changes when payment is due.
 
-    That equivalence is an assumption about QuickPay, and the one thing here nobody has
-    confirmed against the business: whether a QuickPay term counts from invoice receipt like
-    Net 30 does, and whether "2 Day" means calendar or business days. The two answers agree
-    for a Monday invoice and diverge for a Thursday one, and a two-day term makes a weekend
-    landing far more visible than a thirty-day term ever did. Left identical to Net rather
-    than given an invented business-day rule, because a rule nobody verified is worse than
-    an arithmetic everyone can check.
-
-    "Due On Receipt" deliberately returns ``None`` rather than 0. Zero would flow through
-    the arithmetic and produce "payable today", which reads as a promise; ``None`` routes to
-    the same "no date can be given" path as unset terms, and a human decides.
+    "Due On Receipt" deliberately returns ``None`` rather than zero days. Zero would flow
+    through the arithmetic and produce "payable today", which reads as a promise; ``None``
+    routes to the same "no date can be given" path as unset terms, and a human decides.
     """
 
     if not terms:
         return None
-    for pattern in _TERM_DAYS_PATTERNS:
+    for pattern, business in _TERM_PATTERNS:
         match = pattern.search(terms)
         if match:
-            return int(match.group(1))
+            return PaymentTerm(days=int(match.group(1)), business_days=business)
     return None
+
+
+def net_days_in(terms: str | None) -> int | None:
+    """The day count alone, or ``None``. Kept for callers that only need the number.
+
+    Deliberately does NOT say which kind of day it is, so nothing can compute a date from
+    it and silently get QuickPay wrong — :func:`parse_terms` is the one that knows, and
+    :func:`~payment_bot.domain.cargotel.resolve_payment` uses that.
+    """
+
+    term = parse_terms(terms)
+    return term.days if term else None

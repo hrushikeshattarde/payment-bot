@@ -17,7 +17,10 @@ Pay date                      ``estimated_payment_date``      ``Invoice Received
 Mon/Thu rule                  applies                         **does not apply**
 Anchor date                   the load's estimated date       the date billing recorded the
                                                               carrier's invoice
-Term length                   fixed schedule                  per carrier ("Check Net 30")
+Term length                   fixed schedule                  per carrier ("Check Net 30",
+                                                              "Check 2 Day QuickPay")
+Which days count              n/a                             Net: calendar. QuickPay:
+                                                              business days
 Can we answer at all?         a date exists on the line       an invoice has been received
 ============================  ==============================  =============================
 
@@ -25,6 +28,17 @@ Can we answer at all?         a date exists on the line       an invoice has bee
 business. Rolling a CargoTel due date onto a payment day would move a date the payment
 terms had already settled, so the computed date is returned exactly as the arithmetic gives
 it, whatever weekday it lands on.
+
+**Two kinds of term, and they count different days.** The ``ap_terms`` dropdown is a closed
+list of six: ``{2 Day QuickPay, 7 Day QuickPay, Net 30}`` crossed with ``{ACH, Check}``.
+Both kinds are anchored on the A/P *Invoice Received* date — confirmed with the business on
+2026-08-13, and not the A/R customer invoice date, which is a different cell on the same
+page and was a week later on load 298891. What differs is only the counting: Net runs
+calendar days, QuickPay runs **business** days. See :func:`add_term_days`. Weekends are
+skipped for QuickPay, holidays are not; a stale hard-coded holiday calendar would produce
+wrong dates silently, and a date a day early across Thanksgiving is the smaller, knowable
+error. The weekend rule matters here in a way it never did for Net: under calendar counting
+every Thursday and Friday invoice on a two-day term promised payment at the weekend.
 
 The anchor is the other thing worth stating twice. It is **not** the delivery date. Checked
 against QuickBooks, which receives these loads as bills: load 296006 delivered 07/02/2026,
@@ -40,7 +54,36 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
-from payment_bot.models.cargotel import CargoTelCarrier, CargoTelLoad
+from payment_bot.models.cargotel import CargoTelCarrier, CargoTelLoad, PaymentTerm
+
+
+def add_term_days(start: date, term: PaymentTerm) -> date:
+    """Apply a payment term to its anchor date.
+
+    Net counts calendar days; QuickPay counts business days. Both count from the same place
+    — the A/P *Invoice Received* date, confirmed with the business on 2026-08-13 — so this
+    is the only thing that differs between the two, and keeping it in one function is what
+    stops a caller applying the wrong kind by reaching for a bare day count.
+
+    Weekends are skipped for QuickPay, holidays are not. A hard-coded federal-holiday
+    calendar needs extending every year, and a stale one produces wrong dates silently,
+    which is worse than a bounded and understood error: a QuickPay date crossing
+    Thanksgiving or July 4th can be a day early.
+
+    The result is still never shifted onto a "payment day" — that rule belongs to Transport
+    Pro. A Net 30 date landing on a Sunday is returned as a Sunday, exactly as before.
+    """
+
+    if not term.business_days:
+        return start + timedelta(days=term.days)
+
+    current = start
+    remaining = term.days
+    while remaining > 0:
+        current += timedelta(days=1)
+        if current.weekday() < 5:  # Mon-Fri
+            remaining -= 1
+    return current
 
 
 class BillingState(StrEnum):
@@ -165,10 +208,11 @@ def resolve_payment(
 
     # The load's own terms win; the carrier record is the fallback, not an override. A load
     # set to different terms from its carrier's default was set that way deliberately.
-    days = load.net_days
-    if days is None and carrier is not None:
-        days = carrier.net_days
-    if days is None:
+    term = load.payment_term
+    if term is None and carrier is not None:
+        term = carrier.payment_term
+    days = term.days if term else None
+    if term is None:
         # Invoice in, but nobody set the terms. Deliberately not defaulted to 30 — see
         # `CargoTelLoad.net_days`.
         return CargoTelPaymentState(
@@ -183,7 +227,7 @@ def resolve_payment(
         )
 
     assert load.invoice_received is not None  # is_invoiced guarantees this
-    expected = load.invoice_received + timedelta(days=days)
+    expected = add_term_days(load.invoice_received, term)
 
     # A paid-looking load that is still missing paperwork is worth flagging rather than
     # smoothing over: billing accepted an invoice while the file list says a document is

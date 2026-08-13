@@ -266,9 +266,14 @@ REPLY
   a Monday or a Thursday — that rule belongs to a different system and does not apply here.
 - Match the tense to the date. When `expected_payment_date_is_past` is true that day has
   already gone by, so write it as past — the load WAS scheduled for payment on it. Never
-  say payment is scheduled, will go out, or is expected on a date already behind us. That
-  the day has passed does not mean the load was paid: give the date it was scheduled for,
-  say it is not showing as paid yet, and that someone will follow up.
+  say payment is scheduled, will go out, or is expected on a date already behind us.
+- NEVER say whether a load has been paid, in either direction. Nothing here reports that:
+  `billing_state` has no paid value, and no field carries a check number, a payment date or
+  a method. A passed date is not evidence of payment, and its absence is not evidence
+  against — the system simply does not say. Forbidden in the reply, all three:
+  "paid", "not yet paid", "not showing as paid".
+  For a date already gone by: give the date it was scheduled for, and say someone will
+  confirm where it stands.
 - If `note` is present, obey it. It names something the reply must not claim.
 - Never state a payment date the tool did not return, and never invent one from the
   delivery date or the payment terms yourself.
@@ -322,7 +327,23 @@ CARGOTEL_PAYMENT_STATUS_SKILL = Skill(
     # returned 2026-08-08 and 2026-07-09, the draft called them Friday and Wednesday (a
     # Saturday and a Thursday), and cited the tool for both. The same draft called August 8
     # scheduled, five days after it passed. Both are now tool-supplied facts, not derivations.
-    version="1.2.0",
+    #
+    # 1.3.0: the reply may not say whether a load is paid, in EITHER direction. 1.2.0's tense
+    # rule ended "say it is not showing as paid yet", which was meant to stop the model
+    # claiming payment and instead instructed a different ungrounded claim, negatively.
+    # Nothing on this path reports payment: BillingState has no paid member and the output
+    # carries no check number, payment date or method — the Accounting tab is not wired. So a
+    # passed date is not evidence of payment and its absence is not evidence against.
+    # Live on load 298891 within hours of shipping 1.2.0: "was scheduled for payment on
+    # Wednesday, August 12, 2026, but is not yet showing as paid" — tense correct, weekday
+    # correct, every figure grounded, all thirteen gate checks passed, and the one clause a
+    # factoring company would act on was sourced from the prompt rather than the system.
+    # Grounding cannot see it; it compares amounts and dates, not status prose.
+    #
+    # The identical instruction on the Transport Pro side is CORRECT and stays: earning lines
+    # there carry payment_status, actual_payment_date and check_number, so "not showing as
+    # paid" is a reading. The wording was right for one system and wrong for the other.
+    version="1.3.0",
     system_prompt=_CARGOTEL_PAYMENT_STATUS_PROMPT,
     allowed_tools=CARGOTEL_PAYMENT_STATUS_TOOLS,
 )

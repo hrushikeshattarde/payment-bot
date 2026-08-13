@@ -400,7 +400,7 @@ def test_the_prompt_requires_the_amount_and_forbids_a_breakdown() -> None:
     assert "Give each load's `amount`" in prompt
     assert "State it even when the load is not yet scheduled" in prompt
     assert "no line items" in prompt
-    assert CARGOTEL_PAYMENT_STATUS_SKILL.version == "1.2.0"
+    assert CARGOTEL_PAYMENT_STATUS_SKILL.version == "1.3.0"
 
 
 @pytest.mark.integration
@@ -424,4 +424,44 @@ def test_the_prompt_hands_dates_over_rather_than_asking_for_them() -> None:
         assert field in prompt, f"{field} is not offered to the model"
     assert "Never work out a weekday yourself" in prompt
     assert "expected_payment_date_is_past" in prompt
-    assert "does not mean the load was paid" in prompt
+
+
+@pytest.mark.integration
+def test_the_prompt_forbids_a_payment_claim_in_either_direction() -> None:
+    """1.3.0: this system cannot report payment, so the reply may not characterise it.
+
+    The bug this pins was mine, and it shipped for a few hours. 1.2.0's tense rule ended
+    "say it is not showing as paid yet" — written to stop the model claiming payment, and
+    instructing an equally ungrounded claim in the opposite direction. Live on load 298891:
+    "was scheduled for payment on Wednesday, August 12, 2026, but is not yet showing as
+    paid". Tense right, weekday right, every figure grounded, all thirteen gate checks
+    passed — and the one clause a factoring company would act on came from the prompt.
+
+    Grounding cannot catch it: it compares amounts and dates, never status prose. So the
+    prompt is the control, and the assertion below is what keeps it.
+    """
+
+    from payment_bot.agent.skills import CARGOTEL_PAYMENT_STATUS_SKILL
+
+    prompt = CARGOTEL_PAYMENT_STATUS_SKILL.system_prompt
+
+    assert "NEVER say whether a load has been paid, in either direction" in prompt
+    # The negative claim specifically — the direction that reads as harmless and is not.
+    assert '"not yet paid"' in prompt and '"not showing as paid"' in prompt
+    # And the reason, so a future edit cannot quietly reintroduce it as a formatting tweak.
+    assert "`billing_state` has no paid value" in prompt
+
+
+@pytest.mark.integration
+def test_the_transport_pro_prompt_keeps_the_rule_this_system_cannot_support() -> None:
+    """The same instruction is correct over there, and the asymmetry is the point.
+
+    Transport Pro earning lines carry payment_status, actual_payment_date and check_number,
+    so "not showing as paid" is a reading of the data rather than an inference from a signal
+    that does not exist. Deleting it there would lose a true statement; keeping it here lost
+    a grounded one. Same words, opposite verdicts, because the systems differ.
+    """
+
+    from payment_bot.agent.skills import PAYMENT_STATUS_SKILL
+
+    assert "not showing as paid" in PAYMENT_STATUS_SKILL.system_prompt

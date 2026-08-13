@@ -4,8 +4,11 @@ Scripted deployment of the payment bot to AWS: one scheduled Lambda that does ex
 the workstation task does today — fetch unread carrier mail, run the pipeline and the
 pre-send gate, save gate-passing replies to Gmail Drafts. It sends nothing.
 
-The architecture and the reasoning behind it are in
-[AWS_DEPLOYMENT_PLAN.md](../docs/AWS_DEPLOYMENT_PLAN.md); this file is how to run it.
+This file is the **reference** for what is in this directory. If you are deploying for the
+first time, follow [AWS_DEPLOY_RUNBOOK.md](../docs/AWS_DEPLOY_RUNBOOK.md) instead — it is
+the walkthrough, in order, including the deployer-permissions check that blocks most first
+attempts. The architecture and the reasoning behind it are in
+[AWS_DEPLOYMENT_PLAN.md](../docs/AWS_DEPLOYMENT_PLAN.md).
 
 | File | What it is |
 |---|---|

@@ -265,7 +265,7 @@ Bedrock and no TP write** access — it only re-gates and sends.
 2. **Use inference profiles / current model IDs.** The defaults in
    [`config.py`](../src/payment_bot/config.py):
    - fast: `us.anthropic.claude-haiku-4-5-20251001-v1:0`
-   - draft: `us.anthropic.claude-sonnet-5-v1:0`
+   - draft: `us.anthropic.claude-sonnet-5`
 
    Verify the exact IDs available in your account/region (`aws bedrock list-foundation-models`
    / `list-inference-profiles`) and update the settings. Cross-region inference profiles

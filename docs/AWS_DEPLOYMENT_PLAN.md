@@ -78,7 +78,7 @@ front: **the bot now knows what day it is.**
 |---|---|
 | Trigger | EventBridge Scheduler — match the workstation's **20 minutes**, not the hourly figure this plan originally assumed. Carriers chase within the hour and the local task was tightened for that reason; deploying at a slower cadence than the thing being replaced would be a visible regression |
 | Compute | Lambda (Python 3.12) — Fargate fallback if runs outgrow 15 min |
-| LLM | **Amazon Bedrock**, `us.anthropic.claude-sonnet-5-v1:0` (`BedrockLlmClient` already in the codebase) |
+| LLM | **Amazon Bedrock**, `us.anthropic.claude-sonnet-5` (`BedrockLlmClient` already in the codebase) |
 | Review surface | Gmail Drafts (Stage 1) → Slack Approve/Edit/Reject (Stage 2) |
 | Secrets | SSM Parameter Store (config) + Secrets Manager (credentials) |
 | Trust roster | S3 object, fetched at cold start; regenerated from settlement exports |
@@ -199,7 +199,7 @@ operations, and an alarm on auto-sent count.
 | # | Decision / prerequisite | Owner | Notes |
 |---|---|---|---|
 | P1 | AWS account + region | ops | `us-east-1` assumed by config default |
-| P2 | Bedrock model access enabled for `us.anthropic.claude-sonnet-5-v1:0` | ops | Console → Bedrock → Model access; verify with `aws bedrock list-inference-profiles` |
+| P2 | Bedrock model access enabled for `us.anthropic.claude-sonnet-5` | ops | Console → Bedrock → Model access; verify with `aws bedrock list-inference-profiles` |
 | P3 | IaC tool | eng | Recommendation: **AWS SAM** (three Lambdas + queue + tables is squarely its shape); CDK acceptable |
 | P4 | Google service-account key handling | eng | Move key JSON into **Secrets Manager**; the code already supports inline JSON via `PAYBOT_GOOGLE_SA_JSON` |
 | P5 | Dedicated shared mailbox for `paystatus@` | ops | Today a personal mailbox is impersonated (Google Groups can't be impersonated). A real shared account means drafts live in a team-visible Drafts folder. One `.env` line to switch (`PAYBOT_GMAIL_USER`) |

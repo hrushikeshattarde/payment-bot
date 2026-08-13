@@ -20,8 +20,8 @@
   "TransportProBaseUrl": "",
   "TransportProUsername": "",
 
-  "BedrockModelId": "us.anthropic.claude-sonnet-5-v1:0",
-  "_BedrockModelId": "Model access must be enabled by hand first — see README.md step 1. Verify with: aws bedrock list-inference-profiles",
+  "BedrockModelId": "us.anthropic.claude-sonnet-5",
+  "_BedrockModelId": "Verified present and ACTIVE on 2026-08-13. Confirm against your own account — the version suffix is not universal (sonnet-5 has none, sonnet-4-5 is ...-20250929-v1:0), and a wrong id deploys cleanly then fails at the first model call. Model access must be enabled by hand first — README.md step 1.",
 
   "RosterBucket": "",
   "RosterKey": "factoring_domains.json",

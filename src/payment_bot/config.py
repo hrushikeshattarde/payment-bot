@@ -324,9 +324,21 @@ class Settings(BaseSettings):
     #: Leave blank in Lambda. There is no profile there: the function's execution role is
     #: the credential source, and naming a profile that does not exist would break it.
     aws_profile: str = ""
-    #: Bedrock model / inference-profile id used to drive the agent loop in AWS.
-    #: Verify availability in your region with `aws bedrock list-inference-profiles`.
-    model_draft: str = "us.anthropic.claude-sonnet-5-v1:0"
+    #: Bedrock **inference profile** id used to drive the agent loop in AWS.
+    #:
+    #: A profile (``us.``/``global.`` prefixed), not a bare foundation-model id: the profile
+    #: is what carries cross-region capacity. Both deploy and validate happily with a wrong
+    #: value here — the error arrives at the first ``converse`` call, as an access denial
+    #: that reads like a permissions problem rather than a typo.
+    #:
+    #: The version suffix is not universal. This default carried ``-v1:0`` and no such
+    #: profile existed: the live account lists ``us.anthropic.claude-sonnet-5`` plain, while
+    #: its 4.5 sibling really is ``…-20250929-v1:0``. Always confirm against the account
+    #: rather than pattern-matching off another id:
+    #:
+    #:     aws bedrock list-inference-profiles \
+    #:       --query "inferenceProfileSummaries[?contains(inferenceProfileId,'claude')].inferenceProfileId"
+    model_draft: str = "us.anthropic.claude-sonnet-5"
 
     # --- Groq (local / non-AWS LLM provider) --------------------------------
     groq_api_key: SecretStr = SecretStr("")

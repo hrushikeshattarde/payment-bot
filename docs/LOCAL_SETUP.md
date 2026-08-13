@@ -123,7 +123,7 @@ All settings are read by [`config.py`](../src/payment_bot/config.py) (via
 | `PAYBOT_DRAFT_ONLY` | `false` | `true` blocks the auto-send path. `payment-bot-local` forces it on. |
 | `PAYBOT_REPLY_CC` | `[]` | JSON list of addresses to Cc on the reply. |
 | `PAYBOT_AWS_REGION` | `us-east-1` | Region for Bedrock. |
-| `PAYBOT_MODEL_DRAFT` | `us.anthropic.claude-sonnet-5-v1:0` | Bedrock model for the deployed agent loop. |
+| `PAYBOT_MODEL_DRAFT` | `us.anthropic.claude-sonnet-5` | Bedrock model for the deployed agent loop. |
 | `PAYBOT_AGENT_MAX_ITERATIONS` | `12` | Hard cap on agent tool-use turns. |
 | `PAYBOT_SLACK_APPROVAL_CHANNEL` | `#payments-approvals` | Approval channel. |
 | `PAYBOT_SLACK_SECURITY_CHANNEL` | `#payments-security` | Security-escalation channel. |

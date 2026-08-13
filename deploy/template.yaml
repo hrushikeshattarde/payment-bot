@@ -48,10 +48,13 @@ Parameters:
 
   BedrockModelId:
     Type: String
-    Default: us.anthropic.claude-sonnet-5-v1:0
+    Default: us.anthropic.claude-sonnet-5
     Description: >
-      Inference profile, not a bare model id. Access must be enabled by hand first —
-      see deploy/README.md; it is the one prerequisite no script can do for you.
+      Inference profile, not a bare model id — the profile carries the cross-region
+      capacity. Confirm the exact string against the account before deploying; the version
+      suffix is not universal (sonnet-5 has none, sonnet-4-5 is …-20250929-v1:0) and a
+      wrong id deploys cleanly and fails at the first converse call. Model access must be
+      enabled by hand first — see deploy/README.md step 1.
 
   GmailUser:
     Type: String

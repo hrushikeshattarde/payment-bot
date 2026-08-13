@@ -45,9 +45,10 @@ front: **the bot now knows what day it is.**
 * **`ToolContext.today` is the calendar**, resolved once per pipeline and injected, and
   `cgt_get_load_status` / `compute_scheduled_pay_date` now return an `*_is_past` flag beside
   each date. Nothing reads the system clock at the point of use. In the Lambda this makes the
-  container's timezone a *correctness* input rather than a logging detail: **set `TZ` to the
-  business timezone**, or a run just after midnight UTC will judge a same-day pay date as
-  yesterday's broken promise and block a good reply (§3.2).
+  container's timezone a *correctness* input rather than a logging detail: **set
+  `TZ=America/New_York`** — the Eastern the rest of the system already assumes — or a run
+  after 20:00 Eastern will judge a same-day pay date as yesterday's broken promise and block
+  a good reply (§3.2).
 * **CargoTel dates now leave the tool preformatted** (`expected_payment_date_display` and
   friends), closing on the 6-digit path the same gap the pay-date tool closed on the 7-digit
   one. No deployment impact; noted because the prompt versions moved with it.
@@ -231,7 +232,7 @@ Lambda env for the boring constants.
 | `PAYBOT_AWS_PROFILE` | Lambda env, **blank** | Exists because boto3 reads the *process environment* and never `.env`, so on a workstation the CargoTel cookie read fails with "Unable to locate credentials" unless a profile is named. **Leave it empty in Lambda**: there are no profiles there, the execution role is the credential source, and naming one that does not exist would break the cookie read outright |
 | `PAYBOT_GROQ_*` | **dropped** | Local-only provider |
 | `PAYBOT_DRAFT_ONLY` | Lambda env, `true` in Stage 1 | Stage 2 keeps it `true` in the processor; only the Slack callback sends |
-| `TZ` | Lambda env, **`America/Chicago`** | Not ours, and easy to leave unset — Lambda defaults to UTC. Since 2026-08-13 it is a correctness input: `ToolContext.today` resolves the calendar date the gate's tense check judges against, so between 19:00 and midnight Central the container is already on tomorrow's date. A pay date of *today* would be scored a day late and a correct reply blocked. Set it explicitly rather than relying on the default |
+| `TZ` | Lambda env, **`America/New_York`** | Not ours, and easy to leave unset — Lambda defaults to UTC. Since 2026-08-13 it is a correctness input: `ToolContext.today` resolves the calendar date the gate's tense check judges against, so from 20:00 Eastern (19:00 in winter) the container is already on tomorrow's date and a pay date of *today* would score a day late, blocking a correct reply. Eastern because that is what the rest of the system already assumes — `_parse_pay_date` converts every API timestamp to an Eastern calendar date and `compute_scheduled_pay_date` takes `tz="EDT"`. **Use the zone name, not the literal `EST`**: `TZ=EST` pins UTC-5 all year and is an hour wrong from March to November, which is precisely the late-evening hour that moves the date. `America/New_York` is EST and EDT, each when it applies |
 
 ### 3.3 Trust roster pipeline
 
@@ -420,6 +421,18 @@ it without pipeline changes).
 * [ ] Staging mailbox + seeded test threads for CI verification
 * [ ] **P8: CargoTel login-bot owner, refresh cadence, and paging path** — the one dependency
       this plan cannot satisfy itself
+* [ ] **Verify the Transport Pro pay-date shift once the clocks go back (before 2026-11-01).**
+      `_parse_pay_date` converts API timestamps at a *fixed* UTC-4, and `_app_pay_date` adds a
+      day back at the client boundary, both compensating for the same thing: the TP UI stores
+      date-typed pay fields at midnight Eastern and the Public API serialises them through a
+      -4 shift, so a date arrives one day behind the application. Verified on load 2479097 —
+      in August, which is to say under EDT only. Whether TP's serialisation follows Eastern
+      into EST or stays pinned at -4 year-round is a question about their code, unanswerable
+      from here and untested by anything we own. The two outcomes need opposite fixes, and it
+      now matters more than it did: `ToolContext.today` will be honestly EST under
+      `TZ=America/New_York`, so from November a pay date parsed an hour adrift can land on the
+      wrong side of today and turn a correct reply into a blocked one. Re-verify one known
+      load against the TP UI in early November and correct whichever layer is wrong
 * [ ] Decide P9: enable `PAYBOT_CARGOTEL_REPLIES` in Stage 1 (recommended) or hold it
 * [ ] Add Saint John Capital's sending domain to the factoring roster if 6-digit factored
       loads should be answered — most carriers on this path factor to them, so without it

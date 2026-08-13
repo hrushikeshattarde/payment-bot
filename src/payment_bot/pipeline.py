@@ -51,6 +51,7 @@ from payment_bot.domain import route_load
 from payment_bot.errors import PaymentBotError
 from payment_bot.gate import GateResult, PreSendGate
 from payment_bot.grounding import GroundingLedger
+from payment_bot.id_filter import MIN_CANDIDATES, IdFilterMode, apply_filter, classify
 from payment_bot.logging import AuditSink, get_logger
 from payment_bot.models import InboundEmail, Intent, SensitiveAction, System
 from payment_bot.roster_candidate import build_candidate, log_candidate
@@ -158,6 +159,7 @@ class PaymentBotPipeline:
         today: date | None = None,
     ) -> None:
         self._tp = tp
+        self._llm = llm
         # Resolved once per pipeline rather than per email so a long-running processor cannot
         # render a date under one day and judge its tense under the next. Injectable because
         # fixture data has fixed dates: a test asserting "Thursday, August 6, 2026" is only
@@ -248,7 +250,7 @@ class PaymentBotPipeline:
             ctx,
         )
         identifiers = ExtractIdentifiersOutput.model_validate(ident_out.payload)
-        load_ids = identifiers.load_ids
+        load_ids = self._filter_ids(list(identifiers.load_ids), email, correlation_id)
         if not load_ids:
             # No valid id — carrier-name lookup / clarification is out of this slice.
             return self._escalate(
@@ -770,6 +772,44 @@ class PaymentBotPipeline:
 
         extra = max(0, load_count - 1) * self._settings.agent_iterations_per_extra_load
         return min(self._settings.agent_max_iterations + extra, ITERATION_CEILING)
+
+    def _filter_ids(
+        self, load_ids: list[str], email: InboundEmail, correlation_id: str
+    ) -> list[str]:
+        """Let the model drop candidates the regex should not have called loads.
+
+        Deliberately here rather than inside ``extract_identifiers``: that tool stays
+        deterministic, so its output remains reproducible and its tests keep meaning what
+        they mean, and the model's opinion is a separate, separately logged step that can be
+        turned off without touching it.
+
+        Best-effort throughout. Any failure — an unreachable model, an unreadable answer —
+        returns the ids unchanged, which is exactly the behaviour with the filter off.
+        """
+
+        try:
+            mode = IdFilterMode(self._settings.llm_id_filter)
+        except ValueError:
+            _log.warning(
+                "id_filter_mode_unknown", extra={"value": self._settings.llm_id_filter}
+            )
+            return load_ids
+        if mode is IdFilterMode.OFF or len(load_ids) < MIN_CANDIDATES:
+            return load_ids
+
+        try:
+            text = "\n".join(
+                p
+                for p in (email.subject, email.body, email.html_text, email.thread_text)
+                if p
+            )
+            verdicts = classify(self._llm, load_ids, text)
+            return apply_filter(mode, load_ids, verdicts, correlation_id=correlation_id)
+        except Exception as exc:  # never let the filter break intake
+            _log.warning(
+                "id_filter_failed", extra={"correlation_id": correlation_id, "error": str(exc)}
+            )
+            return load_ids
 
     def _roster_candidate(
         self,

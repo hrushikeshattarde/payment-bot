@@ -165,6 +165,15 @@ class Settings(BaseSettings):
     #: another's loads, which is the whole thing this must not do.
     carrier_contacts: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
+    #: Whether the model gets to say which extracted numbers are really load ids.
+    #:
+    #: ``off`` (default) is today's behaviour: the regex and its seven guards decide alone.
+    #: ``shadow`` calls the model and logs what it *would* drop, changing nothing — the way
+    #: to measure agreement on real mail before anything depends on it. ``enforce`` applies
+    #: it. See :mod:`payment_bot.id_filter`; the model only ever removes candidates the
+    #: regex already produced, so it cannot introduce a load id.
+    llm_id_filter: str = "off"
+
     #: Review artifact listing, per factor, the domains our OWN records hold and how many
     #: carriers factor to them. Read only when an unknown factoring sender escalates, to put
     #: "the domain we have on file" beside "the domain that just wrote in" — see

@@ -29,6 +29,10 @@ Checks (all must pass):
 13. **Tense consistency** — no date that has already passed is written as though it were
     still ahead. Same blind spot one step further out: checks 3 and 12 settle that a date
     is real and correctly named, and neither of them knows what today is.
+14. **CargoTel payment claim** — a 6-digit load's reply never says whether it was paid,
+    either way. The blind spot widened once more: checks 3, 12 and 13 all police *dates*,
+    and none of them looks at a claim about payment state — which on this path no tool
+    reports, so the words can only have come from the model or its prompt.
 """
 
 from __future__ import annotations
@@ -117,6 +121,44 @@ _NOA_REQUEST_RE = re.compile(
 )
 
 
+#: Wording that characterises whether a 6-digit load has been paid — in either direction.
+#:
+#: On the CargoTel path this is unanswerable, not merely unverified: ``BillingState`` has
+#: five members and none of them is paid, and ``CgtLoadStatusOutput`` carries no check
+#: number, no payment date and no method (that detail is on the Accounting tab, which is
+#: not wired). A passed pay date is not evidence of payment and its absence is not evidence
+#: against — the system does not say. So the word is ungrounded *by construction* here,
+#: which is what makes a flat ban on it safe rather than blunt.
+#:
+#: The first pattern is deliberately the whole of the paid-word family and nothing near it.
+#: "payable", "payment", "pay date" and ``freightpay@circledelivers.com`` are all required
+#: vocabulary in these replies and none contains ``paid``, so the word boundary does the
+#: separating on its own. Observed live on load 298891: "was scheduled for payment on
+#: Wednesday, August 12, 2026, but is not yet showing as paid" — thirteen checks passed and
+#: the one clause a factor would act on was sourced from the prompt, not the load.
+#:
+#: The second closes the paraphrase that says the same thing without the word. Kept tight:
+#: a payment noun within a few words of a *completed*-action verb. Future forms are left
+#: alone deliberately — "we'll confirm when payment goes out" claims nothing.
+_CGT_PAYMENT_CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("paid/unpaid", re.compile(r"\b(?:un)?paid\b", re.IGNORECASE)),
+    (
+        "completed-payment claim",
+        re.compile(
+            r"\b(?:payment|check|funds|remittance)\b(?:\W+\w+){0,4}?\W+"
+            r"\b(?:went\s+out|gone\s+out|issued|released|mailed|remitted|disbursed|cleared)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _cargotel_payment_claims(text: str) -> list[str]:
+    """Labels of every payment characterisation present in ``text``."""
+
+    return [label for label, pattern in _CGT_PAYMENT_CLAIM_PATTERNS if pattern.search(text)]
+
+
 class GateCheck(BaseModel):
     """Outcome of one named gate check."""
 
@@ -174,6 +216,7 @@ class PreSendGate:
             self._check_grounding(draft, ctx),
             self._check_weekday_consistency(draft),
             self._check_tense_consistency(draft, ctx),
+            self._check_cargotel_payment_claim(draft),
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
             self._check_carrier_consistency(draft, email, ctx),
@@ -609,4 +652,56 @@ class PreSendGate:
             name="tense_consistency",
             passed=True,
             detail="no past date is described as upcoming",
+        )
+
+    def _check_cargotel_payment_claim(self, draft: SubmitDraftOutput) -> GateCheck:
+        """A 6-digit load's reply may not say whether it was paid, in either direction.
+
+        The other two date checks exist because grounding compares dates and not the words
+        beside them. This one exists because grounding compares *amounts and dates* and not
+        status prose at all — so a sentence asserting a payment state has nothing checking
+        it, whichever way it points.
+
+        Blocks the load-298891 shape: "was scheduled for payment on Wednesday, August 12,
+        2026, but is not yet showing as paid". Correct tense, correct weekday, every figure
+        traced to `cgt_get_load_status`, thirteen checks green — and CargoTel had reported
+        no payment state at all, because it has none to report. The claim came from the
+        skill prompt, which is exactly why the prompt is not sufficient control for it.
+
+        The negative direction is the one worth the code. Claiming payment invites a "no you
+        didn't"; claiming NON-payment to a factoring company chasing money invites a
+        duplicate-payment request or a dispute, and reads as authoritative because we are
+        the payer.
+
+        Scoped to 6-digit loads. On Transport Pro the same sentence is a reading of
+        `payment_status` / `actual_payment_date` / `check_number` and must stay sayable — an
+        email spanning both systems escalates before it reaches the gate, so a mixed draft
+        does not arrive here.
+        """
+
+        cargotel_loads = [
+            lid for lid in draft.load_ids if route_load(lid).system is System.QUICKBOOKS
+        ]
+        if not cargotel_loads:
+            return GateCheck(
+                name="cargotel_payment_claim",
+                passed=True,
+                detail="no 6-digit load disclosed; payment state is reportable here",
+            )
+
+        claims = _cargotel_payment_claims(draft.reply_body)
+        if claims:
+            return GateCheck(
+                name="cargotel_payment_claim",
+                passed=False,
+                detail=(
+                    f"draft characterises payment on 6-digit load(s) {cargotel_loads}, which "
+                    f"this system does not report either way: {claims}. State the scheduled "
+                    "date and that someone will confirm where it stands."
+                ),
+            )
+        return GateCheck(
+            name="cargotel_payment_claim",
+            passed=True,
+            detail="reply makes no claim about whether a 6-digit load was paid",
         )

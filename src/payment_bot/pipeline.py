@@ -53,6 +53,7 @@ from payment_bot.gate import GateResult, PreSendGate
 from payment_bot.grounding import GroundingLedger
 from payment_bot.logging import AuditSink, get_logger
 from payment_bot.models import InboundEmail, Intent, SensitiveAction, System
+from payment_bot.roster_candidate import build_candidate, log_candidate
 from payment_bot.tools import ToolContext, ToolRegistry, build_default_registry
 from payment_bot.tools.shared import (
     CheckAuthorizationOutput,
@@ -422,10 +423,17 @@ class PaymentBotPipeline:
             if auth.pre_noa:
                 prenoa_loads.append(load_id)
         if not authorized_loads:
+            reason = f"sender not authorized for any load: {_group_by_reason(unauthorized)}"
+            # Assemble the roster packet BEFORE escalating, so the reviewer gets the evidence
+            # in the same place as the refusal rather than having to go and find it. This
+            # decides nothing — the escalation is unchanged either way; see roster_candidate.
+            packet = self._roster_candidate(email, tuple(load_ids), ctx, correlation_id)
+            if packet:
+                reason = f"{reason}\n\n{packet}"
             return self._escalate(
                 email,
                 "review",
-                f"sender not authorized for any load: {_group_by_reason(unauthorized)}",
+                reason,
                 tuple(load_ids),
                 correlation_id,
             )
@@ -762,6 +770,61 @@ class PaymentBotPipeline:
 
         extra = max(0, load_count - 1) * self._settings.agent_iterations_per_extra_load
         return min(self._settings.agent_max_iterations + extra, ITERATION_CEILING)
+
+    def _roster_candidate(
+        self,
+        email: InboundEmail,
+        load_ids: tuple[str, ...],
+        ctx: ToolContext,
+        correlation_id: str,
+    ) -> str | None:
+        """The reviewer's packet for an unknown factoring sender, or None if not applicable.
+
+        Best-effort by construction. Every failure mode here — an unreachable back office, a
+        load with no factor, a malformed hints file — returns None and leaves the escalation
+        exactly as it was. An escalation that failed to escalate because its *annotation*
+        raised would be a far worse bug than the manual lookup this saves.
+        """
+
+        try:
+            factors: dict[str, list[str]] = {}
+            carriers: set[str] = set()
+            for load_id in load_ids:
+                system = route_load(load_id).system
+                if system is System.QUICKBOOKS:
+                    if ctx.cargotel is None:
+                        continue
+                    auth = ctx.cargotel.get_authorization_context(load_id)
+                elif system is System.TRANSPORT_PRO:
+                    auth = ctx.tp.get_authorization_context(load_id)
+                else:
+                    continue
+                if not auth.factoring_company:
+                    continue
+                factors.setdefault(auth.factoring_company, []).append(load_id)
+                if auth.carrier_company:
+                    carriers.add(auth.carrier_company)
+
+            blocks: list[str] = []
+            for factor, loads in factors.items():
+                candidate = build_candidate(
+                    sender_email=email.from_email,
+                    factor_on_file=factor,
+                    load_ids=tuple(loads),
+                    settings=self._settings,
+                    carrier_companies=tuple(sorted(carriers)),
+                )
+                if candidate is None:
+                    continue
+                log_candidate(candidate, correlation_id)
+                blocks.append(candidate.render())
+            return "\n\n".join(blocks) or None
+        except Exception as exc:  # never let the annotation break the escalation
+            _log.warning(
+                "roster_candidate_failed",
+                extra={"correlation_id": correlation_id, "error": str(exc)},
+            )
+            return None
 
     def _escalate(
         self,

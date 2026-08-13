@@ -146,6 +146,18 @@ class Settings(BaseSettings):
     #: collision, so a hand-curated correction always beats the generated file.
     factoring_domains_file: str = ""
 
+    #: Review artifact listing, per factor, the domains our OWN records hold and how many
+    #: carriers factor to them. Read only when an unknown factoring sender escalates, to put
+    #: "the domain we have on file" beside "the domain that just wrote in" — see
+    #: :mod:`payment_bot.roster_candidate`.
+    #:
+    #: Never consulted for an authorization decision, and it must not be: these domains come
+    #: from mixed sources (AP records, contact records, a website lookup) and a website-sourced
+    #: domain is the same evidence class as a guess. It informs a human, nothing else.
+    #:
+    #: Optional. Unset, escalations lose one line of context and behave exactly as before.
+    factor_domain_hints_file: str = ""
+
     @model_validator(mode="before")
     @classmethod
     def _merge_factoring_domains_file(cls, values: Any) -> Any:

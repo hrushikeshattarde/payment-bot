@@ -146,6 +146,25 @@ class Settings(BaseSettings):
     #: collision, so a hand-curated correction always beats the generated file.
     factoring_domains_file: str = ""
 
+    #: Carrier company name → **exact** email addresses authorised for that carrier's loads,
+    #: on top of whatever the back office holds. The carrier-side sibling of
+    #: ``factoring_domains``, and deliberately not the same shape as it.
+    #:
+    #: Addresses, never domains. Carriers are routinely on free mail — measured across four
+    #: CargoTel carriers, two had *only* a Gmail address — so a domain-keyed grant here would
+    #: mean authorising gmail.com, i.e. every Gmail user on earth, to ask about that carrier's
+    #: loads. An exact address grants exactly itself and nothing else.
+    #:
+    #: Exists so a known-good contact can be authorised without an edit to the back office,
+    #: which is not always ours to make and not always quick. The back office remains the
+    #: better home for a permanent contact: an entry here is invisible to everyone who looks
+    #: at the carrier's record and wonders why the bot answers an address that is not on it.
+    #:
+    #: The name must match the carrier on the load after normalisation — no token matching,
+    #: no containment. A loose match would let one carrier's configured address answer for
+    #: another's loads, which is the whole thing this must not do.
+    carrier_contacts: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+
     #: Review artifact listing, per factor, the domains our OWN records hold and how many
     #: carriers factor to them. Read only when an unknown factoring sender escalates, to put
     #: "the domain we have on file" beside "the domain that just wrote in" — see

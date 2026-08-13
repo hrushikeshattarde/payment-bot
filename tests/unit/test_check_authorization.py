@@ -192,3 +192,126 @@ def test_pre_noa_never_fires_on_a_load_factored_to_someone_else() -> None:
     assert out.decision is AuthDecision.DENY
     assert not out.authorized
     assert not out.pre_noa
+
+
+# ---------------------------------------------------------------------------
+# PAYBOT_CARRIER_CONTACTS — exact addresses authorised for one carrier's loads,
+# on top of whatever the back office holds.
+#
+# Live on 2026-08-13: Always There Logistics wrote from a billing alias that was
+# not on their Transport Pro record, which carried alwaystherelogistics@ and
+# loads4logistics@. The record was out of date rather than the sender wrong, but
+# nothing in a free-mail address can establish that — hence a grant of exactly
+# one address, and never a domain.
+# ---------------------------------------------------------------------------
+CARRIER = "ALWAYS THERE LOGISTICS INC"
+CONFIGURED = "alwaystherelogisticsbilling@gmail.com"
+
+
+def _carrier_ctx(contacts: dict[str, tuple[str, ...]]) -> ToolContext:
+    """Load 2462934 with a named carrier and no contacts of its own on file."""
+
+    tp = sample_transport_pro_client()
+    fixture = build_load_2462934_fixture()
+    tp.add(
+        fixture.__class__(
+            load=fixture.load,
+            dispatch=fixture.dispatch,
+            settlement=fixture.settlement,
+            files=fixture.files,
+            noa_factoring=fixture.noa_factoring,
+            authorization=AuthorizationContext(
+                carrier_company=CARRIER, authorized_emails=()
+            ),
+        )
+    )
+    return ToolContext(
+        tp=tp,
+        ledger=GroundingLedger(),
+        correlation_id="carrier-contacts",
+        settings=Settings(_env_file=None, carrier_contacts=contacts),  # type: ignore[arg-type]
+    )
+
+
+def _decide(ctx: ToolContext, sender: str) -> CheckAuthorizationOutput:
+    out = CheckAuthorization().run(
+        CheckAuthorizationInput(
+            sender_email=sender, load_id="2462934", system=System.TRANSPORT_PRO
+        ),
+        ctx,
+    )
+    assert isinstance(out, CheckAuthorizationOutput)
+    return out
+
+
+@pytest.mark.unit
+def test_a_configured_carrier_contact_is_authorized() -> None:
+    out = _decide(_carrier_ctx({CARRIER: (CONFIGURED,)}), CONFIGURED)
+
+    assert out.decision is AuthDecision.ALLOW
+    assert out.authorized is True
+    assert out.matched_party == CARRIER
+    # The reason must say where the grant came from: an address answered here is invisible
+    # to anyone reading the carrier's record and wondering why the bot replied to it.
+    assert "PAYBOT_CARRIER_CONTACTS" in out.reason
+
+
+@pytest.mark.unit
+def test_the_grant_is_the_address_and_not_its_domain() -> None:
+    """The whole reason this is addresses rather than domains.
+
+    Carriers are routinely on free mail — of four CargoTel carrier records measured, two
+    listed only a Gmail address. A domain-shaped grant would authorise every Gmail user on
+    earth for that carrier's loads.
+    """
+
+    ctx = _carrier_ctx({CARRIER: (CONFIGURED,)})
+
+    assert _decide(ctx, "someone.else@gmail.com").decision is AuthDecision.DENY
+    assert _decide(ctx, "billing@gmail.com").decision is AuthDecision.DENY
+    # A domain accidentally configured where an address belongs authorises nobody.
+    assert _decide(_carrier_ctx({CARRIER: ("gmail.com",)}), CONFIGURED).decision is (
+        AuthDecision.DENY
+    )
+
+
+@pytest.mark.unit
+def test_a_lookalike_of_the_configured_address_is_denied() -> None:
+    ctx = _carrier_ctx({CARRIER: (CONFIGURED,)})
+
+    for lookalike in (
+        "alwaystherelogisticsbilling@gmail.com.evil.net",
+        "alwaystherelogistics.billing@gmail.com",
+        "alwaystherelogisticsbiIling@gmail.com",  # capital i for l
+    ):
+        assert _decide(ctx, lookalike).decision is AuthDecision.DENY, lookalike
+
+
+@pytest.mark.unit
+def test_one_carriers_configured_address_cannot_answer_for_another() -> None:
+    """Why the carrier name is matched exactly rather than by token overlap.
+
+    ``_factor_names_match`` would link "ALWAYS THERE LOGISTICS INC" to any other carrier
+    sharing a distinctive word. For a grant that authorises a specific address against a
+    specific carrier's loads, that looseness is the failure mode, not a convenience.
+    """
+
+    ctx = _carrier_ctx({"SOME OTHER LOGISTICS INC": (CONFIGURED,)})
+
+    assert _decide(ctx, CONFIGURED).decision is AuthDecision.DENY
+
+
+@pytest.mark.unit
+def test_punctuation_and_case_in_the_carrier_name_do_not_matter() -> None:
+    """Exact after normalisation, not byte-exact — the back office spells names variously."""
+
+    for spelling in ("Always There Logistics, Inc.", "always there logistics inc"):
+        ctx = _carrier_ctx({spelling: (CONFIGURED,)})
+        assert _decide(ctx, CONFIGURED).decision is AuthDecision.ALLOW, spelling
+
+
+@pytest.mark.unit
+def test_configuring_nothing_changes_nothing() -> None:
+    """The default must leave every existing decision exactly as it was."""
+
+    assert _decide(_carrier_ctx({}), CONFIGURED).decision is AuthDecision.DENY

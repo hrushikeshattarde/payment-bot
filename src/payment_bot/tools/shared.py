@@ -456,6 +456,38 @@ def _factor_names_match(configured_name: str, on_file: str) -> bool:
     )
 
 
+def _is_configured_carrier_contact(
+    carrier_company: str | None, sender_email: str, ctx: ToolContext
+) -> bool:
+    """True when the sender is an address configured for this load's carrier.
+
+    The carrier-side counterpart of :func:`_is_configured_factor_domain`, and narrower in
+    both directions on purpose.
+
+    Matching is on the **whole address**, never the domain, because carriers are routinely
+    on free mail — a domain grant here would authorise every Gmail user for that carrier.
+    And the carrier name must match exactly once normalised, with none of the token overlap
+    :func:`_factor_names_match` allows: a loose match would let one carrier's configured
+    address answer for another's loads, which is precisely what this must never do.
+
+    Reached only after the back office's own contact list has been consulted and missed, so
+    it adds addresses and can never remove one.
+    """
+
+    sender = sender_email.strip().lower()
+    if not (carrier_company and sender):
+        return False
+    wanted = _normalize_company_name(carrier_company)
+    if not wanted:
+        return False
+    for name, addresses in ctx.settings.carrier_contacts.items():
+        if _normalize_company_name(name) != wanted:
+            continue
+        if sender in {str(a).strip().lower() for a in addresses}:
+            return True
+    return False
+
+
 def _is_configured_factor_domain(
     factoring_company: str, sender_email: str, ctx: ToolContext
 ) -> bool:
@@ -1251,6 +1283,16 @@ class CheckAuthorization(Tool):
                 matched_party=auth.carrier_company,
                 reason="sender is an explicitly authorized contact for this load",
             )
+        if _is_configured_carrier_contact(auth.carrier_company, sender, ctx):
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.ALLOW,
+                authorized=True,
+                matched_party=auth.carrier_company,
+                reason=(
+                    "sender is a configured contact for this load's carrier "
+                    "(PAYBOT_CARRIER_CONTACTS, not the back office record)"
+                ),
+            )
         if sender in {e.lower() for e in auth.factoring_emails}:
             return CheckAuthorizationOutput(
                 decision=AuthDecision.FACTORING,
@@ -1411,6 +1453,17 @@ class CheckAuthorization(Tool):
                 authorized=True,
                 matched_party=auth.carrier_company,
                 reason="sender is a contact on this carrier's record",
+            )
+
+        if _is_configured_carrier_contact(auth.carrier_company, sender, ctx):
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.ALLOW,
+                authorized=True,
+                matched_party=auth.carrier_company,
+                reason=(
+                    "sender is a configured contact for this load's carrier "
+                    "(PAYBOT_CARRIER_CONTACTS, not the back office record)"
+                ),
             )
 
         if (

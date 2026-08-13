@@ -226,6 +226,69 @@ class GmailApiClient:
         _log.info("gmail_api_fetched", extra={"count": len(emails), "query": query})
         return emails
 
+    def search(self, query: str, limit: int = 500) -> list[InboundEmail]:
+        """Every message matching ``query``, oldest handling rules deliberately not applied.
+
+        The read-only counterpart of :meth:`fetch_new`, for offline analysis rather than for
+        deciding what to answer. Everything :meth:`fetch_new` does to pick *work* is wrong
+        here and is left out: no collapsing to one message per thread, and no skipping of
+        threads a colleague already answered — for contact discovery those threads are the
+        best evidence there is, since a human replying to an address is a human accepting it.
+
+        Paginates, because the point is history rather than a window. ``limit`` caps messages
+        fetched, and each one costs a request.
+        """
+
+        emails: list[InboundEmail] = []
+        page_token: str | None = None
+        while len(emails) < limit:
+            params = {"q": query, "maxResults": str(min(_LISTING_WINDOW, limit - len(emails)))}
+            if page_token:
+                params["pageToken"] = page_token
+            listing = self._get(f"/users/{self._quoted_user()}/messages", params)
+            items = [
+                str(item["id"])
+                for item in (listing.get("messages") or [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+            for message_id in items:
+                if len(emails) >= limit:
+                    break
+                parsed = self._fetch_message(message_id)
+                if parsed is not None:
+                    emails.append(parsed)
+            page_token = listing.get("nextPageToken")
+            if not page_token or not items:
+                break
+
+        _log.info("gmail_api_searched", extra={"count": len(emails), "query": query})
+        return emails
+
+    def _fetch_message(self, message_id: str) -> InboundEmail | None:
+        """One message by id, or ``None`` when it cannot be decoded."""
+
+        record = self._get(
+            f"/users/{self._quoted_user()}/messages/{urllib.parse.quote(message_id)}",
+            {"format": "RAW"},
+        )
+        raw = record.get("raw")
+        if not isinstance(raw, str):
+            _log.warning("gmail_api_message_without_raw", extra={"id": message_id})
+            return None
+        try:
+            decoded = base64.urlsafe_b64decode(_pad_base64(raw))
+        except (ValueError, TypeError) as exc:
+            _log.warning(
+                "gmail_api_undecodable_message", extra={"id": message_id, "error": str(exc)}
+            )
+            return None
+        return parse_inbound_email(
+            email.message_from_bytes(decoded),
+            thread_id=str(record.get("threadId") or "") or None,
+            labels=[str(label) for label in (record.get("labelIds") or [])],
+            group_address=self._group or None,
+        )
+
     def create_draft(
         self,
         email_message: InboundEmail,

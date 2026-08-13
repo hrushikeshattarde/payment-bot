@@ -62,6 +62,9 @@ load_*.html
 # names mapped to domains — and it was sitting untracked but NOT ignored, one `git add -A`
 # away from being published.
 factoring_domains_CANDIDATES*.json
+# Carrier contact candidates from the mail sweep. Real company names mapped to real
+# addresses, many of them people's names — the same class as the roster files below.
+carrier_contacts_CANDIDATES*.json
 factoring_domains.json
 # Hand-verified send-from domains merged into the roster by the generator. Same class of
 # data as the file above: real company names mapped to the domains we will disclose to.

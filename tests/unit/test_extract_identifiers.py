@@ -639,3 +639,117 @@ def test_a_hyphenated_load_reference_is_still_read(ctx: ToolContext) -> None:
     """
 
     assert _run(ctx, body="load 296006-INVDKD0098").load_ids == ["296006"]
+
+
+# ---------------------------------------------------------------------------
+# A WEX collections table. Four ids in one row, one real load.
+#
+#   Carrier | Mot Car | Account | Mot Car | Invoice | Load | Age | Balance
+#   FFS Brothers LLC | 1601899 | CIRCLE LOGISTICS, INC (IN) (7 DIGIT LOAD#S)
+#     (FREIGHTPAY@…) | 761291 | IN-001208 | 2481841 | 45 | $150.00
+#
+# The row reaches us only through the HTML part, flattened to one line, so the
+# column headers end up 40-odd characters from the values beneath them — well
+# outside the 24-character label window, and widening that would start attaching
+# whatever precedes a number two cells later.
+# ---------------------------------------------------------------------------
+WEX_SUBJECT = "Payment Inquiry CIRCLE LOGISTICS, INC (IN) (7 DIGIT LOAD#S)"
+WEX_HEADERS = "Carrier Mot Car Account Mot Car Invoice Load Age Balance "
+WEX_ROW = (
+    "FFS Brothers LLC 1601899 CIRCLE LOGISTICS, INC (IN) (7 DIGIT LOAD#S) "
+    "(FREIGHTPAY@CIRCLEDELIVERS.COM) 761291 IN-001208 2481841 45 $150.00"
+)
+
+
+@pytest.mark.unit
+def test_the_wex_collections_table_no_longer_spans_both_systems(ctx: ToolContext) -> None:
+    """Live escalation: 'email spans both systems' on a single-system enquiry.
+
+    Two independent guards do the work. `IN-001208` is dropped as zero-padded, and `761291`
+    — the account's Motor Carrier number — is dropped because the sender states our load ids
+    are seven digits, in the subject and again in the table.
+    """
+
+    out = _run(ctx, subject=WEX_SUBJECT, body=WEX_HEADERS, html_text=WEX_HEADERS + WEX_ROW)
+
+    assert out.load_ids == ["1601899", "2481841"]
+    assert "001208" not in out.load_ids
+    assert "761291" not in out.load_ids
+
+
+@pytest.mark.unit
+def test_a_zero_padded_reference_is_not_a_load(ctx: ToolContext) -> None:
+    """`IN-001208` is an invoice number formatted to a fixed width.
+
+    A load id is a sequence number and never carries a leading zero, which is what makes a
+    flat rule safe here. Deliberately not a rule about the `IN-` prefix: suppressing digits
+    after any letter-hyphen would also drop `INV-2462934`, and `inv` has to keep meaning the
+    load itself.
+    """
+
+    assert _run(ctx, body="Invoice IN-001208 for load 2481841").load_ids == ["2481841"]
+    assert _run(ctx, body="ref 0012345").load_ids == []
+    # The shapes that must survive it.
+    assert _run(ctx, body="INV 2462934").load_ids == ["2462934"]
+    assert _run(ctx, body="load 296006").load_ids == ["296006"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("subject", "body", "expected"),
+    [
+        # Fires: two systems, and the sender says which length ours are.
+        ("(7 DIGIT LOAD#S)", "1601899 and 761291 and 2481841", ["1601899", "2481841"]),
+        ("(6 DIGIT LOAD#S)", "296006 and 2481841", ["296006"]),
+        # Silent: one system, so there is nothing to resolve.
+        ("(7 DIGIT LOAD#S)", "2462934 and 2481841", ["2462934", "2481841"]),
+        # Silent: no declaration at all — a genuine two-system email must still escalate.
+        ("Payment inquiry", "296006 and 2481841", ["296006", "2481841"]),
+        # Silent: the email contradicts itself, so it says nothing usable.
+        ("6 digit loads and 7 digit loads", "296006 and 2481841", ["296006", "2481841"]),
+        # Silent: "7 digit" that is not about a load is a coincidence, not a declaration.
+        ("7 digit account numbers", "296006 and 2481841", ["296006", "2481841"]),
+        # Silent: the declaration would leave nothing, so it cannot be what was meant.
+        ("(6 DIGIT LOAD#S)", "2462934 and 2481841", ["2462934", "2481841"]),
+    ],
+)
+def test_a_declared_id_length_only_breaks_a_real_tie(
+    ctx: ToolContext, subject: str, body: str, expected: list[str]
+) -> None:
+    """Same safety envelope as the labelled-load preference it sits beside.
+
+    It can only ever filter, never introduce an id, and it cannot fire on a single-system
+    email or without an explicit statement about *loads*.
+    """
+
+    assert _run(ctx, subject=subject, body=body).load_ids == expected
+
+
+@pytest.mark.unit
+def test_a_named_load_is_never_dropped_for_being_the_wrong_length(ctx: ToolContext) -> None:
+    """An id the sender CALLED a load outranks a length declared in an account name.
+
+    The two can genuinely disagree, and when they do the specific statement about that
+    number beats the general one about the account. Protecting the labelled id leaves the
+    disagreement intact here, so nothing is resolved and the email still reaches a human —
+    which is the right outcome for a contradiction, not a bug in the tie-break.
+    """
+
+    out = _run(ctx, subject="(7 DIGIT LOAD#S)", body="Load #296006 and reference 2481841")
+
+    assert out.load_ids == ["296006", "2481841"]
+
+
+@pytest.mark.unit
+def test_a_declared_length_still_clears_the_unlabelled_noise_around_a_named_load(
+    ctx: ToolContext,
+) -> None:
+    """The two guards compose: the label protects one id, the length drops the strays."""
+
+    out = _run(
+        ctx,
+        subject="(7 DIGIT LOAD#S)",
+        body="Mot Car 761291 Invoice IN-001208 Load #2481841",
+    )
+
+    assert out.load_ids == ["2481841"]

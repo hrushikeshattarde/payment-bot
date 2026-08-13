@@ -152,6 +152,19 @@ def _load_ids_in(text: str) -> list[str]:
     text = _URL_RE.sub(" ", text)
     found: list[str] = []
     for match in _LOAD_ID_RE.finditer(text):
+        # A load id is a sequence number and never carries a leading zero; a zero-padded
+        # one is a reference number formatted to a fixed width. Observed live on a WEX
+        # collections table whose Invoice cell read "IN-001208": the 001208 routed to
+        # CargoTel while the load beside it was 7-digit, and an answerable single-system
+        # email was refused as spanning both.
+        #
+        # This is deliberately NOT a rule about the "IN-" prefix. Suppressing digits after
+        # any letter-hyphen would also drop "INV-2462934", and `inv` must keep meaning the
+        # load itself — carriers write it that way, which is exactly why `inv` was left out
+        # of _NOT_A_LOAD_LABEL_RE. Padding is the orthogonal signal: no real id has it, and
+        # a sender writing "INV 2462934" is unaffected.
+        if match.group().startswith("0"):
+            continue
         before = text[max(0, match.start() - 24) : match.start()]
         if _NOT_A_LOAD_LABEL_RE.search(before):
             continue
@@ -223,6 +236,71 @@ def _prefer_labelled_loads_across_systems(load_ids: list[str], text: str) -> lis
             "unlabelled_cross_system_id_dropped",
             extra={"dropped": dropped, "kept": kept, "labelled_system": wanted.value},
         )
+    return kept
+
+
+#: A sender stating outright how long our load ids are — "(7 DIGIT LOAD#S)", "6-digit loads".
+#:
+#: Factors label our account in their own system and put that label in the subject and in
+#: the table, which is where this comes from. It has to say *load*: "7 digit" beside
+#: anything else is a coincidence, and this must never fire on one.
+_DECLARED_ID_LENGTH_RE = re.compile(r"\b([67])[\s-]*digit[\s-]*load", re.IGNORECASE)
+
+
+def _prefer_declared_id_length_across_systems(load_ids: list[str], text: str) -> list[str]:
+    """When ids disagree about system, keep the length the sender says our loads are.
+
+    Fourth instance of the shape :func:`_prefer_labelled_loads_across_systems` documents, and
+    the first where the label sits in a **column header** rather than beside the number. A WEX
+    collections table arrived as ``Carrier | Mot Car | Account | Mot Car | Invoice | Load |
+    Age | Balance`` over ``FFS Brothers LLC | 1601899 | CIRCLE LOGISTICS, INC (IN) (7 DIGIT
+    LOAD#S) | 761291 | IN-001208 | 2481841 | …``. Four ids, one real load.
+
+    The label guard cannot reach these: HTML flattening leaves 40-odd characters between
+    "Mot Car" and the number under it, and the proximity window is 24 — widening it would
+    start attaching labels to whatever happens to precede a number two cells later, which is
+    worse than the escalation.
+
+    So this uses the other positive evidence the same email carries: the sender has written
+    down what length our load ids are, twice. Preferring that length needs no knowledge of
+    what a "Mot Car" is.
+
+    Same safety envelope as the labelled guard, for the same reasons. It cannot fire on a
+    single-system email, cannot fire without an explicit declaration, and cannot fire when
+    the declaration would leave nothing — so a genuine two-system email still escalates,
+    which is the case a human must see. It only ever *filters*; it can never introduce an id.
+    """
+
+    if len(load_ids) < 2:
+        return load_ids
+
+    systems = {lid: domain_route_load(lid).system for lid in load_ids}
+    if len(set(systems.values())) < 2:
+        return load_ids
+
+    declared = {int(m.group(1)) for m in _DECLARED_ID_LENGTH_RE.finditer(text)}
+    if len(declared) != 1:  # nothing said, or the email contradicts itself
+        return load_ids
+
+    wanted = next(iter(declared))
+    # An id the sender explicitly CALLED a load outranks a length declared once in an
+    # account name, so it is never dropped here. The two can genuinely disagree — "Load
+    # #296006" under a "(7 DIGIT LOAD#S)" account — and when they do, the specific
+    # statement about that number beats the general one about the account.
+    labelled = {m.group(1) for m in _LOAD_LABEL_RE.finditer(text)}
+    kept = [lid for lid in load_ids if len(lid) == wanted or lid in labelled]
+    dropped = [lid for lid in load_ids if lid not in kept]
+    if not kept or not dropped:
+        return load_ids
+    # If protecting the labelled ids leaves the disagreement intact, the declaration did not
+    # resolve anything and the email still needs a human.
+    if len({domain_route_load(lid).system for lid in kept}) > 1:
+        return load_ids
+
+    _log.info(
+        "declared_length_cross_system_id_dropped",
+        extra={"dropped": dropped, "kept": kept, "declared_digits": wanted},
+    )
     return kept
 
 
@@ -600,6 +678,9 @@ class ExtractIdentifiers(Tool):
         invoice_numbers = _dedupe(_INVOICE_RE.findall(text))
         load_ids = _drop_stray_sender_invoice_ids(load_ids, invoice_numbers)
         load_ids = _prefer_labelled_loads_across_systems(load_ids, text)
+        # After the label guard, not before: an id the sender actually called a load is
+        # stronger evidence than a length they declared once in an account name.
+        load_ids = _prefer_declared_id_length_across_systems(load_ids, text)
 
         stated_rates: list[StatedRate] = []
         for line in text.splitlines():

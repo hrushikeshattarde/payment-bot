@@ -164,6 +164,68 @@ _MONEY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?")
 _INVOICE_RE = re.compile(r"invoice\s*(?:no\.?|number|#)?\s*:?\s*(\d{3,})", re.IGNORECASE)
 
 
+#: Words a sender uses for OUR load, as a label immediately before the number.
+#:
+#: ``reference`` belongs here rather than among the sender's own references: factoring
+#: templates write the load itself as "Reference#: 2520504", which is why ``ref`` has always
+#: been excluded from :data:`_NOT_A_LOAD_LABEL_RE`.
+_LOAD_LABEL_RE = re.compile(
+    r"\b(?:load|order|pro|trip|reference|ref)\b\W{0,3}(?:no|nbr|num|number)?\W{0,3}(\d{6,7})\b",
+    re.IGNORECASE,
+)
+
+
+def _prefer_labelled_loads_across_systems(load_ids: list[str], text: str) -> list[str]:
+    """When ids disagree about system, keep the ones the sender CALLED a load.
+
+    Third instance of one shape. A VIP Logistics enquiry read "Load #2513318 / VIP
+    #282775-0-A": the first is a Transport Pro load, the second is the sender's own reference,
+    six digits, so it routed to CargoTel and the email was refused as spanning both systems.
+    OperFi's "Load #: 2485194" beside "OperFi Invoice #: 318354" is the same sentence with
+    different nouns, and RTS's "CHK 787147" was the same thing with a label
+    :data:`_NOT_A_LOAD_LABEL_RE` now knows.
+
+    Neither existing guard reaches this one. The label is a company abbreviation, so no fixed
+    list can hold it — every carrier and factor has its own — and nothing captured the number
+    as an invoice, so :func:`_drop_stray_sender_invoice_ids` had no candidate.
+
+    So this works from positive evidence instead: the sender wrote "Load #" in front of one
+    number and something else in front of the other. Preferring the labelled one needs no
+    knowledge of what the other label meant.
+
+    Deliberately cannot fire on a single-system email, and cannot fire unless a load label is
+    actually present. A genuine two-system email where neither id is labelled still escalates,
+    which is the case a human must see. Suppressing the *suffix* instead — ``282775-0-A`` — was
+    the other candidate and is wrong: a load id is legitimately followed by a hyphen and more,
+    as in CargoTel's own ``296006-INVDKD0098``.
+    """
+
+    if len(load_ids) < 2:
+        return load_ids
+
+    systems = {lid: domain_route_load(lid).system for lid in load_ids}
+    if len(set(systems.values())) < 2:
+        return load_ids
+
+    labelled = {m.group(1) for m in _LOAD_LABEL_RE.finditer(text)} & set(load_ids)
+    if not labelled:
+        return load_ids
+
+    keep_systems = {systems[lid] for lid in labelled}
+    if len(keep_systems) != 1:
+        return load_ids
+
+    wanted = next(iter(keep_systems))
+    kept = [lid for lid in load_ids if lid in labelled or systems[lid] is wanted]
+    dropped = [lid for lid in load_ids if lid not in kept]
+    if dropped:
+        _log.info(
+            "unlabelled_cross_system_id_dropped",
+            extra={"dropped": dropped, "kept": kept, "labelled_system": wanted.value},
+        )
+    return kept
+
+
 def _drop_stray_sender_invoice_ids(load_ids: list[str], invoice_numbers: list[str]) -> list[str]:
     """Drop an id that is only the sender's own invoice number, pulled into another system.
 
@@ -537,6 +599,7 @@ class ExtractIdentifiers(Tool):
         load_ids = _dedupe(_load_ids_in(text))
         invoice_numbers = _dedupe(_INVOICE_RE.findall(text))
         load_ids = _drop_stray_sender_invoice_ids(load_ids, invoice_numbers)
+        load_ids = _prefer_labelled_loads_across_systems(load_ids, text)
 
         stated_rates: list[StatedRate] = []
         for line in text.splitlines():

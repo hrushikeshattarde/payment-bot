@@ -58,6 +58,10 @@ gsheets-*.json
 # Tests use the synthetic fixture in tests/cargotel_pages.py instead.
 loads/
 load_*.html
+# Roster candidates awaiting review. Same class as the two roster files below — real company
+# names mapped to domains — and it was sitting untracked but NOT ignored, one `git add -A`
+# away from being published.
+factoring_domains_CANDIDATES*.json
 factoring_domains.json
 # Hand-verified send-from domains merged into the roster by the generator. Same class of
 # data as the file above: real company names mapped to the domains we will disclose to.

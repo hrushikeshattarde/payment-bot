@@ -572,3 +572,70 @@ def test_visible_text_in_a_styled_element_is_still_read(ctx: ToolContext) -> Non
     out = _run(ctx, html_text=email.html_text)
 
     assert out.load_ids == ["2502262"]
+
+
+# ---------------------------------------------------------------------------
+# When ids disagree about system, prefer the one the sender CALLED a load.
+#
+# Positive evidence, because the negative kind ran out: the competing label is a
+# company abbreviation, and no fixed list can hold every carrier's and factor's.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_a_company_reference_does_not_fake_a_second_system(ctx: ToolContext) -> None:
+    """Live regression, the third of this shape.
+
+    A VIP Logistics enquiry read "Load #2513318 / VIP #282775-0-A". The second is the sender's
+    own reference; six digits routed it to CargoTel and the email was refused as spanning both
+    systems. Neither existing guard reaches it — "VIP" is in no label list, and nothing
+    captured the number as an invoice.
+    """
+
+    out = _run(
+        ctx,
+        subject="Circle Logistics Statement",
+        body="Please advise on the payment date for the below load:\n\nLoad #2513318 / VIP #282775-0-A\n",
+    )
+
+    assert out.load_ids == ["2513318"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # No load label anywhere: nothing to prefer, so the escalation stands.
+        ("2513318 / VIP #282775-0-A", ["2513318", "282775"]),
+        # Neither id labelled: a genuine two-system email a human must see.
+        ("Load 2485194 and load 318354 please", ["2485194", "318354"]),
+        # Both labelled, in different systems: also a human's call, not ours.
+        ("Load 2485194 and load #318354", ["2485194", "318354"]),
+        # One system only: the rule cannot fire at all.
+        ("Load #2513318 / VIP #2513319-0-A", ["2513318", "2513319"]),
+    ],
+)
+def test_the_preference_only_fires_on_a_resolvable_disagreement(
+    ctx: ToolContext, body: str, expected: list[str]
+) -> None:
+    assert _run(ctx, body=body).load_ids == expected
+
+
+@pytest.mark.unit
+def test_reference_counts_as_a_load_label_not_a_sender_reference(ctx: ToolContext) -> None:
+    """Factoring templates write the load itself as "Reference#: 2520504".
+
+    That is why `ref` has always been excluded from `_NOT_A_LOAD_LABEL_RE`, and it has to mean
+    the same thing here or the rule would drop the very id it should keep.
+    """
+
+    assert _run(ctx, body="Reference#: 2520504 and VIP #282775").load_ids == ["2520504"]
+
+
+@pytest.mark.unit
+def test_a_hyphenated_load_reference_is_still_read(ctx: ToolContext) -> None:
+    """Suppressing the SUFFIX was the other candidate fix, and it is wrong.
+
+    CargoTel's own A/P invoice number is `<load id>-<carrier invoice>`, so a load id followed
+    by a hyphen and more is ordinary rather than suspicious.
+    """
+
+    assert _run(ctx, body="load 296006-INVDKD0098").load_ids == ["296006"]

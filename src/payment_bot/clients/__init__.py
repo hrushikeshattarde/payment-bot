@@ -68,6 +68,7 @@ from payment_bot.clients.llm import (
     ToolResultBlock,
     ToolSpec,
     ToolUseBlock,
+    build_bedrock_client,
 )
 from payment_bot.clients.llm_groq import (
     DEFAULT_GROQ_MODEL,
@@ -150,6 +151,7 @@ __all__ = [
     "TransportProHttpClient",
     "TransportProSettings",
     "UrllibTransport",
+    "build_bedrock_client",
     "build_cargotel_client",
     "build_gmail_api_client",
     "build_groq_client",

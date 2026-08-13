@@ -36,6 +36,12 @@ htmlcov/
 *.p12
 secrets/
 
+# Deployment parameters. No credentials — those are in Secrets Manager — but they do carry
+# the mailbox, the Transport Pro host and the CargoTel cookie location, and this repo is
+# public. params.example.json is the committed template.
+deploy/params.*.json
+!deploy/params.example.json
+
 # Local machine settings
 .claude/settings.local.json
 

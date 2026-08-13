@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
+from payment_bot.config import Settings, get_settings
 from payment_bot.errors import ClientError
 
 
@@ -230,6 +231,40 @@ class BedrockLlmClient:
             content=blocks,
             usage=response.get("usage", {}) or {},
         )
+
+
+def build_bedrock_client(
+    settings: Settings | None = None,
+    client: Any | None = None,
+) -> BedrockLlmClient:
+    """Build a :class:`BedrockLlmClient` from ``PAYBOT_MODEL_DRAFT`` / ``PAYBOT_AWS_REGION``.
+
+    The counterpart to :func:`~payment_bot.clients.llm_groq.build_groq_client`, so the two
+    providers are chosen the same way and the Lambda handler reads like the local runner.
+
+    ``aws_profile`` is honoured for the same reason it exists at all: boto3 reads the
+    *process* environment and never ``.env``, so a workstation run against Bedrock would
+    otherwise fail to find credentials that work fine from the shell. It must stay blank in
+    Lambda, where the execution role is the credential source — naming a profile that does
+    not exist there would break the call outright.
+    """
+
+    resolved = settings or get_settings()
+    if client is None and resolved.aws_profile:
+        try:
+            import boto3
+        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+            raise ClientError(
+                "boto3 is required for BedrockLlmClient. Install with the 'aws' extra: "
+                "pip install -e '.[aws]'"
+            ) from exc
+        session = boto3.Session(profile_name=resolved.aws_profile)
+        client = session.client("bedrock-runtime", region_name=resolved.aws_region)
+    return BedrockLlmClient(
+        model_id=resolved.model_draft,
+        region=resolved.aws_region,
+        client=client,
+    )
 
 
 # ---------------------------------------------------------------------------

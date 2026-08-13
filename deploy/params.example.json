@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "Copy to params.prod.json (or params.staging.json) and fill in. Keys match the",
+    "Parameters block in template.yaml; anything omitted keeps the template default.",
+    "",
+    "NO SECRETS BELONG HERE. The Google service-account key and the Transport Pro",
+    "password live in Secrets Manager — the stack creates both as empty placeholders",
+    "and deploy.ps1 prints the put-secret-value commands to fill them.",
+    "",
+    "Keys beginning with an underscore are ignored by the deploy scripts."
+  ],
+
+  "GmailUser": "hrushikesh.attarde@circledelivers.com",
+  "_GmailUser": "A real user, not the group. Google Groups cannot be impersonated, so read a member's mailbox and let GmailQuery narrow it to group mail.",
+
+  "GmailQuery": "is:unread to:paystatus@circledelivers.com",
+  "FetchLimit": 5,
+  "_FetchLimit": "5, not the local 10. The turn budget scales with load count, so ten multi-load emails can exceed Lambda's 15-minute cap. Raise only after measuring.",
+
+  "TransportProBaseUrl": "",
+  "TransportProUsername": "",
+
+  "BedrockModelId": "us.anthropic.claude-sonnet-5-v1:0",
+  "_BedrockModelId": "Model access must be enabled by hand first — see README.md step 1. Verify with: aws bedrock list-inference-profiles",
+
+  "RosterBucket": "",
+  "RosterKey": "factoring_domains.json",
+  "_RosterBucket": "Where factoring_domains.json lives. Blank disables the fetch and the inline PAYBOT_FACTORING_DOMAINS patches stand alone.",
+
+  "CargoTelReplies": "true",
+  "CargoTelCookieBucket": "circle-bot-cookies",
+  "CargoTelCookieKey": "rubicon/cargotel.json",
+  "_CargoTelCookieBucket": "The login bot's bucket, not ours. The stack grants read on this one key only. If it is in another AWS account, that account must also allow this role — see README.md.",
+
+  "AllowFactoring": "true",
+  "SensitiveBankReplies": "true",
+  "SensitiveNoaReplies": "true",
+
+  "ReplySignature": "Circle Delivers Payments",
+  "ReplyCc": "hrushikesh.attarde@circledelivers.com",
+  "DocumentsEmail": "freightpay@circledelivers.com",
+  "PortalUrl": "",
+
+  "Timezone": "America/New_York",
+  "_Timezone": "Correctness input, not a logging detail — the gate's tense check judges dates against it. Use the zone name; TZ=EST pins UTC-5 all year and is wrong every summer.",
+
+  "ScheduleEnabled": "false",
+  "_ScheduleEnabled": "Deploy disabled. Invoke manually once, diff against the workstation log, then flip to true and redeploy (cutover step 2).",
+  "ScheduleExpression": "cron(15,35,55 * * * ? *)",
+
+  "LogRetentionDays": 90,
+  "AlarmEmail": ""
+}

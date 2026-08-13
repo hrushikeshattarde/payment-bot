@@ -1,0 +1,8 @@
+# Shell scripts must keep LF endings whatever the checkout platform does. Git on Windows
+# converts to CRLF by default, and a `#!/usr/bin/env bash\r` shebang fails on Linux with
+# the famously unhelpful "bad interpreter: No such file or directory" — the deploy script
+# is authored on Windows and runs in CI, so it would hit exactly that.
+*.sh text eol=lf
+
+# PowerShell is the mirror case: keep it CRLF so Windows tooling reads it natively.
+*.ps1 text eol=crlf

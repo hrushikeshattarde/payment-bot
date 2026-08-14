@@ -130,7 +130,17 @@ class CargoTelPaymentState(BaseModel):
     #: The N that was applied.
     net_days: int | None = None
     payable: Decimal | None = None
-    #: Which of :data:`REQUIRED_DOCUMENTS` are not yet on file.
+    #: Which of :data:`REQUIRED_DOCUMENTS` the SENDER still has to send — populated only in
+    #: :attr:`BillingState.AWAITING_PAPERWORK`, and empty in every other state.
+    #:
+    #: It used to carry the raw file-list gap in every state, and that is what produced the
+    #: A & J and load-301230 replies: an invoice or BOL that reached billing by email is never
+    #: in the Print Docs menu, so the gap persists on ``invoiced_no_terms`` and ``scheduled``
+    #: too — and the skill keys "name what is in missing_documents and ask the sender to send
+    #: it" off this field. The model was reading it correctly; the field was answering a
+    #: different question than the one it was being asked. The gap itself is not lost: it goes
+    #: into :attr:`note` via :func:`_file_list_gap_note`, which says plainly that it is not
+    #: what is holding payment.
     missing_documents: tuple[str, ...] = ()
     #: Plain-language note on anything the reply must not paper over.
     note: str | None = None
@@ -150,6 +160,23 @@ def missing_documents(load: CargoTelLoad) -> tuple[str, ...]:
     if not load.has_carrier_invoice:
         missing.append("carrier invoice")
     return tuple(missing)
+
+
+def _file_list_gap_note(missing: tuple[str, ...]) -> str:
+    """The note for a load billing has invoiced while the file list still shows a gap.
+
+    Shared by :attr:`BillingState.SCHEDULED` and :attr:`BillingState.INVOICED_NO_TERMS`
+    because the gap means the same thing in both: the document arrived by some route other
+    than the Print Docs menu, and payment is not waiting on it. Says so explicitly rather
+    than only forbidding the "complete" claim — a note that lists a missing document without
+    saying who owns it is how the ask got written in the first place.
+    """
+
+    return (
+        f"billing has the invoice, but the file list still shows no {', '.join(missing)} — do "
+        "not tell the sender their paperwork is complete, and do NOT ask them for it: it "
+        "arrived by another route and is not what is holding this payment"
+    )
 
 
 def resolve_payment(
@@ -174,11 +201,12 @@ def resolve_payment(
     payable = load.payable
 
     if load.pay_hold:
+        # No missing_documents: a hold is not answered by paperwork, and naming a document
+        # here invites a reply that blames the sender for a hold they cannot clear.
         return CargoTelPaymentState(
             state=BillingState.ON_HOLD,
             invoice_received=load.invoice_received,
             payable=payable,
-            missing_documents=missing,
             note=(
                 "this load is on an accounting hold, so no payment date can be given and "
                 "the reply must not imply one — it needs a human"
@@ -215,15 +243,21 @@ def resolve_payment(
     if term is None:
         # Invoice in, but nobody set the terms. Deliberately not defaulted to 30 — see
         # `CargoTelLoad.net_days`.
+        note = (
+            "the invoice is in but no payment terms are set on this load, so no date "
+            "can be computed — state that it is being processed and give no date"
+        )
+        if missing:
+            # The A & J shape (loads 291174/291180/291117): invoice recorded 07/14, no
+            # attachment in the menu, no terms. This branch used to pass `missing` through
+            # with a note that never mentioned it, so the only thing the model saw about the
+            # document was a field that reads as a chore for the sender.
+            note = f"{note}. Also: {_file_list_gap_note(missing)}"
         return CargoTelPaymentState(
             state=BillingState.INVOICED_NO_TERMS,
             invoice_received=load.invoice_received,
             payable=payable,
-            missing_documents=missing,
-            note=(
-                "the invoice is in but no payment terms are set on this load, so no date "
-                "can be computed — state that it is being processed and give no date"
-            ),
+            note=note,
         )
 
     assert load.invoice_received is not None  # is_invoiced guarantees this
@@ -232,20 +266,15 @@ def resolve_payment(
     # A paid-looking load that is still missing paperwork is worth flagging rather than
     # smoothing over: billing accepted an invoice while the file list says a document is
     # absent, which usually means it arrived by another route. The date stands; the reply
-    # simply should not also claim the paperwork is complete.
-    note = None
-    if missing:
-        note = (
-            f"billing has the invoice, but the file list still shows no {', '.join(missing)}"
-            " — do not tell the sender their paperwork is complete"
-        )
-
+    # simply should not also claim the paperwork is complete — nor chase it. Load 301230
+    # was scheduled for a date already past, with no BOL 05 in the menu, and the draft told
+    # the factor to send one: a document we generate ourselves, for a payment it was not
+    # holding, in answer to a question about status.
     return CargoTelPaymentState(
         state=BillingState.SCHEDULED,
         expected_payment_date=expected,
         invoice_received=load.invoice_received,
         net_days=days,
         payable=payable,
-        missing_documents=missing,
-        note=note,
+        note=_file_list_gap_note(missing) if missing else None,
     )

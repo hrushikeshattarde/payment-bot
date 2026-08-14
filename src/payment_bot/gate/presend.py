@@ -33,6 +33,15 @@ Checks (all must pass):
     either way. The blind spot widened once more: checks 3, 12 and 13 all police *dates*,
     and none of them looks at a claim about payment state — which on this path no tool
     reports, so the words can only have come from the model or its prompt.
+15. **Paperwork request** — a 6-digit load's reply asks the sender for a document only when
+    that load is genuinely ``awaiting_paperwork``. Check 14 polices whether a load was
+    *paid*; this polices whose *court the ball is in*, which is a different claim and was
+    likewise checked by nothing.
+16. **Deduction disclosure** — a 6-digit load's reply never asserts a load is clear of
+    advances, deductions or claims, and never answers a sender who asked about them with
+    silence. The CargoTel payable is a single figure with no line items, so "no deductions"
+    is ungrounded by construction — and a factor asks that question precisely because it is
+    about to advance money, which makes an unanswered one read as "none".
 """
 
 from __future__ import annotations
@@ -42,6 +51,7 @@ import re
 from pydantic import BaseModel
 
 from payment_bot.domain import route_load
+from payment_bot.domain.cargotel import BillingState, resolve_payment
 from payment_bot.errors import ClientError, ToolError
 from payment_bot.grounding import (
     extract_date_tokens,
@@ -67,6 +77,7 @@ from payment_bot.tools.shared import (
     CheckAuthorizationInput,
     DetectSensitiveChange,
     DetectSensitiveChangeInput,
+    strip_quoted,
 )
 from payment_bot.tools.submit import TOOL_NAMES, SubmitDraftOutput
 
@@ -159,6 +170,127 @@ def _cargotel_payment_claims(text: str) -> list[str]:
     return [label for label, pattern in _CGT_PAYMENT_CLAIM_PATTERNS if pattern.search(text)]
 
 
+#: The documents a reply can put back on the sender. ``paperwork``/``documents`` are here
+#: because the ask is just as actionable when it names no specific file.
+_PAPERWORK_NOUN = (
+    r"(?:carrier\s+)?invoices?|bills?\s+of\s+lading|bol\s*0?5|bols?"
+    r"|paperwork|documents?|documentation"
+)
+
+#: Wording that puts a document back on the sender — "send us X", "awaiting your X", "we have
+#: not received X", "X is still outstanding".
+#:
+#: The gap between trigger and noun is ``[^.!?\n]`` rather than a word count, so a match can
+#: never straddle a sentence boundary. That is what keeps "there's nothing further we need
+#: from you. We don't have a payment date yet" from reading as a request for a payment date:
+#: with a word-window the two sentences join up, and the check would fire on the very wording
+#: it exists to make sayable.
+_PAPERWORK_REQUEST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "asks the sender to send it",
+        re.compile(
+            rf"\b(?:send|resend|forward|email|provide|submit|upload|attach)\b"
+            rf"[^.!?\n]{{0,40}}?\b(?:{_PAPERWORK_NOUN})\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "says we are awaiting it",
+        re.compile(
+            rf"\b(?:awaiting|await|waiting\s+(?:on|for))\b"
+            rf"[^.!?\n]{{0,40}}?\b(?:{_PAPERWORK_NOUN})\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "says we have not received it",
+        re.compile(
+            rf"\b(?:not|never|haven't|havent|don't|dont)\b[^.!?\n]{{0,20}}?"
+            rf"\b(?:received|receive|have|got)\b[^.!?\n]{{0,30}}?\b(?:{_PAPERWORK_NOUN})\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "calls it outstanding",
+        re.compile(
+            rf"\b(?:need|needs|needed|require|requires|required|missing|outstanding)\b"
+            rf"[^.!?\n]{{0,40}}?\b(?:{_PAPERWORK_NOUN})\b",
+            re.IGNORECASE,
+        ),
+    ),
+    # The same claim with the noun first — "your BOL is still outstanding", "the carrier
+    # invoice is missing from our file". Only the predicate words go here: a bare "need"
+    # in this direction would fire on "nothing further we need from you".
+    (
+        "says it is outstanding",
+        re.compile(
+            rf"\b(?:{_PAPERWORK_NOUN})\b[^.!?\n]{{0,30}}?"
+            rf"\b(?:missing|outstanding|still\s+needed|still\s+required|not\s+on\s+file)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _paperwork_requests(text: str) -> list[str]:
+    """Labels of every way ``text`` puts a document back on the sender."""
+
+    return [label for label, pattern in _PAPERWORK_REQUEST_PATTERNS if pattern.search(text)]
+
+
+#: Phrases that mean a sender is asking whether the payable is net of anything.
+#:
+#: Phrases, never bare words, and the reason is recorded in ``_RATE_SIGNALS``: bare "advance"
+#: scored "Thank you in Advance, ACDS TEAM" as a rate request at 0.9 confidence, and "claim"
+#: was the same shape. A signature or a legal disclaimer is not stripped from a sender's own
+#: text the way quoted history is, so a single ordinary word here would fire on boilerplate.
+#: "claims" is therefore admitted only alongside a deduction word — "no claims and no
+#: deductions" is the real phrasing and it carries its own corroboration.
+_DEDUCTION_QUESTION_SIGNALS: tuple[str, ...] = (
+    "fuel advance", "fuel advances", "advance payment", "payment advance", "cash advance",
+    "advances or deductions", "advances and deductions", "advances, claims",
+    "deduction", "deductions", "deducted",
+    "chargeback", "chargebacks", "charge back", "charge backs",
+    "short pay", "short-pay", "shortpay", "shortpays",
+    "claims or deductions", "claims and deductions", "claims, deductions",
+)  # fmt: skip
+
+#: The vocabulary a reply uses when it *does* address the question, either way.
+#:
+#: "in advance" is removed before this is applied — a reply signing off "thanks in advance"
+#: must not count as having addressed deductions. That direction of error is the dangerous
+#: one here: it would mark the check satisfied and let the silence through.
+_DEDUCTION_TOPIC_RE = re.compile(
+    r"\b(?:advances?|deductions?|deducted|chargebacks?|charge\s?backs?|claims?"
+    r"|short\s?pays?|offsets?)\b",
+    re.IGNORECASE,
+)
+
+_IN_ADVANCE_RE = re.compile(r"\bin\s+advance\b", re.IGNORECASE)
+
+#: A reply asserting the load is clean. Ungrounded on the CargoTel path by construction:
+#: ``amount`` is one payable and the tool returns no line items, so neither the presence nor
+#: the absence of a deduction is reported. "We have no record of deductions" is included
+#: deliberately — no record is what this path always shows, so offering it as an answer
+#: dresses a structural blind spot up as a finding.
+_DEDUCTION_CLEAR_CLAIM_RE = re.compile(
+    r"\b(?:no|not\s+any|none|without|free\s+of|clear\s+of|zero)\b[^.!?\n]{0,30}?"
+    r"\b(?:advances?|deductions?|chargebacks?|claims?|short\s?pays?|offsets?)\b",
+    re.IGNORECASE,
+)
+
+
+def _deduction_questions(text: str) -> list[str]:
+    """Every advance/deduction phrase the sender used, matched as whole words."""
+
+    lowered = text.lower()
+    return [
+        phrase
+        for phrase in _DEDUCTION_QUESTION_SIGNALS
+        if re.search(rf"\b{re.escape(phrase)}\b", lowered)
+    ]
+
+
 class GateCheck(BaseModel):
     """Outcome of one named gate check."""
 
@@ -217,6 +349,8 @@ class PreSendGate:
             self._check_weekday_consistency(draft),
             self._check_tense_consistency(draft, ctx),
             self._check_cargotel_payment_claim(draft),
+            self._check_paperwork_request(draft, ctx),
+            self._check_deduction_disclosure(draft, email),
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
             self._check_carrier_consistency(draft, email, ctx),
@@ -705,3 +839,187 @@ class PreSendGate:
             passed=True,
             detail="reply makes no claim about whether a 6-digit load was paid",
         )
+
+    def _check_paperwork_request(self, draft: SubmitDraftOutput, ctx: ToolContext) -> GateCheck:
+        """A 6-digit load's reply may ask for a document only while it is awaiting one.
+
+        Live regression, loads 291174/291180/291117 (A & J Transport). Billing had recorded
+        the carrier's invoice on 07/14/2026 and assigned A/P number ``291756-00000938``, so
+        ``resolve_payment`` returned ``invoiced_no_terms`` with the note "state that it is
+        being processed and give no date". The draft answered: "All three are awaiting your
+        carrier invoice ... Please send the carrier invoices." Every figure was grounded and
+        every other check was green — on the sender's third attempt to get an answer, after
+        two ignored calls.
+
+        The model did not invent it. ``missing_documents`` is returned **non-empty in states
+        that are not awaiting paperwork**: an invoice that reached billing by email is never
+        in the CargoTel Print Docs menu, so ``('carrier invoice',)`` rides along on both
+        ``invoiced_no_terms`` and ``scheduled``. The skill keys "name it and ask the sender to
+        send it" off that field, so the wrong branch is one plausible read away, and the
+        ``note`` forbidding it is prose the prompt cannot enforce. That is the argument for
+        the check: the field the model was told to read genuinely does say "carrier invoice"
+        here — only ``billing_state`` says whose problem it is.
+
+        Fails closed when the state cannot be re-derived, which is reachable only for a draft
+        that *is* making the ask. A caller who cannot confirm the ball is in the sender's
+        court must not tell them it is; the cost is a block on the one shape worth blocking,
+        not on every reply.
+
+        Scoped to 6-digit loads. Transport Pro's document requirements come from its own file
+        history (``REQUIRED_FOR_PAYMENT``) and have no ``BillingState`` to check against, so
+        the ask stays sayable there.
+        """
+
+        cargotel_loads = [
+            lid for lid in draft.load_ids if route_load(lid).system is System.QUICKBOOKS
+        ]
+        if not cargotel_loads:
+            return GateCheck(
+                name="paperwork_request",
+                passed=True,
+                detail="no 6-digit load disclosed; paperwork requests are not policed here",
+            )
+
+        asks = _paperwork_requests(draft.reply_body)
+        if not asks:
+            return GateCheck(
+                name="paperwork_request",
+                passed=True,
+                detail="reply asks the sender for no document",
+            )
+
+        states: dict[str, str] = {}
+        for load_id in cargotel_loads:
+            try:
+                states[load_id] = self._cargotel_billing_state(load_id, ctx).value
+            except (ClientError, ToolError) as exc:
+                return GateCheck(
+                    name="paperwork_request",
+                    passed=False,
+                    detail=(
+                        f"reply asks the sender for paperwork ({asks}) but load {load_id}'s "
+                        f"billing state could not be re-derived to justify it: {exc}"
+                    ),
+                )
+
+        awaiting = [lid for lid, state in states.items() if state == BillingState.AWAITING_PAPERWORK]
+        if awaiting:
+            return GateCheck(
+                name="paperwork_request",
+                passed=True,
+                detail=f"paperwork request justified — load(s) {awaiting} are awaiting_paperwork",
+            )
+
+        spread = ", ".join(f"{lid}={state}" for lid, state in sorted(states.items()))
+        return GateCheck(
+            name="paperwork_request",
+            passed=False,
+            detail=(
+                f"reply asks the sender for paperwork ({asks}) but no disclosed load is "
+                f"awaiting_paperwork: {spread}. An invoice that reached billing by email is "
+                "not in the Print Docs menu, so missing_documents can name it while the ball "
+                "is with us — say it is being processed and ask the sender for nothing."
+            ),
+        )
+
+    def _check_deduction_disclosure(
+        self, draft: SubmitDraftOutput, email: InboundEmail
+    ) -> GateCheck:
+        """A 6-digit load's reply neither claims it is clean nor ignores the question.
+
+        Live regression, load 317967 (Shadow Freight, Saint John Capital, 2026-08-14). The
+        factor asked three things: the rate, "if there were any fuel advances, no claims and
+        no deductions", and whether SJC was the factor of record. The draft answered the
+        first and third and said nothing at all about the second. It was blocked — but on the
+        *factor* sentence, for an unrelated wording collision. Reword that one clause and the
+        draft ships with the money question silently dropped.
+
+        Silence is not neutral here. A factor asks because it is about to advance funds
+        against the invoice, so "we didn't mention it" is read as "nothing to report". If an
+        advance exists, they advance against the gross, we remit less, and the reply is what
+        they relied on. ``_check_coverage`` cannot see it: that check counts load ids, not
+        questions.
+
+        The opposite failure is worse and is checked first, whether or not anyone asked.
+        ``amount`` on this path is a single payable and ``CgtLoadStatusOutput`` returns no
+        line items — the skill forbids breaking it into a rate plus charges for exactly that
+        reason. So "no deductions" is ungrounded *by construction*, the same footing as the
+        paid/unpaid ban in check 14. Grounding cannot catch it: there is no figure in the
+        sentence to trace.
+
+        What passes is the honest shape — name the topic, say this system does not carry it,
+        hand it to a human. That is the only wording that is both responsive and true.
+
+        Scoped to 6-digit loads. Transport Pro earning lines carry deductions as real signed
+        figures (``-11.25`` reaching a reply as "a deduction of $11.25"), so there the
+        question is answerable and a definite answer is grounded.
+        """
+
+        cargotel_loads = [
+            lid for lid in draft.load_ids if route_load(lid).system is System.QUICKBOOKS
+        ]
+        if not cargotel_loads:
+            return GateCheck(
+                name="deduction_disclosure",
+                passed=True,
+                detail="no 6-digit load disclosed; deductions are reportable here",
+            )
+
+        clean_claim = _DEDUCTION_CLEAR_CLAIM_RE.search(draft.reply_body)
+        if clean_claim:
+            return GateCheck(
+                name="deduction_disclosure",
+                passed=False,
+                detail=(
+                    f"draft asserts 6-digit load(s) {cargotel_loads} are clear of "
+                    f"advances/deductions — {' '.join(clean_claim.group(0).split())!r} — which "
+                    "this path cannot support: the payable is one figure with no line items. "
+                    "Say it cannot be confirmed here and that someone will follow up."
+                ),
+            )
+
+        asked = _deduction_questions(f"{email.subject}\n{strip_quoted(email.body)}")
+        if not asked:
+            return GateCheck(
+                name="deduction_disclosure",
+                passed=True,
+                detail="sender asked about no advance/deduction, and the draft claims none",
+            )
+
+        answered = _DEDUCTION_TOPIC_RE.search(_IN_ADVANCE_RE.sub(" ", draft.reply_body))
+        if answered is None:
+            return GateCheck(
+                name="deduction_disclosure",
+                passed=False,
+                detail=(
+                    f"sender asked about advances/deductions ({asked}) on 6-digit load(s) "
+                    f"{cargotel_loads} and the reply does not mention them at all. Silence "
+                    "reads as 'none' to a factor about to advance against this invoice — say "
+                    "the payment record does not carry it and that someone will follow up."
+                ),
+            )
+        return GateCheck(
+            name="deduction_disclosure",
+            passed=True,
+            detail="advance/deduction question addressed without asserting a clean load",
+        )
+
+    def _cargotel_billing_state(self, load_id: str, ctx: ToolContext) -> BillingState:
+        """Re-derive one CargoTel load's billing state, carrier terms included.
+
+        The carrier record is fetched for the same reason ``CgtGetLoadStatus`` fetches it: it
+        supplies the payment term for a load carrying none, and that is the difference between
+        ``invoiced_no_terms`` and ``scheduled``. Its absence is not fatal here — neither state
+        is ``awaiting_paperwork``, so the check's answer does not turn on it.
+        """
+
+        if ctx.cargotel is None:
+            raise ToolError(f"load {load_id} is a 6-digit load but no CargoTel client is wired")
+        load = ctx.cargotel.get_load(load_id)
+        carrier = None
+        if load.carrier_client_id:
+            try:
+                carrier = ctx.cargotel.get_carrier(load.carrier_client_id)
+            except (ClientError, ToolError):
+                carrier = None
+        return resolve_payment(load, carrier).state

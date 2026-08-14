@@ -371,14 +371,54 @@ def test_a_pay_hold_outranks_everything() -> None:
 
 
 def test_a_scheduled_load_still_missing_paperwork_is_flagged() -> None:
-    """Billing accepted an invoice the file list does not show — say the date, not "complete"."""
+    """Billing accepted an invoice the file list does not show — say the date, not "complete".
+
+    The gap goes in the NOTE, not in ``missing_documents``. Live regression, load 301230:
+    scheduled for a date already past, no BOL 05 in the Print Docs menu, and the draft asked
+    the factor to send one — a document CargoTel generates itself, for a payment it was not
+    holding. ``missing_documents`` is what the sender still owes us, and on a scheduled load
+    that is nothing; the skill asks for whatever is in that field, so anything left there is
+    a chore invented for someone who did their part.
+    """
 
     state = resolve_payment(_load(invoice_received="07/07/2026", bol05=False))
 
     assert state.state is BillingState.SCHEDULED
     assert state.expected_payment_date == date(2026, 8, 6)
-    assert state.missing_documents == ("BOL 05",)
-    assert state.note is not None and "do not tell the sender" in state.note
+    assert state.missing_documents == ()
+    assert state.note is not None
+    assert "BOL 05" in state.note  # still visible, just not as an ask
+    assert "do not tell the sender" in state.note
+    assert "do NOT ask them for it" in state.note
+
+
+def test_an_invoiced_load_with_no_terms_names_the_file_gap_in_its_note() -> None:
+    """The A & J shape: invoice recorded, nothing in the menu, no terms set.
+
+    Loads 291174/291180/291117 — invoice received 07/14/2026 by email, so no attachment ever
+    appeared in the Print Docs menu. This branch used to pass ``missing_documents`` through
+    with a note that never mentioned the document, which left the field as the only thing the
+    model saw about it. It reads as a chore for the sender, and that is how a carrier who had
+    waited a month was told we were waiting on her.
+    """
+
+    state = resolve_payment(_load(invoice_received="07/14/2026", ap_terms=None, carrier_invoices=None))
+
+    assert state.state is BillingState.INVOICED_NO_TERMS
+    assert state.missing_documents == ()
+    assert state.note is not None
+    assert "no payment terms" in state.note
+    assert "carrier invoice" in state.note
+    assert "do NOT ask them for it" in state.note
+
+
+def test_a_hold_names_no_paperwork() -> None:
+    """A hold is not answered by paperwork, and the sender cannot clear one."""
+
+    state = resolve_payment(_load(pay_hold=True, invoice_received=None, bol05=False))
+
+    assert state.state is BillingState.ON_HOLD
+    assert state.missing_documents == ()
 
 
 # --- the stale-cookie guard -------------------------------------------------

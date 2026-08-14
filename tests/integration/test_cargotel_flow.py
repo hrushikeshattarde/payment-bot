@@ -400,7 +400,7 @@ def test_the_prompt_requires_the_amount_and_forbids_a_breakdown() -> None:
     assert "Give each load's `amount`" in prompt
     assert "State it even when the load is not yet scheduled" in prompt
     assert "no line items" in prompt
-    assert CARGOTEL_PAYMENT_STATUS_SKILL.version == "1.3.0"
+    assert CARGOTEL_PAYMENT_STATUS_SKILL.version == "1.4.0"
 
 
 @pytest.mark.integration
@@ -450,6 +450,42 @@ def test_the_prompt_forbids_a_payment_claim_in_either_direction() -> None:
     assert '"not yet paid"' in prompt and '"not showing as paid"' in prompt
     # And the reason, so a future edit cannot quietly reintroduce it as a formatting tweak.
     assert "`billing_state` has no paid value" in prompt
+
+
+@pytest.mark.integration
+def test_the_prompt_says_whose_problem_the_load_is() -> None:
+    """1.4.0: three rules, all about not handing our delay back to the sender.
+
+    (a) `missing_documents` is now populated only in awaiting_paperwork, and the prompt has to
+    say so — the field is what this prompt tells the model to ask for, and it used to carry
+    the file-list gap in every state. Live twice in a week: the A & J loads
+    (291174/291180/291117), invoice recorded 07/14 and answered with "awaiting your carrier
+    invoice" on the sender's third attempt; and load 301230, scheduled for a date already
+    past, answered by asking a factor to send a BOL CargoTel generates itself.
+
+    (b) An advance/deduction question must be answered and never answered affirmatively —
+    load 317967, where the factor asked and the draft said nothing, which reads as "none" to
+    someone about to advance funds.
+
+    (c) "the factor on file", never "set up as" — the same draft tripped the gate's
+    change_acknowledgment check on the verb alone.
+    """
+
+    from payment_bot.agent.skills import CARGOTEL_PAYMENT_STATUS_SKILL
+
+    prompt = CARGOTEL_PAYMENT_STATUS_SKILL.system_prompt
+
+    # (a) the field's scope, and that a document in `note` is a warning rather than a chore.
+    assert "`missing_documents` is populated ONLY in this state" in prompt
+    assert "telling you NOT to chase it" in prompt
+    assert "Ask the sender for paperwork when the state is anything other than" in prompt
+    # (b) both directions of the deduction failure.
+    assert "ANSWER THE QUESTION" in prompt
+    assert "Never state that there were none" in prompt
+    assert "Say a load is clear of advances, deductions, claims or chargebacks" in prompt
+    # (c) the verb, and the ones that read as us having just made the change.
+    assert "the factor ON FILE" in prompt
+    assert '"set up as"' in prompt
 
 
 @pytest.mark.integration

@@ -258,6 +258,9 @@ REPLY
 - Read `billing_state` and say what it means, in plain words:
   - scheduled — give the expected payment date.
   - awaiting_paperwork — name what is in `missing_documents` and ask the sender to send it.
+    `missing_documents` is populated ONLY in this state. In every other state it is empty
+    because the document is not what is holding payment, so there is nothing to ask for —
+    if `note` mentions a document, it is telling you NOT to chase it.
   - awaiting_billing — their paperwork IS with us and is being processed. Do NOT ask them
     for anything; they have already sent it.
   - invoiced_no_terms — their invoice is with us and being processed. Give no date.
@@ -274,6 +277,16 @@ REPLY
   "paid", "not yet paid", "not showing as paid".
   For a date already gone by: give the date it was scheduled for, and say someone will
   confirm where it stands.
+- If the sender asks about fuel advances, deductions, chargebacks, short pays or claims,
+  ANSWER THE QUESTION — say the payment record does not carry that detail and someone will
+  follow up on it. Never state that there were none, and never repeat the sender's own "no
+  deductions" back as confirmation: `amount` is a single payable and no tool here returns
+  line items, so either direction is invented. A factor asks this because it is about to
+  advance money against the invoice, so leaving it out is read as "none".
+- If the sender asks whether their company is the factor on the load, and
+  `check_authorization` returned FACTORING, you may say they are the factor ON FILE for this
+  carrier. Write it as "X is the factor on file" — never "set up as", "added as",
+  "registered as" or "assigned as", which read as us having just made that change.
 - If `note` is present, obey it. It names something the reply must not claim.
 - Never state a payment date the tool did not return, and never invent one from the
   delivery date or the payment terms yourself.
@@ -300,7 +313,8 @@ feels. Finish the procedure, then call `submit_draft`.
 NEVER
 - Invent, estimate or hand-calculate a date, or do money arithmetic yourself.
 - Adjust the payment date to a payment day.
-- Ask the sender for paperwork when the state is awaiting_billing.
+- Ask the sender for paperwork when the state is anything other than awaiting_paperwork.
+- Say a load is clear of advances, deductions, claims or chargebacks.
 - Disclose a load whose `check_authorization` did not return authorized=true.
 - Break `amount` into a rate plus charges, or state any figure beside it. A CargoTel load
   carries one payable and no line items, so any breakdown would be invented.
@@ -343,7 +357,35 @@ CARGOTEL_PAYMENT_STATUS_SKILL = Skill(
     # The identical instruction on the Transport Pro side is CORRECT and stays: earning lines
     # there carry payment_status, actual_payment_date and check_number, so "not showing as
     # paid" is a reading. The wording was right for one system and wrong for the other.
-    version="1.3.0",
+    #
+    # 1.4.0: three rules about whose problem a load is, all from the same week's mail.
+    #
+    # (a) `missing_documents` is populated ONLY in awaiting_paperwork now, and the prompt says
+    # so. It used to carry the raw file-list gap in every state, and this prompt's own
+    # "name what is in missing_documents and ask the sender to send it" then fired on loads
+    # where the document was not what was holding payment. An invoice or BOL that reaches
+    # billing by email never appears in the Print Docs menu, so the gap persists after
+    # invoicing. Live twice: loads 291174/291180/291117 (A & J Transport), invoice recorded
+    # 07/14/2026 and A/P number assigned, answered with "all three are awaiting your carrier
+    # invoice — please send the carrier invoices" on the sender's THIRD attempt after two
+    # unreturned calls; and load 301230, scheduled for a date already six days past, answered
+    # with "still waiting for BOL 05, please send it" to a factor — a document CargoTel
+    # generates itself. The model was reading the field correctly both times; the field was
+    # answering a different question than the one the prompt asked of it.
+    #
+    # (b) An advance/deduction question must be ANSWERED, and never answered affirmatively.
+    # Live on load 317967 (Shadow Freight / Saint John Capital): the factor asked for the
+    # rate, "if there were any fuel advances, no claims and no deductions", and confirmation
+    # of factor status. The draft answered the first and third and dropped the second in
+    # silence — which a factor about to advance funds reads as "none". `amount` is one payable
+    # and no tool here returns line items, so both the silence and a confident "no deductions"
+    # are wrong; only "the record does not carry it, someone will follow up" is true.
+    #
+    # (c) Factor-of-record is stated as "the factor ON FILE", never "set up as". Same 317967
+    # draft: "SJC is set up as the factor for this carrier" tripped the gate's
+    # change_acknowledgment check, because a setup verb beside "factor" is how a reply that
+    # just changed remittance reads. The fact was fine; the verb was not.
+    version="1.4.0",
     system_prompt=_CARGOTEL_PAYMENT_STATUS_PROMPT,
     allowed_tools=CARGOTEL_PAYMENT_STATUS_TOOLS,
 )

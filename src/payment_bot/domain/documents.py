@@ -97,7 +97,22 @@ REQUIRED_FOR_PAYMENT: tuple[DocCategory, ...] = (
 )
 
 #: A cancel confirmation is recorded in a comment, not a type — and it escalates (§3.2).
+#:
+#: Searched against the file type and the comment SEPARATELY, never against the two joined by
+#: a space. Joining them lets a match straddle the seam: file type "Request to Cancel" beside
+#: comment "Load reinstated 8/1" reads as "…Cancel Load reinstated…" and put a load that ran
+#: normally on hold, with neither field containing the phrase on its own.
 _CANCEL_RE = re.compile(r"\bcancel\s+load\b", re.I)
+
+
+def _cancel_phrase_in(file_type: str, comments: str | None) -> str | None:
+    """The CANCEL LOAD phrase as written, or ``None``. Each field checked on its own."""
+
+    for field in (file_type, comments or ""):
+        found = _CANCEL_RE.search(field)
+        if found is not None:
+            return found.group(0)
+    return None
 
 
 class ClassifiedDocument(BaseModel):
@@ -133,6 +148,14 @@ class DocumentStatus(BaseModel):
     missing: list[DocCategory]
     by_category: list[CategorySummary]
     has_cancel_confirmation: bool = False
+    #: The documents that carried the phrase, as ``"<file type>: <comment>"``.
+    #:
+    #: The boolean says one exists; this says WHICH, and that is the part a person needs.
+    #: Live on load 2534597: the cancel confirmation was filed as file type "Carrier Rate
+    #: Agreement" — one of four rate agreements on the load — with the phrase only in its
+    #: comment. Nobody scanning the document list for something called a cancellation could
+    #: find it, and the escalation gave them no way to.
+    cancel_confirmation_sources: tuple[str, ...] = ()
 
     @property
     def is_complete(self) -> bool:
@@ -183,7 +206,7 @@ def assess_documents(
     classified: list[ClassifiedDocument] = []
     counts: dict[DocCategory, int] = {}
     latest: dict[DocCategory, date | None] = {}
-    has_cancel = False
+    cancel_sources: list[str] = []
 
     for file_type, type_id, uploaded, comments in documents:
         category = classify(file_type, type_id)
@@ -204,8 +227,10 @@ def assess_documents(
         elif category not in latest:
             latest[category] = known
 
-        if _CANCEL_RE.search(f"{file_type} {comments or ''}"):
-            has_cancel = True
+        if _cancel_phrase_in(file_type, comments) is not None:
+            cancel_sources.append(
+                f"{file_type}: {comments}" if comments else f"{file_type} (no comment)"
+            )
 
     present = sorted(counts, key=lambda c: c.value)
     status = DocumentStatus(
@@ -215,6 +240,7 @@ def assess_documents(
         by_category=[
             CategorySummary(category=c, count=counts[c], latest=latest.get(c)) for c in present
         ],
-        has_cancel_confirmation=has_cancel,
+        has_cancel_confirmation=bool(cancel_sources),
+        cancel_confirmation_sources=tuple(cancel_sources),
     )
     return status, classified

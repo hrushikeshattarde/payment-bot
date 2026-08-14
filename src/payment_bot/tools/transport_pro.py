@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from payment_bot.domain import compute_carrier_rate
 from payment_bot.domain.documents import DocCategory, assess_documents
-from payment_bot.errors import ToolError
+from payment_bot.errors import ClientError, ToolError
 from payment_bot.models import Deduction, DispatchRow, Earning, SettlementEntry
 from payment_bot.tools.base import Tool, ToolContext
 from payment_bot.tools.shared import LoadIdStr
@@ -197,6 +197,20 @@ class TpFileHistoryOutput(BaseModel):
     has_bol_or_pod: bool = False
     has_rate_agreement: bool = False
     has_cancel_confirmation: bool = False
+    #: Which document carried the phrase, so a reviewer can actually find it. The phrase lives
+    #: in a comment on an ordinary document type, so the file list alone never reveals it.
+    cancel_confirmation_sources: list[str] = Field(default_factory=list)
+    #: True when a cancel confirmation exists BUT the load went on to deliver under a carrier
+    #: whose dispatch is not canceled — i.e. the cancellation belongs to a superseded leg.
+    #:
+    #: ``has_cancel_confirmation`` is load-level and the document names only the load, so on a
+    #: re-dispatched load it cannot say whose cancellation it was. Live on 2534597: Nesh Trans
+    #: canceled, N S Express delivered, and a factor asking about N S Express was told the load
+    #: was under review for a cancellation belonging to the carrier that never ran it.
+    cancel_confirmation_superseded: bool = False
+    #: Carriers whose dispatch is canceled, and the carrier that delivered.
+    canceled_carriers: list[str] = Field(default_factory=list)
+    delivered_carrier: str | None = None
 
 
 class TpGetFileHistory(Tool):
@@ -214,7 +228,10 @@ class TpGetFileHistory(Tool):
         "proof of delivery/BOL, rate agreement), plus a per-category count of what is on "
         "file and whether a CANCEL LOAD confirmation exists. Read `missing_documents` — "
         "do not infer it yourself. A driver_upload row is a driver-app photo, not the "
-        "signed BOL: it never satisfies proof of delivery. A cancel confirmation escalates."
+        "signed BOL: it never satisfies proof of delivery. A cancel confirmation escalates, "
+        "UNLESS `cancel_confirmation_superseded` is true: the load was then re-dispatched and "
+        "delivered, and the cancellation belongs to `canceled_carriers` — a different carrier "
+        "from `delivered_carrier`, whose leg ran normally."
     )
     input_model = LoadIdInput
 
@@ -246,6 +263,29 @@ class TpGetFileHistory(Tool):
         for category in status.present:
             ctx.ledger.record_text("document", category.value, self.name, load_id)
 
+        # A cancel confirmation names only the load, so on its own it cannot say WHOSE
+        # dispatch was canceled. The dispatch rows can, and this tool is where both are
+        # reachable — the model must not be left to join them, because it would have to call
+        # a second tool it has no reason to call and then reason about supersession.
+        superseded = False
+        canceled_carriers: list[str] = []
+        delivered_carrier: str | None = None
+        if status.has_cancel_confirmation:
+            rows: list[DispatchRow] = []
+            try:
+                rows = list(ctx.tp.get_dispatch_history(load_id))
+            except (ClientError, ToolError):
+                # Unreadable dispatch history must not fail the document read, and must not
+                # claim supersession either: `superseded` stays False, so the hold stands.
+                rows = []
+            canceled_carriers = [r.carrier_name for r in rows if r.is_canceled]
+            delivered = next((r for r in rows if r.is_delivered and not r.is_canceled), None)
+            delivered_carrier = delivered.carrier_name if delivered else None
+            # Delivered under a carrier whose own dispatch is not canceled means the load was
+            # re-dispatched and ran. Requiring a canceled row too keeps this from firing on a
+            # load whose cancel document is the only sign of a cancellation nobody recorded.
+            superseded = delivered is not None and bool(canceled_carriers)
+
         return TpFileHistoryOutput(
             load_id=load_id,
             document_count=status.document_count,
@@ -259,6 +299,10 @@ class TpGetFileHistory(Tool):
             has_bol_or_pod=DocCategory.PROOF_OF_DELIVERY in present,
             has_rate_agreement=DocCategory.RATE_AGREEMENT in present,
             has_cancel_confirmation=status.has_cancel_confirmation,
+            cancel_confirmation_sources=list(status.cancel_confirmation_sources),
+            cancel_confirmation_superseded=superseded,
+            canceled_carriers=canceled_carriers,
+            delivered_carrier=delivered_carrier,
         )
 
 

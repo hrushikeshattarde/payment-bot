@@ -189,6 +189,14 @@ REPLY
 HOLD — draft a short reply naming each load id ("load 2520677 is under review") and do NOT confirm the rate — when
 `tp_get_file_history` shows a CANCEL LOAD confirmation or conflicting rate agreements, or the
 carrier or rate is ambiguous across dispatch rows.
+- A cancel confirmation is NOT a hold reason when `cancel_confirmation_superseded` is true.
+  The load was re-dispatched after that cancellation and delivered under `delivered_carrier`,
+  so the cancelled leg belongs to `canceled_carriers` — a different company. Never describe
+  the load as cancelled, under review for a cancellation, or in doubt on those grounds to a
+  sender asking about `delivered_carrier`: their leg ran. Hold only if something ELSE on the
+  list qualifies, and then say what.
+- `has_cancel_confirmation` is load-level and the document names only the load, so it can
+  never tell you whose cancellation it was on its own. Read the three fields beside it.
 
 DELIVERY
 Your reply exists only if you call `submit_draft`. Prose written outside that tool call is
@@ -219,7 +227,23 @@ RATE_VERIFICATION_SKILL = Skill(
     #
     # 1.10.0: same pay-date change as payment_status — copy `scheduled_pay_date_display`
     # rather than assembling a weekday. Both prompts carried the identical formatting rule.
-    version="1.10.0",
+    #
+    # 1.11.0: a superseded cancellation is not a hold reason. `has_cancel_confirmation` is
+    # load-level and the document names only the load, never a carrier, so on a re-dispatched
+    # load nothing said whose leg was cancelled. Live on load 2534597: Nesh Trans cancelled,
+    # N S Express delivered, four Carrier Rate Agreements on file — one of them carrying
+    # "CANCEL LOAD Confirmation" in its COMMENT. OTR Solutions asked to verify the rate for
+    # N S Express and was told the load was under review for a cancellation belonging to the
+    # carrier that never ran it. The back office could not find the document either, because
+    # nothing in the file list says "cancel"; only that one comment does, on a document type
+    # that appears three more times.
+    #
+    # `tp_get_file_history` now joins the dispatch rows itself and returns
+    # cancel_confirmation_superseded, canceled_carriers, delivered_carrier and the source
+    # comment. Deliberately in the tool rather than here: the model would otherwise have to
+    # call tp_get_dispatch_history — which the HOLD rule gave it no reason to call — and then
+    # reason about supersession, which is exactly the kind of join a prompt cannot guarantee.
+    version="1.11.0",
     system_prompt=_RATE_VERIFICATION_PROMPT,
     allowed_tools=RATE_VERIFICATION_TOOLS,
 )

@@ -57,6 +57,7 @@ from payment_bot.logging import (
 )
 from payment_bot.models import InboundEmail
 from payment_bot.pipeline import Outcome, PaymentBotPipeline, PipelineResult
+from payment_bot.tools.shared import free_mail_roster_entries
 
 _log = get_logger("local_runner")
 
@@ -341,6 +342,16 @@ def check_configuration(settings: Settings | None = None) -> int:
         + ("yes -> Gmail Drafts (drafts.create)" if resolved.gmail_create_draft else "no")
     )
     print(f"  reply cc          : {', '.join(resolved.reply_cc) or '(none)'}")
+    print(f"  factoring roster  : {len(resolved.factoring_domains)} companies")
+
+    # Inert rather than dangerous — the lookup refuses them — but an entry that authorises
+    # nobody looks exactly like an entry that works until someone tests it.
+    offending = free_mail_roster_entries(resolved)
+    if offending:
+        print("  ! roster entries on free-mail domains — these authorise NOBODY and should")
+        print("    be removed; a free-mail domain cannot identify a factoring company:")
+        for name, domains in offending.items():
+            print(f"      {name} -> {', '.join(domains)}")
 
     problems = _missing_configuration(resolved)
     if problems:

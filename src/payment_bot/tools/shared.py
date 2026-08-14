@@ -15,6 +15,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, Field
 
+from payment_bot.config import Settings
 from payment_bot.domain import compute_carrier_rate as domain_carrier_rate
 from payment_bot.domain import compute_scheduled_pay_date as domain_scheduled_pay_date
 from payment_bot.domain import route_load as domain_route_load
@@ -522,12 +523,49 @@ def _is_configured_factor_domain(
     domain = _sender_domain(sender_email)
     if not domain:
         return False
+
+    # A free-mail domain identifies nobody, so it can never identify a factor — and this
+    # refuses it at the point of use rather than trusting that none ever reached the roster.
+    #
+    # Everything that WRITES the roster already excludes free mail: the generator skips those
+    # rows, and the escalation packet will not propose one. Neither protects a hand edit to
+    # factoring_domains_manual.json, which is a file people edit under time pressure, from an
+    # escalation whose own text says "add it to PAYBOT_FACTORING_DOMAINS if it is genuine".
+    # A single "gmail.com" pasted there would have authorised every Gmail address on earth as
+    # that factor, on every load factored to them, silently. Verified before adding this:
+    # the lookup matched it exactly as it would any other domain.
+    #
+    # `free_mail_roster_entries` reports such an entry so it can be removed; this makes it
+    # inert in the meantime.
+    if domain in _FREE_MAIL_DOMAINS:
+        return False
+
     for configured_name, domains in ctx.settings.factoring_domains.items():
         if not _factor_names_match(configured_name, factoring_company):
             continue
         if any(domain == str(d).strip().lower().lstrip("@") for d in domains):
             return True
     return False
+
+
+def free_mail_roster_entries(settings: Settings) -> dict[str, tuple[str, ...]]:
+    """Roster entries whose domains are free-mail, which authorise nobody.
+
+    Reporting only — :func:`_is_configured_factor_domain` already refuses them. Exists so a
+    bad entry is *visible* rather than merely harmless: silently inert configuration is how
+    someone concludes the roster is broken and edits it again.
+    """
+
+    offending: dict[str, tuple[str, ...]] = {}
+    for name, domains in settings.factoring_domains.items():
+        bad = tuple(
+            d
+            for d in (str(x).strip().lower().lstrip("@") for x in domains)
+            if d in _FREE_MAIL_DOMAINS
+        )
+        if bad:
+            offending[name] = bad
+    return offending
 
 
 def _roster_entry_for_domain(sender_domain: str, ctx: ToolContext) -> str | None:

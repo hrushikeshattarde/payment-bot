@@ -315,3 +315,83 @@ def test_configuring_nothing_changes_nothing() -> None:
     """The default must leave every existing decision exactly as it was."""
 
     assert _decide(_carrier_ctx({}), CONFIGURED).decision is AuthDecision.DENY
+
+
+# ---------------------------------------------------------------------------
+# Free mail can never authorise a FACTOR, however it got into the roster.
+#
+# Everything that writes the roster already excludes it — the generator skips
+# those rows, the escalation packet refuses to propose one. Neither protects a
+# hand edit to factoring_domains_manual.json, which is a file people edit under
+# time pressure from an escalation whose own text says "add it to
+# PAYBOT_FACTORING_DOMAINS if it is genuine".
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_a_free_mail_domain_in_the_roster_authorises_nobody() -> None:
+    """Verified before the guard existed: the lookup matched it like any other domain.
+
+    A single "gmail.com" pasted into the roster would have made every Gmail address on
+    earth that factor, on every load factored to them, silently and forever.
+    """
+
+    from payment_bot.tools.shared import _is_configured_factor_domain
+
+    ctx = ToolContext(
+        tp=sample_transport_pro_client(),
+        ledger=GroundingLedger(),
+        correlation_id="free-mail",
+        settings=Settings(  # type: ignore[arg-type]
+            _env_file=None, factoring_domains={"acme factoring": ("gmail.com",)}
+        ),
+    )
+
+    for sender in ("anyone@gmail.com", "attacker@gmail.com", "real.factor@gmail.com"):
+        assert _is_configured_factor_domain("Acme Factoring", sender, ctx) is False, sender
+
+
+@pytest.mark.unit
+def test_the_guard_does_not_disturb_a_legitimate_roster_entry() -> None:
+    """The corporate case is the common one and must be untouched."""
+
+    from payment_bot.tools.shared import _is_configured_factor_domain
+
+    ctx = ToolContext(
+        tp=sample_transport_pro_client(),
+        ledger=GroundingLedger(),
+        correlation_id="free-mail",
+        settings=Settings(  # type: ignore[arg-type]
+            _env_file=None,
+            factoring_domains={
+                "rts financial": ("rtsfinancial.com",),
+                "acme factoring": ("gmail.com",),  # inert, and beside a good entry
+            },
+        ),
+    )
+
+    assert _is_configured_factor_domain("RTS Financial Service, Inc", "ar@rtsfinancial.com", ctx)
+    assert not _is_configured_factor_domain("RTS Financial Service, Inc", "ar@gmail.com", ctx)
+
+
+@pytest.mark.unit
+def test_a_bad_roster_entry_is_reportable_as_well_as_inert() -> None:
+    """Silently inert configuration is how someone decides the roster is broken and re-edits."""
+
+    from payment_bot.tools.shared import free_mail_roster_entries
+
+    settings = Settings(  # type: ignore[arg-type]
+        _env_file=None,
+        factoring_domains={
+            "rts financial": ("rtsfinancial.com",),
+            "acme factoring": ("gmail.com", "acmefactoring.com"),
+            "other": ("yahoo.com",),
+        },
+    )
+
+    assert free_mail_roster_entries(settings) == {
+        "acme factoring": ("gmail.com",),
+        "other": ("yahoo.com",),
+    }
+    # A clean roster reports nothing at all.
+    assert free_mail_roster_entries(
+        Settings(_env_file=None, factoring_domains={"rts financial": ("rtsfinancial.com",)})  # type: ignore[arg-type]
+    ) == {}

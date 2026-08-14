@@ -273,16 +273,17 @@ def _free_mail_candidate() -> Any:
     )
 
 
-def test_a_free_mail_sender_is_never_offered_as_a_roster_entry() -> None:
-    """The bug this pins was mine, and it was the dangerous kind: paste-ready and wrong.
+def test_a_free_mail_sender_is_offered_as_an_address_never_as_a_domain() -> None:
+    """A free-mail sender IS addable now — as the whole address, which is the safe form.
 
-    A roster entry keys a DOMAIN to a factor. Proposing ``"apex capital corp":
-    ["gmail.com"]`` would have authorised every Gmail address on earth as Apex Capital
-    Corp — and it was rendered as a line to copy, under a heading saying a human decides,
-    which is exactly the presentation that gets a thing pasted.
+    The bug this pins was mine and it was the dangerous kind: paste-ready and wrong. The
+    packet used to render ``"apex capital corp": ["gmail.com"]`` as a line to copy, under a
+    heading saying a human decides, which is exactly the presentation that gets a thing
+    pasted — and pasting it would have authorised every Gmail address on earth as Apex
+    Capital Corp.
 
-    The roster generator has excluded free-mail from the start for this reason. The packet
-    proposing what the generator refuses to produce is the inconsistency being closed.
+    The roster now accepts either form, and which one it is decides the grant. So the packet
+    proposes the address. The domain form must never appear for a free-mail sender.
     """
 
     candidate = _free_mail_candidate()
@@ -290,11 +291,12 @@ def test_a_free_mail_sender_is_never_offered_as_a_roster_entry() -> None:
     rendered = candidate.render()
 
     assert candidate.free_mail is True
-    assert "NO ROSTER ENTRY IS POSSIBLE" in rendered
-    # The paste-ready line must be absent entirely, not merely discouraged.
-    assert '"apex capital corp"' not in rendered
-    assert "gmail.com\"]" not in rendered
-    assert "factoring_domains_manual.json" not in rendered
+    assert f'["{FREE_MAIL_SENDER}"]' in rendered
+    # The dangerous form, in every spelling it could reach the file in.
+    assert '["gmail.com"]' not in rendered
+    assert '"gmail.com"]' not in rendered
+    # And it says WHY the address rather than the domain, so the next editor knows.
+    assert "would authorise every address at that provider" in rendered
 
 
 def test_the_free_mail_packet_shows_the_addresses_already_on_the_record() -> None:
@@ -312,8 +314,9 @@ def test_the_free_mail_packet_shows_the_addresses_already_on_the_record() -> Non
         assert addr in rendered
     assert FREE_MAIL_SENDER in rendered
     assert "COMPARE THOSE CAREFULLY" in rendered
-    # And it must point at the remedy that actually works for a carrier sender.
-    assert "carrier record" in rendered
+    # And it must still ask whether the carrier's own record is the better home, because for
+    # this shape it usually is — the roster is for factors.
+    assert "carrier's own record is the better home" in rendered
 
 
 def test_the_free_mail_packet_drops_the_domain_conflict_block() -> None:

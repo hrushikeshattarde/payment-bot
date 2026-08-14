@@ -63,8 +63,8 @@ class RosterCandidate:
     #: How the domain resembles the factor name, or "" when it does not resemble it at all.
     #: A hint for the reviewer, never evidence: resemblance is what an attacker manufactures.
     resemblance: str = ""
-    #: True when the sender is on a free-mail domain. A roster entry is then **impossible**,
-    #: not merely inadvisable — see :meth:`render`.
+    #: True when the sender is on a free-mail domain. The proposed entry is then their whole
+    #: ADDRESS rather than the domain — see :meth:`entry_json`.
     free_mail: bool = False
     #: The addresses already authorised on the carrier's own record. Printed so a near-miss
     #: is visible at a glance, which is the whole diagnosis in the free-mail case.
@@ -78,9 +78,16 @@ class RosterCandidate:
         return tuple(sorted(d for d in known if d != self.sender_domain))
 
     def entry_json(self) -> str:
-        """The line to paste into ``factoring_domains_manual.json``."""
+        """The line to paste into ``factoring_domains_manual.json``.
 
-        return f'  {json.dumps(self.roster_key)}: {json.dumps([self.sender_domain])},'
+        A free-mail sender gets their whole ADDRESS rather than their domain. The roster
+        accepts either, and which one it is decides the grant: ``gmail.com`` would authorise
+        every Gmail address on earth as this factor, while ``billing@gmail.com`` authorises
+        exactly the mailbox that wrote in.
+        """
+
+        value = self.sender_email if self.free_mail else self.sender_domain
+        return f"  {json.dumps(self.roster_key)}: {json.dumps([value])},"
 
     def render(self) -> str:
         """The reviewer-facing block."""
@@ -122,21 +129,22 @@ class RosterCandidate:
             ]
 
         if self.free_mail:
-            # A roster entry keys a DOMAIN to a factor, so "gmail.com" for Apex Capital
-            # Corp would authorise every Gmail user on earth as that factor. The generator
-            # excludes free-mail for this exact reason and so must this packet — the
-            # dangerous thing about a paste-ready instruction is that it gets pasted.
+            # A roster value is either a domain or a whole address, and which one it is
+            # decides the grant. This packet used to render the DOMAIN for a free-mail
+            # sender — "gmail.com" for Apex Capital Corp — as a line to copy, which would
+            # have authorised every Gmail address on earth as that factor. The dangerous
+            # thing about a paste-ready instruction is precisely that it gets pasted, so it
+            # now renders the address and says why.
             lines += [
                 "",
-                f"  NO ROSTER ENTRY IS POSSIBLE — {self.sender_domain} is a free-mail domain.",
-                "  A roster entry authorises a DOMAIN for a factor, so this one would",
-                f"  authorise every {self.sender_domain} address on earth as"
-                f" {self.factor_on_file}.",
+                f"  FREE-MAIL SENDER — {self.sender_domain}. The entry below is the WHOLE",
+                "  ADDRESS, not the domain, and that distinction is the whole safety of it:",
+                f"  \"{self.sender_domain}\" would authorise every address at that provider",
+                f"  as {self.factor_on_file}; the address authorises exactly this mailbox.",
                 "",
-                "  This shape is usually the CARRIER writing in, not the factor, from an",
-                "  address that is not on their record. The fix is on the carrier record,",
-                "  not in the roster: add the address there and the bot answers this sender",
-                "  from then on, with no code or roster change.",
+                "  Consider first whether this is the CARRIER writing rather than the factor.",
+                "  If it is, the carrier's own record is the better home — the bot answers",
+                "  them from then on and everyone reading that record can see why.",
             ]
             if self.carrier_on_file_emails:
                 lines += [
@@ -157,7 +165,6 @@ class RosterCandidate:
                     "  The carrier's record carries no addresses at all, so there is nothing",
                     "  to compare this against. Confirm with the carrier before adding it.",
                 ]
-            return "\n".join(lines)
 
         lines += [
             "",

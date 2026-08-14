@@ -395,3 +395,87 @@ def test_a_bad_roster_entry_is_reportable_as_well_as_inert() -> None:
     assert free_mail_roster_entries(
         Settings(_env_file=None, factoring_domains={"rts financial": ("rtsfinancial.com",)})  # type: ignore[arg-type]
     ) == {}
+
+
+@pytest.mark.unit
+def test_a_free_mail_address_in_the_roster_authorises_that_mailbox() -> None:
+    """The supported way to roster a factor whose send-from is free mail.
+
+    A roster value is either a domain or a whole address, and which one it is decides the
+    grant. "gmail.com" would be every Gmail address on earth; "billing@gmail.com" is one
+    mailbox. Both forms live in the same list, so an entry says what it grants by its shape.
+    """
+
+    from payment_bot.tools.shared import _is_configured_factor_domain
+
+    ctx = ToolContext(
+        tp=sample_transport_pro_client(),
+        ledger=GroundingLedger(),
+        correlation_id="free-mail",
+        settings=Settings(  # type: ignore[arg-type]
+            _env_file=None, factoring_domains={"acme factoring": ("billing@gmail.com",)}
+        ),
+    )
+
+    assert _is_configured_factor_domain("Acme Factoring", "billing@gmail.com", ctx) is True
+    # And nothing else at that provider, which is the entire point.
+    for other in ("someone.else@gmail.com", "billing@gmail.com.evil.net", "billing@yahoo.com"):
+        assert _is_configured_factor_domain("Acme Factoring", other, ctx) is False, other
+
+
+@pytest.mark.unit
+def test_an_address_entry_still_answers_only_for_its_own_factor() -> None:
+    """The per-load factor comparison is unchanged by the address form."""
+
+    from payment_bot.tools.shared import _is_configured_factor_domain
+
+    ctx = ToolContext(
+        tp=sample_transport_pro_client(),
+        ledger=GroundingLedger(),
+        correlation_id="free-mail",
+        settings=Settings(  # type: ignore[arg-type]
+            _env_file=None, factoring_domains={"acme factoring": ("billing@gmail.com",)}
+        ),
+    )
+
+    assert _is_configured_factor_domain("Acme Factoring", "billing@gmail.com", ctx) is True
+    assert _is_configured_factor_domain("RTS Financial", "billing@gmail.com", ctx) is False
+
+
+@pytest.mark.unit
+def test_a_corporate_domain_entry_is_unchanged_by_the_address_form() -> None:
+    """The ordinary case is the common one: a factor writes from ar@, billing@, noa@."""
+
+    from payment_bot.tools.shared import _is_configured_factor_domain
+
+    ctx = ToolContext(
+        tp=sample_transport_pro_client(),
+        ledger=GroundingLedger(),
+        correlation_id="free-mail",
+        settings=Settings(  # type: ignore[arg-type]
+            _env_file=None,
+            factoring_domains={"rts financial": ("rtsfinancial.com", "@ryanrts.com")},
+        ),
+    )
+
+    for sender in ("ar@rtsfinancial.com", "billing@rtsfinancial.com", "x@ryanrts.com"):
+        assert _is_configured_factor_domain("RTS Financial Service, Inc", sender, ctx), sender
+    assert not _is_configured_factor_domain("RTS Financial Service, Inc", "x@other.com", ctx)
+
+
+@pytest.mark.unit
+def test_only_a_bare_free_mail_domain_is_reported_as_useless() -> None:
+    """An address at a free-mail domain is supported and must not be flagged for removal."""
+
+    from payment_bot.tools.shared import free_mail_roster_entries
+
+    settings = Settings(  # type: ignore[arg-type]
+        _env_file=None,
+        factoring_domains={
+            "good address": ("billing@gmail.com",),
+            "bad domain": ("gmail.com",),
+            "fine": ("acmefactoring.com",),
+        },
+    )
+
+    assert free_mail_roster_entries(settings) == {"bad domain": ("gmail.com",)}

@@ -520,63 +520,90 @@ def _is_configured_factor_domain(
     unrelated factor.
     """
 
-    domain = _sender_domain(sender_email)
-    if not domain:
+    sender = sender_email.strip().lower()
+    domain = _sender_domain(sender)
+    if not (sender and domain):
         return False
 
-    # A free-mail domain identifies nobody, so it can never identify a factor — and this
-    # refuses it at the point of use rather than trusting that none ever reached the roster.
-    #
-    # Everything that WRITES the roster already excludes free mail: the generator skips those
-    # rows, and the escalation packet will not propose one. Neither protects a hand edit to
-    # factoring_domains_manual.json, which is a file people edit under time pressure, from an
-    # escalation whose own text says "add it to PAYBOT_FACTORING_DOMAINS if it is genuine".
-    # A single "gmail.com" pasted there would have authorised every Gmail address on earth as
-    # that factor, on every load factored to them, silently. Verified before adding this:
-    # the lookup matched it exactly as it would any other domain.
-    #
-    # `free_mail_roster_entries` reports such an entry so it can be removed; this makes it
-    # inert in the meantime.
-    if domain in _FREE_MAIL_DOMAINS:
-        return False
-
-    for configured_name, domains in ctx.settings.factoring_domains.items():
+    for configured_name, entries in ctx.settings.factoring_domains.items():
         if not _factor_names_match(configured_name, factoring_company):
             continue
-        if any(domain == str(d).strip().lower().lstrip("@") for d in domains):
+        if any(_roster_entry_matches(entry, sender, domain) for entry in entries):
             return True
     return False
 
 
-def free_mail_roster_entries(settings: Settings) -> dict[str, tuple[str, ...]]:
-    """Roster entries whose domains are free-mail, which authorise nobody.
+def _roster_entry_matches(entry: object, sender: str, domain: str) -> bool:
+    """Does one roster value authorise this sender?
 
-    Reporting only — :func:`_is_configured_factor_domain` already refuses them. Exists so a
-    bad entry is *visible* rather than merely harmless: silently inert configuration is how
+    A roster value is **either** a domain or a whole address, and which one it is decides
+    how much it grants:
+
+    * ``acmefactoring.com`` — every mailbox at that domain, the ordinary case. A factor
+      writes from ar@, billing@ and noa@ and an entry per address would be unmaintainable.
+    * ``billing@gmail.com`` — that address and nothing else. The only way to authorise a
+      factor whose send-from is free mail, because the domain form there would grant every
+      Gmail address on earth.
+
+    A bare free-mail **domain** is refused whatever it was meant to be. Everything that
+    writes the roster already excludes one — the generator skips those rows, the escalation
+    packet will not propose one — but none of that protects a hand edit to
+    factoring_domains_manual.json, prompted by an escalation whose own text says "add it to
+    PAYBOT_FACTORING_DOMAINS if it is genuine". Verified before the guard existed: a pasted
+    "gmail.com" matched exactly like any other domain and authorised the whole internet as
+    that factor, silently. The address form is what that edit almost always meant.
+    """
+
+    value = str(entry).strip().lower()
+    if not value:
+        return False
+    if value.startswith("@"):  # "@acmefactoring.com" — a domain, written with the at
+        value = value[1:]
+    elif "@" in value:  # "billing@gmail.com" — a whole address
+        return value == sender
+    return value not in _FREE_MAIL_DOMAINS and value == domain
+
+
+def free_mail_roster_entries(settings: Settings) -> dict[str, tuple[str, ...]]:
+    """Roster entries that are a bare free-mail DOMAIN, which authorise nobody.
+
+    Reporting only — :func:`_roster_entry_matches` already refuses them. Exists so such an
+    entry is *visible* rather than merely harmless: silently inert configuration is how
     someone concludes the roster is broken and edits it again.
+
+    A whole address at a free-mail domain (``billing@gmail.com``) is NOT reported. That is
+    the supported way to authorise a factor on free mail, and it grants exactly itself.
     """
 
     offending: dict[str, tuple[str, ...]] = {}
-    for name, domains in settings.factoring_domains.items():
+    for name, entries in settings.factoring_domains.items():
         bad = tuple(
-            d
-            for d in (str(x).strip().lower().lstrip("@") for x in domains)
-            if d in _FREE_MAIL_DOMAINS
+            value
+            for value in (str(x).strip().lower().lstrip("@") for x in entries)
+            if "@" not in value and value in _FREE_MAIL_DOMAINS
         )
         if bad:
             offending[name] = bad
     return offending
 
 
-def _roster_entry_for_domain(sender_domain: str, ctx: ToolContext) -> str | None:
-    """The roster entry (configured factor name) that owns ``sender_domain``, if any.
+def _roster_entry_for_sender(sender_email: str, ctx: ToolContext) -> str | None:
+    """The roster entry (configured factor name) that owns this sender, if any.
 
     Membership only — no per-load factor comparison. Used by the pre-NOA path, where the
     load has no factor on file to compare against.
+
+    Shares :func:`_roster_entry_matches` with the per-load check so the two cannot disagree
+    about what a roster value means. In particular a free-mail *address* entry works here
+    too: a factor on free mail is a factor on free mail whichever path reaches them.
     """
 
-    for configured_name, domains in ctx.settings.factoring_domains.items():
-        if any(sender_domain == str(d).strip().lower().lstrip("@") for d in domains):
+    sender = sender_email.strip().lower()
+    domain = _sender_domain(sender)
+    if not (sender and domain):
+        return None
+    for configured_name, entries in ctx.settings.factoring_domains.items():
+        if any(_roster_entry_matches(entry, sender, domain) for entry in entries):
             return configured_name
     return None
 
@@ -1401,9 +1428,10 @@ class CheckAuthorization(Tool):
             ctx.settings.factoring_prenoa_replies
             and not auth.factoring_company
             and sender_domain
-            and sender_domain not in _FREE_MAIL_DOMAINS
         ):
-            roster_name = _roster_entry_for_domain(sender_domain, ctx)
+            # No free-mail guard here: _roster_entry_matches applies it per entry, so a
+            # free-mail ADDRESS entry works and a bare free-mail domain still cannot.
+            roster_name = _roster_entry_for_sender(sender, ctx)
             if roster_name is not None:
                 return CheckAuthorizationOutput(
                     decision=AuthDecision.FACTORING,

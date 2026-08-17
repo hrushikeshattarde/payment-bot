@@ -235,20 +235,30 @@ def test_a_pdf_is_read_only_for_identifiers_never_the_change_scan() -> None:
     )
     assert "021000021" in parsed.attachments[0].extracted_text  # it IS extracted
 
-    out = DetectSensitiveChange().run(
-        DetectSensitiveChangeInput(
-            subject=parsed.subject,
-            body=parsed.body,
-            attachments=[
-                {"filename": a.filename, "mime_type": a.mime_type} for a in parsed.attachments
-            ],
-        ),
-        ToolContext(tp=None, ledger=GroundingLedger(), correlation_id="pdf-scan-test"),
+    def scan(body: str) -> list[SensitiveFlag]:
+        out = DetectSensitiveChange().run(
+            DetectSensitiveChangeInput(
+                subject=parsed.subject,
+                body=body,
+                # The real field name. Passing `attachments=` here is silently ignored by
+                # pydantic, which makes this assertion pass while proving nothing — the first
+                # version of this test did exactly that.
+                attachments_metadata=[
+                    {"filename": a.filename, "mime_type": a.mime_type} for a in parsed.attachments
+                ],
+            ),
+            ToolContext(tp=None, ledger=GroundingLedger(), correlation_id="pdf-scan-test"),
+        )
+        return out.flags
+
+    # NONE is the "nothing found" sentinel: the remit-to text never reaches the scan.
+    assert scan(parsed.body) == [SensitiveFlag.NONE]
+
+    # POSITIVE CONTROL, so the assertion above cannot pass because the scan is inert: the
+    # same wording IS caught when the sender writes it in the body.
+    assert SensitiveFlag.BANK_CHANGE in scan(
+        "Please update our bank account number and routing number for these invoices."
     )
-    # ...and it does not reach this scan. NONE is the "nothing found" sentinel, so the
-    # assertion is that no real flag fired — a BANK_CHANGE here would escalate every statement.
-    assert out.flags == [SensitiveFlag.NONE], out.evidence
-    assert SensitiveFlag.BANK_CHANGE not in out.flags
 
 
 @pytest.mark.unit

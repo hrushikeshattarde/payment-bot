@@ -452,6 +452,19 @@ class TransportProHttpClient:
                 emails.extend(_emails_from(source))
 
         factoring_company = remit.company_name if (remit and is_factoring) else None
+
+        # Whether an NOA is INDEXED, which `remit_to.company_name` does not answer: that field
+        # is keyed in by hand and is routinely empty on loads whose NOA is on file. Reuses
+        # get_noa_factoring rather than re-matching the document markers, and shares this
+        # method's already-cached get_load — so the marginal cost is the file-history read,
+        # which the agent goes on to make anyway within the same cached client.
+        try:
+            noa_on_file = self.get_noa_factoring(load_id).noa_on_file
+        except ClientError:
+            # Never fail authorization over this. False means "we cannot say it is on file",
+            # which restores the previous behaviour: pre-NOA fires and the reply asks for it.
+            noa_on_file = False
+
         return AuthorizationContext(
             carrier_company=(
                 load.account_information.company_name if load.account_information else None
@@ -461,6 +474,7 @@ class TransportProHttpClient:
             # Factoring contact emails are not exposed; a factoring sender therefore
             # matches only by company-domain, and FACTORING is gated by policy anyway.
             factoring_emails=(),
+            noa_on_file=noa_on_file,
         )
 
     # -- internals -----------------------------------------------------------

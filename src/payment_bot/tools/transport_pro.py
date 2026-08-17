@@ -126,12 +126,21 @@ class TpDispatchHistoryOutput(BaseModel):
 
 
 class TpGetDispatchHistory(Tool):
-    """Dispatch history — use the Delivered row only for carrier + rate; ignore canceled."""
+    """Dispatch history — use the Delivered row only for carrier + rate; ignore canceled.
+
+    Carries NO dates a reply may quote. See :class:`~payment_bot.models.DispatchRow`: the
+    screen's Pickup/Delivery cells stack a place above a date and only the place is parsed,
+    while ``last_updated`` is a record stamp. The delivery date comes from
+    ``tp_get_load_summary``, which is also the only tool that grounds it.
+    """
 
     name = "tp_get_dispatch_history"
     description = (
-        "Return dispatch rows for a load. Use only the Delivered row for carrier and rate; "
-        "canceled rows must be ignored."
+        "Return dispatch rows for a load: carrier, MC, dispatch status and freight bill. Use "
+        "only the Delivered row for carrier and rate; canceled rows must be ignored. This "
+        "tool returns NO usable date. `pickup` and `delivery` are PLACES ('LAREDO, TX'), not "
+        "dates, and `last_updated` is when the record was last edited — never a delivery, "
+        "dispatch or payment date. For the delivery date call `tp_get_load_summary`."
     )
     input_model = LoadIdInput
 

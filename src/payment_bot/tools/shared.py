@@ -1433,6 +1433,27 @@ class CheckAuthorization(Tool):
             # free-mail ADDRESS entry works and a bare free-mail domain still cannot.
             roster_name = _roster_entry_for_sender(sender, ctx)
             if roster_name is not None:
+                # AUTHORIZATION is unchanged by whether the NOA is indexed — a roster-verified
+                # factor asking about a load with no factor of record is the same sender either
+                # way. Only the ASK is conditional: `pre_noa` drives the intake line that
+                # requests the NOA, and requesting one already on the load is what this fixes.
+                #
+                # Live on load 2530268 (Maple Ridge Livestock): the Notice of Assignment was
+                # indexed three times and `remit_to.company_name` was empty, so the draft told
+                # Truckstop to email an NOA sitting on the load. The two fields answer different
+                # questions — see AuthorizationContext.noa_on_file.
+                if auth.noa_on_file:
+                    return CheckAuthorizationOutput(
+                        decision=AuthDecision.FACTORING,
+                        authorized=ctx.settings.allow_factoring,
+                        pre_noa=False,
+                        matched_party=roster_name,
+                        reason=(
+                            "roster-verified factoring company; no factor NAME on file for "
+                            "this load, but its NOA is already indexed — answer the question "
+                            "and do NOT request the NOA"
+                        ),
+                    )
                 return CheckAuthorizationOutput(
                     decision=AuthDecision.FACTORING,
                     authorized=ctx.settings.allow_factoring,

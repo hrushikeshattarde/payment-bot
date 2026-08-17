@@ -196,15 +196,29 @@ class TransportProLoad(_TpModel):
 # derive the convenience/summary fields (delivered_row, has_*, matches_load).
 # ---------------------------------------------------------------------------
 class DispatchRow(_TpModel):
-    """One row of the Dispatch History screen (§4.3 ``tp_get_dispatch_history``)."""
+    """One row of the Dispatch History screen (§4.3 ``tp_get_dispatch_history``).
+
+    **This row carries no delivery date.** The screen's Pickup and Delivery cells stack a
+    place above a date, and only the place is parsed here; the date beside it belongs to the
+    LOAD's waypoints and reaches a reply through ``tp_get_load_summary``, which grounds it.
+    Live on load 2478889: the draft said "delivered on August 6, 2026" for a load that
+    delivered on June 30, citing this tool — August 6 was :attr:`last_updated`.
+    """
 
     carrier_name: str
     mc_number: IdentifierStr = None
     freight_bill: Decimal | None = None
     dispatch_status: str  # "Delivered" | "Canceled Customer Refused" | ...
+    #: Origin **place**, e.g. ``"WHITAKERS, NC"`` — never a date, despite the column header.
     pickup: str | None = None
+    #: Destination **place**, e.g. ``"LAREDO, TX"``. Not the delivery date: see the class note.
     delivery: str | None = None
     comment: str | None = None
+    #: When the dispatch RECORD was last edited, and the trap on this row: it is the only
+    #: date-shaped field here, so it reads as a delivery date and is not one. On 2478889 it
+    #: was 2026-08-06 against a 2026-06-30 delivery — five weeks out, and the UI labels the
+    #: column "Last Updated" with the editing user's name beside it. Never a delivery,
+    #: dispatch or payment date.
     last_updated: str | None = None
 
     @property
@@ -267,3 +281,12 @@ class AuthorizationContext(_TpModel):
     authorized_emails: tuple[str, ...] = ()
     factoring_company: str | None = None
     factoring_emails: tuple[str, ...] = ()
+    #: Whether a Notice of Assignment / factoring agreement is already indexed on the load.
+    #:
+    #: Distinct from :attr:`factoring_company`, and the distinction is the whole point. The
+    #: company name comes from ``remit_to`` — a field somebody has to key in — while this comes
+    #: from the file history. On load 2530268 the NOA was indexed three times over and the
+    #: remit field was still empty, so the pre-NOA branch read "their NOA has not reached us"
+    #: and the reply asked a factor to send a document sitting on the load. `pre_noa` is about
+    #: whether the NOA is ON FILE; only this field answers that.
+    noa_on_file: bool = False

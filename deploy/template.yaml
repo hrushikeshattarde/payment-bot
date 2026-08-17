@@ -134,6 +134,18 @@ Parameters:
       needs a human to verify and file — the draft cannot do either, and the gate's
       change_acknowledgment check forbids the reply from claiming it was filed. Void-check /
       direct-deposit attachments and contact changes escalate in every configuration.
+  LlmIdFilter:
+    Type: String
+    Default: shadow
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Whether the model gets to drop extracted load-id candidates. It can only ever REMOVE
+      candidates the regex already produced, so it cannot introduce a load id, and every
+      failure returns them unchanged. `shadow` calls it and logs what it would drop, changing
+      nothing — the way to measure agreement on real mail before anything depends on it.
+      Defaults to shadow rather than enforce so a new stack measures before it acts; flip to
+      enforce once the id_filter_shadow lines look right. Reading PDF attachments made the
+      regex's precision problem materially worse, which is what this exists to absorb.
   FactoringPrenoaReplies:
     Type: String
     Default: "true"
@@ -336,6 +348,7 @@ Resources:
           PAYBOT_SENSITIVE_NOA_REPLIES: !Ref SensitiveNoaReplies
           PAYBOT_NOA_ATTACHMENT_REPLIES: !Ref NoaAttachmentReplies
           PAYBOT_FACTORING_PRENOA_REPLIES: !Ref FactoringPrenoaReplies
+          PAYBOT_LLM_ID_FILTER: !Ref LlmIdFilter
 
           PAYBOT_REPLY_SIGNATURE: !Ref ReplySignature
           PAYBOT_REPLY_CC: !Ref ReplyCc

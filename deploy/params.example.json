@@ -39,6 +39,8 @@
   "SensitiveNoaReplies": "true",
   "NoaAttachmentReplies": "true",
   "FactoringPrenoaReplies": "true",
+  "LlmIdFilter": "shadow",
+  "_LlmIdFilter": "off | shadow | enforce. The model may only REMOVE load-id candidates the regex produced, never add one, and any failure leaves them unchanged. Left at shadow here so a new stack measures before it acts — read the id_filter_shadow log lines, then flip to enforce. Reading PDF attachments made the regex's precision problem materially worse (an invoice packet contributes its own invoice, rate-con, PRO and reference numbers), which is what enforce absorbs.",
   "_NoaAttachmentReplies": "Draft past an ATTACHED NOA, as opposed to the NOA WORDING SensitiveNoaReplies covers. Factors attach their NOA to routine rate verifications as standard, so 'false' escalates every one of them unanswered. The NOA still needs a human to file; the reply is forbidden from claiming it was filed.",
   "_FactoringPrenoaReplies": "Authorise a roster-verified factor on a load showing NO factor on file — the pre-funding flow. 'false' DENIES those senders outright, which is a large share of inbound factoring mail. Both of these were missing from the template until 2026-08-15, so a deployed stack ran with them off while .env had them on.",
 

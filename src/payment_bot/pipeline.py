@@ -824,6 +824,12 @@ class PaymentBotPipeline:
         load with no factor, a malformed hints file — returns None and leaves the escalation
         exactly as it was. An escalation that failed to escalate because its *annotation*
         raised would be a far worse bug than the manual lookup this saves.
+
+        Best-effort **per load**, too, which the outer handler alone did not give: a single id
+        the back office cannot resolve now skips instead of discarding the packet for every
+        other load in the email. "We could not annotate load X" and "we could not annotate
+        this escalation" are different outcomes, and only the first is acceptable when the
+        unresolvable id is one the sender never asked about.
         """
 
         try:
@@ -832,13 +838,33 @@ class PaymentBotPipeline:
             on_file: set[str] = set()
             for load_id in load_ids:
                 system = route_load(load_id).system
-                if system is System.QUICKBOOKS:
-                    if ctx.cargotel is None:
+                # Per load, because ONE unreadable id must not cost the packet for the others.
+                # Live on an Aladdin verification: the body named 2534786 and the attachment
+                # contributed three phantom 7-digit ids, two of which Transport Pro 400s on
+                # because no such load exists. The first 400 propagated to the handler below,
+                # which returned None for everything — so the reviewer got the escalation
+                # reason and NOT the block saying we already hold aladdincap.com for this
+                # factor while aladdinfactoringapp.com is rostered nowhere. That block was the
+                # entire decision the escalation existed to put in front of them, and a load
+                # that is not even ours discarded it.
+                try:
+                    if system is System.QUICKBOOKS:
+                        if ctx.cargotel is None:
+                            continue
+                        auth = ctx.cargotel.get_authorization_context(load_id)
+                    elif system is System.TRANSPORT_PRO:
+                        auth = ctx.tp.get_authorization_context(load_id)
+                    else:
                         continue
-                    auth = ctx.cargotel.get_authorization_context(load_id)
-                elif system is System.TRANSPORT_PRO:
-                    auth = ctx.tp.get_authorization_context(load_id)
-                else:
+                except PaymentBotError as exc:
+                    _log.info(
+                        "roster_candidate_load_skipped",
+                        extra={
+                            "correlation_id": correlation_id,
+                            "load_id": load_id,
+                            "error": str(exc),
+                        },
+                    )
                     continue
                 on_file.update(auth.authorized_emails)
                 if not auth.factoring_company:

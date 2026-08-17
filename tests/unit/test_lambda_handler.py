@@ -160,6 +160,95 @@ def test_an_unreadable_roster_raises_rather_than_authorising_nobody(
         lambda_handler.load_roster(env, path=str(tmp_path / "roster.json"))
 
 
+# --- carrier contacts -------------------------------------------------------
+def test_the_carrier_contacts_file_is_fetched_and_pointed_at(
+    fake_boto3: dict[str, Any], tmp_path: Any
+) -> None:
+    """Same shape as the roster, and it shares the bucket: one config bucket, two objects."""
+
+    contacts = json.dumps({"STRATAN INC": ["ar.strataninc@example.com"]})
+    fake_boto3["s3"] = _FakeS3(contacts)
+    env = {
+        "PAYBOT_ROSTER_BUCKET": "paybot-config",
+        "PAYBOT_CARRIER_CONTACTS_KEY": "carrier_contacts.json",
+    }
+    target = str(tmp_path / "carrier_contacts.json")
+
+    written = lambda_handler.load_carrier_contacts(env, path=target)
+
+    assert written == target
+    assert env["PAYBOT_CARRIER_CONTACTS_FILE"] == target
+    assert json.loads(Path(target).read_text(encoding="utf-8")) == {
+        "STRATAN INC": ["ar.strataninc@example.com"]
+    }
+    assert fake_boto3["s3"].requested == [("paybot-config", "carrier_contacts.json")]
+
+
+def test_no_carrier_contacts_configured_is_a_valid_deployment(
+    fake_boto3: dict[str, Any],
+) -> None:
+    """How this shipped before the file existed — the inline entries stand alone."""
+
+    env: dict[str, str] = {}
+
+    assert lambda_handler.load_carrier_contacts(env) is None
+    assert "PAYBOT_CARRIER_CONTACTS_FILE" not in env
+    assert fake_boto3["s3"].requested == []
+
+
+def test_a_roster_bucket_without_a_contacts_key_fetches_nothing(
+    fake_boto3: dict[str, Any],
+) -> None:
+    """The common case: a stack with a roster and no contact list yet must not 404.
+
+    Mirrors the template's HasCarrierContacts condition, which requires both the bucket and
+    the key — so the IAM grant is absent rather than pointing at a key that is not there.
+    """
+
+    env = {"PAYBOT_ROSTER_BUCKET": "paybot-config", "PAYBOT_ROSTER_KEY": "roster.json"}
+
+    assert lambda_handler.load_carrier_contacts(env) is None
+    assert fake_boto3["s3"].requested == []
+
+
+def test_an_unreadable_contacts_file_raises(
+    fake_boto3: dict[str, Any], tmp_path: Any
+) -> None:
+    """Same reasoning as the roster: a list that loaded as empty authorises nobody."""
+
+    fake_boto3["s3"] = _FakeS3(None)
+    env = {
+        "PAYBOT_ROSTER_BUCKET": "paybot-config",
+        "PAYBOT_CARRIER_CONTACTS_KEY": "gone.json",
+    }
+
+    with pytest.raises(RuntimeError, match="NoSuchKey"):
+        lambda_handler.load_carrier_contacts(env, path=str(tmp_path / "contacts.json"))
+
+
+def test_the_two_objects_are_fetched_independently(
+    fake_boto3: dict[str, Any], tmp_path: Any
+) -> None:
+    """Each points at its own settings variable, and neither writes the other's."""
+
+    fake_boto3["s3"] = _FakeS3(json.dumps({"x": ["y"]}))
+    env = {
+        "PAYBOT_ROSTER_BUCKET": "paybot-config",
+        "PAYBOT_ROSTER_KEY": "factoring_domains.json",
+        "PAYBOT_CARRIER_CONTACTS_KEY": "carrier_contacts.json",
+    }
+
+    lambda_handler.load_roster(env, path=str(tmp_path / "r.json"))
+    lambda_handler.load_carrier_contacts(env, path=str(tmp_path / "c.json"))
+
+    assert env["PAYBOT_FACTORING_DOMAINS_FILE"] == str(tmp_path / "r.json")
+    assert env["PAYBOT_CARRIER_CONTACTS_FILE"] == str(tmp_path / "c.json")
+    assert fake_boto3["s3"].requested == [
+        ("paybot-config", "factoring_domains.json"),
+        ("paybot-config", "carrier_contacts.json"),
+    ]
+
+
 # --- ordering ---------------------------------------------------------------
 def test_settings_are_built_after_the_environment_is_whole(
     fake_boto3: dict[str, Any], monkeypatch: pytest.MonkeyPatch

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import MutableMapping
 from typing import Any
 
 from payment_bot.clients import (
@@ -48,6 +49,9 @@ _log = get_logger("lambda")
 #: Where the roster is written. ``/tmp`` is the only writable path in Lambda, and it
 #: survives for the life of the container — so a warm invocation reuses the file.
 ROSTER_PATH = "/tmp/factoring_domains.json"
+
+#: Where the carrier contact list is written, same reasoning.
+CONTACTS_PATH = "/tmp/carrier_contacts.json"
 
 #: Secret ARN/name in the environment → the ``PAYBOT_*`` variable its value becomes.
 #:
@@ -100,26 +104,73 @@ def load_secrets(env: dict[str, str] | None = None) -> list[str]:
     return resolved
 
 
-def load_roster(env: dict[str, str] | None = None, *, path: str = ROSTER_PATH) -> str | None:
-    """Fetch the factoring roster from S3 to ``path`` and point settings at it.
+def _fetch_config_object(
+    environ: MutableMapping[str, str],
+    *,
+    bucket_var: str,
+    key_var: str,
+    path: str,
+    points_at: str,
+) -> str | None:
+    """Download one S3 config object to ``path`` and point ``points_at`` at it.
 
-    Returns the path written, or ``None`` when no roster is configured — which is a valid
-    deployment: ``PAYBOT_FACTORING_DOMAINS`` can carry the inline patches alone.
+    Returns the path written, or ``None`` when the object is not configured — which is a
+    valid deployment for both callers, since each has an inline counterpart that can stand
+    alone.
 
-    An unreadable roster raises rather than proceeding with an empty one, matching
-    ``Settings._merge_factoring_domains_file``: a roster that silently authorises nobody
-    turns every factoring enquiry into an escalation, and it would take a day to notice.
+    An unreadable object raises rather than proceeding without it. Both files are
+    authorization data, and the failure mode is identical to
+    ``Settings._merge_domain_file``'s: a list that silently loaded as empty looks configured
+    and authorises nobody, turning every affected enquiry into a quiet escalation that would
+    take a day to notice.
     """
 
-    environ = os.environ if env is None else env
-    bucket = environ.get("PAYBOT_ROSTER_BUCKET", "").strip()
-    key = environ.get("PAYBOT_ROSTER_KEY", "").strip()
+    bucket = environ.get(bucket_var, "").strip()
+    key = environ.get(key_var, "").strip()
     if not (bucket and key):
         return None
 
     _boto3().client("s3").download_file(bucket, key, path)
-    environ["PAYBOT_FACTORING_DOMAINS_FILE"] = path
+    environ[points_at] = path
     return path
+
+
+def load_roster(env: dict[str, str] | None = None, *, path: str = ROSTER_PATH) -> str | None:
+    """Fetch the factoring roster from S3 to ``path`` and point settings at it.
+
+    ``None`` when no roster is configured: ``PAYBOT_FACTORING_DOMAINS`` can carry the inline
+    patches alone.
+    """
+
+    return _fetch_config_object(
+        os.environ if env is None else env,
+        bucket_var="PAYBOT_ROSTER_BUCKET",
+        key_var="PAYBOT_ROSTER_KEY",
+        path=path,
+        points_at="PAYBOT_FACTORING_DOMAINS_FILE",
+    )
+
+
+def load_carrier_contacts(
+    env: dict[str, str] | None = None, *, path: str = CONTACTS_PATH
+) -> str | None:
+    """Fetch the carrier contact list from S3 to ``path`` and point settings at it.
+
+    ``None`` when no contact list is configured: ``PAYBOT_CARRIER_CONTACTS`` can carry the
+    inline entries alone, which is how this shipped before the file existed.
+
+    Shares ``PAYBOT_ROSTER_BUCKET`` deliberately. One private config bucket holds both
+    objects (§3.3) — a second bucket variable would imply a second lifecycle that does not
+    exist, and the IAM grant is per-key either way.
+    """
+
+    return _fetch_config_object(
+        os.environ if env is None else env,
+        bucket_var="PAYBOT_ROSTER_BUCKET",
+        key_var="PAYBOT_CARRIER_CONTACTS_KEY",
+        path=path,
+        points_at="PAYBOT_CARRIER_CONTACTS_FILE",
+    )
 
 
 def bootstrap() -> Settings:
@@ -128,6 +179,7 @@ def bootstrap() -> Settings:
     configure_logging(os.environ.get("PAYBOT_LOG_LEVEL", "INFO"))
     secrets = load_secrets()
     roster = load_roster()
+    contacts = load_carrier_contacts()
     # get_settings is lru_cached, so it must not be called before the environment is whole.
     get_settings.cache_clear()
     settings = get_settings()
@@ -136,6 +188,8 @@ def bootstrap() -> Settings:
         extra={
             "secrets_loaded": secrets,
             "roster_path": roster,
+            "carrier_contacts_path": contacts,
+            "carrier_contacts": len(settings.carrier_contacts),
             "mailbox": settings.gmail_user or settings.mailbox,
             "model": settings.model_draft,
             "region": settings.aws_region,

@@ -25,7 +25,9 @@
 
   "RosterBucket": "",
   "RosterKey": "factoring_domains.json",
-  "_RosterBucket": "Where factoring_domains.json lives. Blank disables the fetch and the inline PAYBOT_FACTORING_DOMAINS patches stand alone.",
+  "CarrierContactsKey": "carrier_contacts.json",
+  "_RosterBucket": "Where factoring_domains.json and carrier_contacts.json live. Blank disables BOTH fetches and the inline PAYBOT_FACTORING_DOMAINS / PAYBOT_CARRIER_CONTACTS entries stand alone.",
+  "_CarrierContactsKey": "Exact addresses authorised for one carrier's loads, on top of the back office record. Hand-maintained — there is no generator, because the point of an entry is that the record does NOT hold the address. Upload it alongside the roster; blank disables the fetch.",
 
   "CargoTelReplies": "true",
   "CargoTelCookieBucket": "circle-bot-cookies",

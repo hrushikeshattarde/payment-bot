@@ -151,6 +151,8 @@ Code changes required (small):
    with `build_bedrock_client()` instead of `build_groq_client()`.
 2. **Roster loading** — fetch `factoring_domains.json` from S3 to `/tmp` at cold start;
    point `PAYBOT_FACTORING_DOMAINS_FILE` at it. (~15 lines + one IAM statement.)
+   `carrier_contacts.json` shares that code path and bucket, with its own key and grant —
+   see §3.3.
 3. **Settings from environment** — already works; Lambda env vars carry the non-secret
    config, and the handler resolves secrets (below) into env before `get_settings()`.
 4. **CargoTel client** — the local runner already builds one when
@@ -222,6 +224,8 @@ Lambda env for the boring constants.
 | `PAYBOT_GMAIL_USER`, `PAYBOT_GMAIL_QUERY`, `PAYBOT_MAILBOX` | SSM `/paybot/gmail/*` | Query keeps the `to:paystatus@` guard — it is load-bearing while impersonating a personal mailbox |
 | `PAYBOT_FACTORING_DOMAINS` (inline patches) | SSM `/paybot/factoring-domains-inline` | The hand-verified overrides; small JSON |
 | `PAYBOT_FACTORING_DOMAINS_FILE` | Lambda env → `/tmp/factoring_domains.json` | Object fetched from S3 at cold start (see 3.3) |
+| `PAYBOT_CARRIER_CONTACTS` (inline entries) | SSM `/paybot/carrier-contacts-inline` | Same role as the inline factoring patches: wins on collision, small JSON |
+| `PAYBOT_CARRIER_CONTACTS_FILE` | Lambda env → `/tmp/carrier_contacts.json` | Object fetched from S3 at cold start, same bucket as the roster (see 3.3). `PAYBOT_CARRIER_CONTACTS_KEY` blank disables the fetch |
 | `PAYBOT_ALLOW_FACTORING`, `PAYBOT_SENSITIVE_BANK_REPLIES`, `PAYBOT_SENSITIVE_NOA_REPLIES` | SSM `/paybot/policy/*` | **Policy switches — changing them should be deliberate and audited**, hence Parameter Store with change history, not plain env |
 | `PAYBOT_REPLY_SIGNATURE`, `PAYBOT_REPLY_CC`, `PAYBOT_DOCUMENTS_EMAIL`, `PAYBOT_PORTAL_URL`, `PAYBOT_BULK_THRESHOLD` | Lambda env | Plain constants |
 | `PAYBOT_AGENT_MAX_ITERATIONS`, `PAYBOT_AGENT_ITERATIONS_PER_EXTRA_LOAD`, `PAYBOT_AGENT_MAX_TOKENS` | Lambda env | Defaults 12 / 9 / 4096. The first two are a *base* and a *per-extra-load increment*, not a flat cap — see §3.7 for what that does to run time. 4096 tokens is fine for Claude (non-reasoning-budget); 16384 was a free-model accommodation |
@@ -246,6 +250,26 @@ The roster is business data with a lifecycle, not code:
    (mirrors the local fail-loud file loading) rather than silently authorizing nobody.
 4. The inline patches (RTS sister domains, rebrands) live in SSM and win on collision,
    exactly as `.env` does today.
+
+**`carrier_contacts.json` rides in the same bucket**, fetched by the same code path
+(`load_carrier_contacts`, `CarrierContactsKey`), with the same fail-loud contract and an IAM
+grant scoped to its own key. One bucket rather than two because the lifecycle is identical;
+the two objects differ in three ways worth keeping straight:
+
+- **No generator.** Nothing can derive carrier contacts from an export, because the entire
+  point of an entry is that the back office record does *not* hold the address. The file is
+  hand-maintained, so it carries its own README and per-entry evidence — `_`-prefixed keys,
+  which `Settings._merge_domain_file` skips.
+- **Addresses, never domains.** Carriers are routinely on free mail (of four CargoTel carrier
+  records measured, two listed only a Gmail address), so a domain entry here would authorize
+  every Gmail user for that carrier. `_is_configured_carrier_contact` matches whole addresses
+  only, and the carrier name must match the load's exactly once normalized.
+- **A bridge, not a home.** An address answered from this file is invisible to anyone reading
+  the carrier's record and wondering why the bot replied to a sender who is not on it. Adding
+  it to the record and removing it here is the end state for every entry.
+
+Blank `CarrierContactsKey` disables the fetch and leaves the inline `PAYBOT_CARRIER_CONTACTS`
+entries to stand alone, which is how this shipped before the file existed.
 
 ### 3.4 IAM (least privilege per function)
 

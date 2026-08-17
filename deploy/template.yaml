@@ -30,11 +30,20 @@ Parameters:
     Type: String
     Default: ""
     Description: >
-      Bucket holding factoring_domains.json. Business data with its own lifecycle (§3.3),
-      fetched at cold start — never baked into the artifact. Blank disables the fetch.
+      Bucket holding factoring_domains.json and carrier_contacts.json. Business data with
+      its own lifecycle (§3.3), fetched at cold start — never baked into the artifact.
+      Blank disables both fetches.
   RosterKey:
     Type: String
     Default: factoring_domains.json
+  CarrierContactsKey:
+    Type: String
+    Default: ""
+    Description: >
+      Key of carrier_contacts.json in RosterBucket — exact addresses authorised for one
+      carrier's loads, on top of the back office record. Same bucket as the roster because
+      one config bucket holds both; the IAM grant below is per-key regardless. Blank
+      disables the fetch, leaving the inline PAYBOT_CARRIER_CONTACTS entries to stand alone.
 
   CargoTelCookieBucket:
     Type: String
@@ -149,6 +158,11 @@ Parameters:
 
 Conditions:
   HasRoster: !Not [!Equals [!Ref RosterBucket, ""]]
+  # Both must be set: the bucket alone cannot be fetched from, and a key with no bucket has
+  # nowhere to come from. Keeps the grant absent rather than malformed when only one is given.
+  HasCarrierContacts: !And
+    - !Not [!Equals [!Ref RosterBucket, ""]]
+    - !Not [!Equals [!Ref CarrierContactsKey, ""]]
   HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
   CargoTelOn: !Equals [!Ref CargoTelReplies, "true"]
   ScheduleOn: !Equals [!Ref ScheduleEnabled, "true"]
@@ -213,6 +227,14 @@ Resources:
                   Action: s3:GetObject
                   Resource: !Sub "arn:aws:s3:::${RosterBucket}/${RosterKey}"
                 - !Ref AWS::NoValue
+              # Scoped to the one key, like the roster above — not the bucket. Both objects
+              # are authorization data; read-only, and nothing else in that bucket is ours.
+              - !If
+                - HasCarrierContacts
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub "arn:aws:s3:::${RosterBucket}/${CarrierContactsKey}"
+                - !Ref AWS::NoValue
               # The CargoTel session cookie. Scoped to the one key, not the bucket: the
               # worker never needs another bot's cookies and never needs to write. The
               # bucket belongs to the login bot, which is why this is the only
@@ -267,6 +289,7 @@ Resources:
           PAYBOT_SECRET_TP_PASSWORD: !Ref TransportProPasswordSecret
           PAYBOT_ROSTER_BUCKET: !Ref RosterBucket
           PAYBOT_ROSTER_KEY: !Ref RosterKey
+          PAYBOT_CARRIER_CONTACTS_KEY: !Ref CarrierContactsKey
 
           PAYBOT_AWS_REGION: !Ref AWS::Region
           # Must stay blank. The execution role is the credential source here; naming a

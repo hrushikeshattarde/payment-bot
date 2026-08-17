@@ -317,8 +317,21 @@ class PaymentBotPipeline:
                 email, "review", f"invalid load length: {invalid}", tuple(load_ids), correlation_id
             )
 
-        if len(load_ids) > self._settings.bulk_threshold:
-            # §3.3 portal fallback: answer with the self-service link rather than escalating.
+        # §3.3 portal fallback, decided in TWO places, because one is not enough.
+        #
+        # Here, cheaply, on what the sender WROTE. Reading PDF attachments made the raw id
+        # count stop meaning "how many loads is this about": an MDR Capital enquiry naming one
+        # load carried an invoice PDF whose client-id, client-invoice and two reference numbers
+        # took the count to ten, and the sender got "you can check all of these here" instead
+        # of an answer. None of those labels can be suppressed — `invoice` is deliberately
+        # excluded from _NOT_A_LOAD_LABEL_RE and `reference` is a positive load label.
+        #
+        # Falling back to the full set when the sender named NONE is what keeps the genuine
+        # case working AND keeps it cheap: a McLeod statement says only "see the attached
+        # statement for invoice detail", so its ids are attachment-only, the fallback fires,
+        # and it deflects here without spending an authorization lookup per load.
+        written_ids = [lid for lid in load_ids if lid in set(identifiers.written_load_ids)]
+        if len(written_ids or load_ids) > self._settings.bulk_threshold:
             return self._finalize(
                 email,
                 self._bulk_portal_draft(email),
@@ -429,6 +442,27 @@ class PaymentBotPipeline:
                 },
             )
             load_ids = authorized_loads
+
+        # The bulk decision's SECOND half, on the set that survived authorization. This is the
+        # count that actually matters: a phantom id from an attachment fails authorization and
+        # drops out above, while a real load the sender is entitled to does not. So an email
+        # naming one load with nine invoice reference numbers attached answers the one, and an
+        # email naming one load with forty of the sender's REAL loads attached still deflects
+        # to the portal — which the written-id check alone could not separate, because both
+        # look like "one written, N attached".
+        #
+        # Cheap by construction: the check above already deflected anything whose ids are
+        # attachment-only, so reaching here means the sender wrote a small number of ids and
+        # only their own loads could have inflated the set.
+        if len(load_ids) > self._settings.bulk_threshold:
+            return self._finalize(
+                email,
+                self._bulk_portal_draft(email),
+                load_ids,
+                correlation_id,
+                ctx,
+                _BULK_PORTAL_SKILL_ID,
+            )
 
         # 2. Select the skill by intent -------------------------------------
         # Built from load_ids, not routes: dropped loads (non-TP, unauthorized) must not

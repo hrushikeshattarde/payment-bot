@@ -257,15 +257,35 @@ def test_loads_found_only_in_an_attachment_are_answered() -> None:
 
 @pytest.mark.integration
 def test_bulk_attachment_loads_get_the_portal_reply() -> None:
-    """More attachment loads than the threshold → the self-service portal link."""
+    """More attachment loads than the threshold → the self-service portal link.
+
+    The seven ids must be loads the sender is genuinely AUTHORIZED for, which is what makes
+    this the real bulk case rather than a pile of phantoms. The bulk decision is taken twice —
+    once on what the sender wrote, then again on what survived authorization — and only the
+    second half separates "one load named, seven of the sender's own attached" from "one load
+    named, nine invoice reference numbers attached". Registering them in the mock is what lets
+    this test exercise the half it is named for; without that they fail authorization, drop
+    out, and the email is correctly answered as the one-load question it then is.
+    """
 
     from payment_bot.models import EmailAttachment
+    from payment_bot.sample_data import build_load_2462934_fixture
 
     gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
-    pipeline = _build(
-        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), gmail, slack, audit
+    ids = [f"25200{n:02d}" for n in range(1, 8)]  # seven 7-digit ids
+    tp = sample_transport_pro_client()
+    for load_id in ids:
+        # The same fixture under another key. The portal decision is taken before the agent
+        # runs, so only authorization has to resolve for these.
+        tp._fixtures[load_id] = build_load_2462934_fixture()
+    pipeline = PaymentBotPipeline(
+        tp=tp,
+        gmail=gmail,
+        slack=slack,
+        llm=scripted_payment_status_llm(),
+        approval_resolver=ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)),
+        audit_sink=audit,
     )
-    rows = "\n".join(f"25200{n:02d}" for n in range(1, 8))  # seven 7-digit ids
     bulk = sample_payment_status_email().model_copy(
         update={
             "message_id": "msg-att-bulk-1",
@@ -274,7 +294,7 @@ def test_bulk_attachment_loads_get_the_portal_reply() -> None:
                 EmailAttachment(
                     filename="loads.xlsx",
                     mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    extracted_text=rows,
+                    extracted_text="\n".join(ids),
                 )
             ],
         }
@@ -285,6 +305,55 @@ def test_bulk_attachment_loads_get_the_portal_reply() -> None:
     assert result.outcome is Outcome.SENT, result.detail
     assert "payment-status-lookup" in gmail.sent[0].body  # the portal link
     assert slack.escalations == []
+
+
+@pytest.mark.integration
+def test_one_named_load_with_reference_numbers_attached_is_answered() -> None:
+    """The other half, and the case that made a second check necessary.
+
+    Live on an MDR Capital enquiry (load 2495569, 2026-08-17): a plain-text body naming ONE
+    load, with an invoice PDF attached whose CLIENT ID NUMBER, CLIENT INVOICE NUMBER, BILLING
+    REFERENCE NUMBER and OTHER REFERENCE NUMBER took the id count to ten. The sender was
+    answered with "you can check all of these here" — a portal link, to a one-load question.
+
+    None of those labels can be suppressed at extraction: ``invoice`` is deliberately excluded
+    from _NOT_A_LOAD_LABEL_RE because carriers write "Invoice 2462934" meaning the load, and
+    ``reference`` is a POSITIVE load label. So the phantoms can only disappear where they fail
+    authorization, which is after the original bulk check ran.
+    """
+
+    from payment_bot.models import EmailAttachment
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), gmail, slack, audit
+    )
+    invoice = (
+        "CLIENT ID NUMBER 1229475\n"
+        "CLIENT INVOICE NUMBER 2869463\n"
+        "BILLING REFERENCE NUMBER 9132447\n"
+        "OTHER REFERENCE NUMBER 3051426\n"
+        "Invoice Sum 9997844\n"
+        "Ref 1025935\nRef 9999359\nRef 1003193\n"
+    )
+    email = sample_payment_status_email().model_copy(
+        update={
+            "message_id": "msg-mdr-1",
+            "body": "Can we get payment status on load 2462934 please?",
+            "attachments": [
+                EmailAttachment(
+                    filename="2034.csv", mime_type="text/csv", extracted_text=invoice
+                )
+            ],
+        }
+    )
+
+    result = pipeline.process_email(email)
+
+    assert result.outcome is Outcome.SENT, result.detail
+    body = gmail.sent[0].body
+    assert "payment-status-lookup" not in body, "a one-load question must not get the portal"
+    assert "2462934" in body, "the load the sender actually asked about"
 
 
 @pytest.mark.integration

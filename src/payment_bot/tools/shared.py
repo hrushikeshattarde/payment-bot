@@ -783,6 +783,23 @@ class ExtractIdentifiersInput(BaseModel):
 class ExtractIdentifiersOutput(BaseModel):
     ok: bool = True
     load_ids: list[str]
+    #: The subset of :attr:`load_ids` the sender actually WROTE — found in the subject, body or
+    #: HTML part rather than pulled out of an attachment or a quoted thread.
+    #:
+    #: "How many loads is this email about?" and "how many load-shaped numbers does it
+    #: contain?" stopped being the same question when PDF attachments started being read. An
+    #: MDR Capital enquiry naming ONE load carried an invoice PDF whose CLIENT ID NUMBER,
+    #: CLIENT INVOICE NUMBER, BILLING REFERENCE NUMBER and OTHER REFERENCE NUMBER pushed the
+    #: count to ten, and the sender was answered with a portal link. None of those labels can
+    #: be suppressed: ``invoice`` is deliberately excluded from
+    #: :data:`_NOT_A_LOAD_LABEL_RE` and ``reference`` is a POSITIVE load label in
+    #: :data:`_LOAD_LABEL_RE`.
+    #:
+    #: HTML counts as written because it IS this message in another format — a portal
+    #: collections table living only in the HTML part is the sender writing forty loads.
+    #: Empty when the sender named none, which is the statement case; callers fall back to
+    #: :attr:`load_ids` there.
+    written_load_ids: list[str] = Field(default_factory=list)
     stated_rates: list[StatedRate]
     carrier_names: list[str]
     factoring_company: str | None = None
@@ -837,6 +854,17 @@ class ExtractIdentifiers(Tool):
             load_ref = line_ids[0] if len(line_ids) == 1 else None
             stated_rates.extend(StatedRate(load_id=load_ref, amount=a) for a in amounts)
 
+        # Which of the surviving ids the sender actually wrote. A subset of the guarded result
+        # rather than a fresh scan, so every guard above still applies — an id the label rules
+        # dropped cannot come back through here. `thread_text` is excluded with the
+        # attachments: quoted history is not this message's question, the line `strip_quoted`
+        # draws for the sensitive-change scan.
+        written_text = "\n".join(
+            p for p in (params.subject, params.body, params.html_text) if p
+        )
+        written = set(_load_ids_in(written_text))
+        written_load_ids = [lid for lid in load_ids if lid in written]
+
         carrier_names = _dedupe(m.strip().rstrip(".") for m in _COMPANY_RE.findall(text))
 
         factoring_company: str | None = None
@@ -857,6 +885,7 @@ class ExtractIdentifiers(Tool):
 
         return ExtractIdentifiersOutput(
             load_ids=load_ids,
+            written_load_ids=written_load_ids,
             stated_rates=stated_rates,
             carrier_names=carrier_names,
             factoring_company=factoring_company,

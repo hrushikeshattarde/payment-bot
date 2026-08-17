@@ -160,6 +160,12 @@ Code changes required (small):
    `cargotel=` to `PaymentBotPipeline` the same way. No new code beyond the wiring, but the
    Lambda needs `boto3` (already present) *and* `beautifulsoup4` — the `cargotel` extra — in
    the deployment package.
+5. **PDF statement reading** — `pypdf`, the `pdf` extra, must be in the package too. It is
+   the one bundled dependency whose absence is **silent**: a PDF statement yields no text, so
+   every one of them escalates as "no valid load id found" while the same mail drafts fine
+   locally. `deploy/build_package.py` carries it in `REQUIREMENTS` for that reason. A scanned
+   PDF has no text layer and is empty regardless — coverage is partial and looks identical to
+   a statement with no load ids in it.
 
 Definition of done: the workstation task and the Lambda run in parallel for 2–3 business
 days producing identical outcomes (thread-skip makes double-processing safe — whichever

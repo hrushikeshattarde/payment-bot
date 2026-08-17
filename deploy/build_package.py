@@ -41,11 +41,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: worker needs. `google-auth` signs the service-account JWT; `beautifulsoup4` is the
 #: `cargotel` extra, and the CargoTel client fails closed with an actionable error without
 #: it — which would be a runtime discovery of a build mistake (§3.6).
+#:
+#: `pypdf` is the `pdf` extra, and it is the one entry here whose absence is SILENT: a PDF
+#: statement would simply yield no text, so every one of them would keep escalating as "no
+#: valid load id found" while the same mail drafted fine on a developer's machine. Nothing
+#: fails closed to catch that, which is precisely why it belongs in this list rather than
+#: being left to whoever remembers the extra.
 REQUIREMENTS = (
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "google-auth>=2.28",
     "beautifulsoup4>=4.12",
+    "pypdf>=4.2",
 )
 
 #: Lambda's Python runtime. Must match `Runtime:` in template.yaml — a mismatch stages

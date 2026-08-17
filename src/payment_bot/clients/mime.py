@@ -139,12 +139,62 @@ def _xlsx_text(payload: bytes) -> str:
         return ""
 
 
-def _attachment_text(content_type: str, filename: str, payload: bytes) -> str:
-    """Extract searchable text from spreadsheet attachments; "" for everything else.
+def _pdf_text(payload: bytes) -> str:
+    """The PDF's embedded text layer, page by page. Never raises; "" when there is none.
 
-    Only spreadsheet types: they are where statement load ids live, they parse with the
-    stdlib, and their content is data rather than prose. PDFs and images are out of
-    scope — no parser dependency, and OCR territory.
+    Statement attachments are routinely PDFs rather than spreadsheets — a McLeod AR statement
+    is the common shape, and its load ids exist nowhere in the covering email, which reads
+    "see the attached statement for invoice detail" and stops.
+
+    ``pypdf`` is imported lazily and its absence yields "", like every other optional
+    dependency here: a deployment without it behaves exactly as this module did before PDFs
+    were read at all, rather than failing a run over an attachment.
+
+    **A SCANNED statement returns "" too**, and nothing downstream can tell that apart from a
+    PDF with no load ids in it. There is no text layer to find and this module does not do OCR
+    (see the module docstring: anything we cannot read becomes empty). So coverage of PDF
+    statements is real but partial, and partial in a way that looks like an ordinary
+    no-ids-found escalation.
+    """
+
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return ""
+
+    try:
+        import io
+
+        reader = PdfReader(io.BytesIO(payload))
+        lines: list[str] = []
+        total = 0
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            if not text:
+                continue
+            lines.append(text)
+            total += len(text)
+            # Same cap and same reason as the spreadsheet reader: a statement can run to
+            # hundreds of pages and only the identifiers matter.
+            if total > _MAX_ATTACHMENT_TEXT:
+                return "\n".join(lines)[:_MAX_ATTACHMENT_TEXT]
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _attachment_text(content_type: str, filename: str, payload: bytes) -> str:
+    """Extract searchable text from statement attachments; "" for everything else.
+
+    Spreadsheets and PDFs: the formats carriers and factors actually send statements in, and
+    the only ones whose load ids exist nowhere in the covering email. Images stay out of
+    scope — that is OCR territory, and so is a scanned PDF, which reaches :func:`_pdf_text`
+    and comes back empty.
+
+    Whatever this returns feeds identifier extraction and NOTHING else — never the
+    sensitive-change scan. See :class:`~payment_bot.models.EmailAttachment`: statements carry
+    remit-to blocks as a matter of course, and scanning them would turn every statement into
+    a suspected bank-change request. That restriction is why widening this function is safe.
     """
 
     lower_name = filename.lower()
@@ -155,11 +205,16 @@ def _attachment_text(content_type: str, filename: str, payload: bytes) -> str:
             return payload.decode("utf-8", errors="replace")[:_MAX_ATTACHMENT_TEXT]
         except Exception:
             return ""
+    # Matched on either signal: McLeod and other back offices label statements
+    # application/octet-stream often enough that the extension has to carry it, and an
+    # uppercase ".PDF" is common from Windows-generated mail.
+    if content_type == "application/pdf" or lower_name.endswith(".pdf"):
+        return _pdf_text(payload)
     return ""
 
 
 def attachments(message: EmailMessage) -> list[EmailAttachment]:
-    """Attachment metadata, plus extracted text for spreadsheet types (§4.2)."""
+    """Attachment metadata, plus extracted text for statement types (§4.2)."""
 
     out: list[EmailAttachment] = []
     for part in message.walk():

@@ -46,14 +46,19 @@ _HSPACE_RE = re.compile(r"[ \t\r\f\v]+")
 
 
 class EmailAttachment(BaseModel):
-    """Attachment metadata, plus extracted text for spreadsheet types.
+    """Attachment metadata, plus extracted text for statement types.
 
     ``detect_sensitive_change`` inspects filenames/types (e.g. a voided-check image or
-    an NOA PDF) as one signal. ``extracted_text`` is filled only for spreadsheet
-    attachments (xlsx/csv) so ``extract_identifiers`` can find the load ids carriers send
-    as statements — it feeds identifier extraction ONLY, never the sensitive-change scan:
-    statement sheets routinely carry remit-to blocks that would false-positive the
-    bank-change patterns, and a change request lives in what the sender *wrote*.
+    an NOA PDF) as one signal. ``extracted_text`` is filled for spreadsheet attachments
+    (xlsx/csv) and for PDFs carrying a text layer, so ``extract_identifiers`` can find the
+    load ids carriers send as statements — it feeds identifier extraction ONLY, never the
+    sensitive-change scan: statements routinely carry remit-to blocks that would
+    false-positive the bank-change patterns, and a change request lives in what the sender
+    *wrote*. That restriction is what makes reading more formats safe rather than riskier.
+
+    Empty is not the same as "nothing there": a scanned PDF has no text layer and yields ""
+    indistinguishably from one with no load ids in it. See
+    :func:`~payment_bot.clients.mime._pdf_text`.
     """
 
     model_config = ConfigDict(frozen=True)

@@ -29,6 +29,10 @@ google = ["google-auth>=2.28"]
 # still goes through our own urllib transport. `boto3` (the `aws` extra) is needed too: the
 # session cookie lives in S3.
 cargotel = ["beautifulsoup4>=4.12"]
+# Statement attachments arrive as PDFs at least as often as spreadsheets, and their load ids
+# exist nowhere in the covering email. An extra rather than a core dependency, and imported
+# lazily: without it PDFs simply yield no text, exactly as before they were read at all.
+pdf = ["pypdf>=4.2"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
@@ -37,6 +41,9 @@ dev = [
     # The CargoTel parser tests run against saved-page fixtures, so the parser's own
     # dependency has to be present for the suite to pass on a fresh checkout.
     "beautifulsoup4>=4.12",
+    # Same reason: the PDF-statement tests build a real PDF and read it back, so the suite
+    # would otherwise pass by exercising only the library-absent path.
+    "pypdf>=4.2",
 ]
 
 [project.scripts]

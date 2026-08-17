@@ -1,4 +1,4 @@
-"""Unit tests for spreadsheet attachment text extraction (mime) and its use in intake."""
+"""Unit tests for statement attachment text extraction (mime) and its use in intake."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from email.message import EmailMessage
 import pytest
 
 from payment_bot.clients.mime import parse_inbound_email
+from payment_bot.grounding import GroundingLedger
 from payment_bot.tools.base import ToolContext
 from payment_bot.tools.shared import ExtractIdentifiers, ExtractIdentifiersInput
 
@@ -87,11 +88,167 @@ def test_broken_xlsx_yields_empty_text_not_a_crash() -> None:
 
 
 @pytest.mark.unit
-def test_non_spreadsheet_attachments_are_not_extracted() -> None:
+def test_an_image_attachment_is_not_extracted() -> None:
+    """Images stay out of scope — that is OCR territory, and so is a scanned PDF."""
+
     parsed = parse_inbound_email(
-        _email_with_attachment(b"%PDF-1.4 fake", "noa.pdf", ("application", "pdf"))
+        _email_with_attachment(b"\x89PNG\r\n\x1a\n fake", "voided-check.png", ("image", "png"))
     )
     assert parsed.attachments[0].extracted_text == ""
+
+
+# --- PDF statements ---------------------------------------------------------
+def _pdf_bytes(*lines: str) -> bytes:
+    """A minimal single-page PDF with a real text layer, built by hand.
+
+    Hand-built rather than written with a library so the test exercises the READER against a
+    genuine text stream, and does not pass because a writer and reader agree with each other.
+    """
+
+    stream = "BT /F1 12 Tf 72 720 Td " + " ".join(f"({line}) Tj 0 -16 Td" for line in lines) + " ET"
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+            "/Resources << /Font << /F1 5 0 R >> >> >>"
+        ),
+        f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n{body}\nendobj\n".encode("latin-1")
+
+    xref_at = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode("latin-1")
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode("latin-1")
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"
+    ).encode("latin-1")
+    return bytes(out)
+
+
+@pytest.mark.unit
+def test_a_pdf_statement_is_extracted() -> None:
+    """Live gap, 2026-08-15: a McLeod AR statement from Delta Carrier Group.
+
+    The covering email read "See the attached statement for invoice detail" and carried no
+    load id anywhere in its body, so the run escalated with "no valid 6/7-digit load id found"
+    while the ids sat in the PDF.
+    """
+
+    parsed = parse_inbound_email(
+        _email_with_attachment(
+            _pdf_bytes("Invoice INV-88213  Load 2534512  1450.00"),
+            "statement.pdf",
+            ("application", "pdf"),
+        )
+    )
+    assert "2534512" in parsed.attachments[0].extracted_text
+
+
+@pytest.mark.unit
+def test_a_pdf_labelled_octet_stream_is_still_read() -> None:
+    """Back offices mislabel statements, and Windows mail sends an uppercase extension."""
+
+    parsed = parse_inbound_email(
+        _email_with_attachment(
+            _pdf_bytes("Load 2534512"), "Statement_08152026.PDF", ("application", "octet-stream")
+        )
+    )
+    assert "2534512" in parsed.attachments[0].extracted_text
+
+
+@pytest.mark.unit
+def test_a_pdf_statement_reaches_the_extractor() -> None:
+    """End to end: the ids in a PDF become load ids, which is the whole point."""
+
+    parsed = parse_inbound_email(
+        _email_with_attachment(
+            _pdf_bytes("Invoice INV-88213  Load 2534512", "Invoice INV-88240  Load 2535880"),
+            "statement.pdf",
+            ("application", "pdf"),
+        )
+    )
+    out = ExtractIdentifiers().run(
+        ExtractIdentifiersInput(
+            subject="Invoices due reminder",
+            body="See the attached statement for invoice detail.",
+            attachments_text=parsed.attachments[0].extracted_text,
+        ),
+        ToolContext(tp=None, ledger=GroundingLedger(), correlation_id="pdf-test"),
+    )
+    assert out.load_ids == ["2534512", "2535880"]
+
+
+@pytest.mark.unit
+def test_a_scanned_pdf_yields_empty_text_not_a_crash() -> None:
+    """No text layer, no ids — and nothing downstream can tell this from "no ids in it".
+
+    This is the documented limit of the feature: coverage of PDF statements is partial, and
+    partial in a way that looks like an ordinary no-ids-found escalation.
+    """
+
+    scanned = _pdf_bytes()  # a page whose content stream draws no text
+    parsed = parse_inbound_email(
+        _email_with_attachment(scanned, "scan.pdf", ("application", "pdf"))
+    )
+    assert parsed.attachments[0].extracted_text.strip() == ""
+
+
+@pytest.mark.unit
+def test_a_corrupt_pdf_yields_empty_text_not_a_crash() -> None:
+    parsed = parse_inbound_email(
+        _email_with_attachment(b"%PDF-1.4 truncated garbage", "broken.pdf", ("application", "pdf"))
+    )
+    assert parsed.attachments[0].extracted_text == ""
+
+
+@pytest.mark.unit
+def test_a_pdf_is_read_only_for_identifiers_never_the_change_scan() -> None:
+    """A statement's remit-to block must not read as a bank-change request.
+
+    The restriction predates PDFs and is what makes reading more formats safe: attachment text
+    feeds extract_identifiers alone. A McLeod statement carries a remit-to block as a matter of
+    course, so without this every one of them would escalate as a suspected change.
+    """
+
+    from payment_bot.models import SensitiveFlag
+    from payment_bot.tools.shared import DetectSensitiveChange, DetectSensitiveChangeInput
+
+    parsed = parse_inbound_email(
+        _email_with_attachment(
+            _pdf_bytes(
+                "Remit to: Delta Carrier Group",
+                "Please update your records: account 123456789 routing 021000021",
+                "Load 2534512  1450.00",
+            ),
+            "statement.pdf",
+            ("application", "pdf"),
+        )
+    )
+    assert "021000021" in parsed.attachments[0].extracted_text  # it IS extracted
+
+    out = DetectSensitiveChange().run(
+        DetectSensitiveChangeInput(
+            subject=parsed.subject,
+            body=parsed.body,
+            attachments=[
+                {"filename": a.filename, "mime_type": a.mime_type} for a in parsed.attachments
+            ],
+        ),
+        ToolContext(tp=None, ledger=GroundingLedger(), correlation_id="pdf-scan-test"),
+    )
+    # ...and it does not reach this scan. NONE is the "nothing found" sentinel, so the
+    # assertion is that no real flag fired — a BANK_CHANGE here would escalate every statement.
+    assert out.flags == [SensitiveFlag.NONE], out.evidence
+    assert SensitiveFlag.BANK_CHANGE not in out.flags
 
 
 @pytest.mark.unit

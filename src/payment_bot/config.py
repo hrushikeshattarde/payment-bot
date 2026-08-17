@@ -61,10 +61,17 @@ def _merge_domain_file(values: Any, inline_key: str, file_key: str) -> Any:
     if not isinstance(loaded, dict):
         raise ValueError(f"{file_key} {path_str!r} must hold a JSON object")
 
+    # Keys beginning with `_` are documentation, not entries. The generated roster has none —
+    # `generate_factoring_domains.py` strips them before writing — but a HAND-maintained file
+    # carries its own README and evidence notes, and without this they would merge in as a
+    # company named "_README" whose "domains" are prose. Skipped here rather than in each
+    # caller so no consumer of a roster file can inherit the footgun.
+    entries = {k: v for k, v in loaded.items() if not str(k).startswith("_")}
+
     inline = values.get(inline_key) or {}
     if isinstance(inline, str):  # env sources may hand the raw JSON string through
         inline = json.loads(inline)
-    values[inline_key] = {**loaded, **inline}
+    values[inline_key] = {**entries, **inline}
     return values
 
 
@@ -165,6 +172,23 @@ class Settings(BaseSettings):
     #: another's loads, which is the whole thing this must not do.
     carrier_contacts: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
+    #: Optional JSON file holding additional carrier contacts, same shape as
+    #: ``carrier_contacts``. Inline entries win on a key collision, exactly as with
+    #: ``factoring_domains_file``.
+    #:
+    #: Exists for the reason the roster's own file does: these are real carrier names mapped
+    #: to real addresses — business data — and ``.env`` is a credentials file. Kept inline,
+    #: each new contact lengthened one JSON line nobody could review, had to be re-entered by
+    #: hand as a Lambda environment variable to reach production, and carried its provenance
+    #: in ``.env`` comments that no reader of the contact list would ever see. The file keeps
+    #: the address beside the evidence for it.
+    #:
+    #: Unlike the roster there is no generator: nothing derives carrier contacts from an
+    #: export, because the whole point of an entry is that the back office record does NOT
+    #: have the address. So this file is hand-maintained, and ``_``-prefixed keys in it are
+    #: documentation — see :func:`_merge_domain_file`.
+    carrier_contacts_file: str = ""
+
     #: Whether the model gets to say which extracted numbers are really load ids.
     #:
     #: ``off`` (default) is today's behaviour: the regex and its seven guards decide alone.
@@ -197,6 +221,17 @@ class Settings(BaseSettings):
         """
 
         return _merge_domain_file(values, "factoring_domains", "factoring_domains_file")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_carrier_contacts_file(cls, values: Any) -> Any:
+        """Load ``carrier_contacts_file`` and merge it under the inline map.
+
+        Same contract as the roster's: unreadable is fatal, because a contact list that
+        quietly failed to load looks configured and authorises nobody.
+        """
+
+        return _merge_domain_file(values, "carrier_contacts", "carrier_contacts_file")
 
     # --- CargoTel (6-digit loads) --------------------------------------------
     #: The load-maintenance page. CargoTel has no API, so the "client" scrapes this.

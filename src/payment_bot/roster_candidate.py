@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from payment_bot.config import Settings
+from payment_bot.errors import ConfigError
 from payment_bot.logging import get_logger
 from payment_bot.tools.shared import (
     _FREE_MAIL_DOMAINS,
@@ -293,6 +294,72 @@ def build_candidate(
         free_mail=domain in _FREE_MAIL_DOMAINS,
         carrier_on_file_emails=carrier_on_file_emails,
     )
+
+
+#: The hand-maintained patch file, beside whatever ``factoring_domains_file`` points at.
+#: Same convention ``scripts/generate_factoring_domains.py`` uses, so a regeneration picks up
+#: anything written here rather than discarding it.
+_MANUAL_FILENAME = "factoring_domains_manual.json"
+
+
+def append_manual_entries(
+    entries: dict[str, str], *, note: str, settings: Settings
+) -> Settings:
+    """Persist roster entries to the manual patch file and return widened settings.
+
+    Only ever ADDS. An existing key is unioned, never replaced, and an existing evidence note
+    is appended to — the same rules the generator applies when it merges this file, so a
+    regeneration reproduces exactly what this wrote.
+
+    Writing to the manual file rather than the generated roster is what makes the addition
+    survive: ``factoring_domains.json`` is rebuilt from the settlements export and would
+    discard a direct edit at the next regeneration.
+
+    Raises :class:`ConfigError` when there is nowhere to write — an unset
+    ``factoring_domains_file`` means no roster file is configured, and silently doing nothing
+    would leave the caller believing an entry exists.
+    """
+
+    if not settings.factoring_domains_file:
+        raise ConfigError(
+            "cannot write a roster entry: PAYBOT_FACTORING_DOMAINS_FILE is unset, so there is "
+            "no roster file to keep it beside"
+        )
+    path = Path(settings.factoring_domains_file).resolve().parent / _MANUAL_FILENAME
+
+    manual: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"{path} could not be read: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ConfigError(f"{path} must hold a JSON object")
+        manual = loaded
+
+    evidence = manual.get("_evidence")
+    if not isinstance(evidence, dict):
+        evidence = {}
+
+    for key, value in entries.items():
+        existing = manual.get(key)
+        current = [str(v) for v in existing] if isinstance(existing, list) else []
+        manual[key] = sorted({*current, value})
+        prior = evidence.get(key)
+        evidence[key] = f"{prior} || {note}" if prior else note
+
+    # `_evidence` last, so the file keeps reading as entries-then-notes.
+    ordered = {k: v for k, v in manual.items() if k != "_evidence"}
+    ordered["_evidence"] = evidence
+    try:
+        path.write_text(json.dumps(ordered, indent=1) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"{path} could not be written: {exc}") from exc
+
+    widened = {k: tuple(v) for k, v in settings.factoring_domains.items()}
+    for key, value in entries.items():
+        widened[key] = tuple(sorted({*widened.get(key, ()), value}))
+    return settings.model_copy(update={"factoring_domains": widened})
 
 
 def log_candidate(candidate: RosterCandidate, correlation_id: str) -> dict[str, Any]:

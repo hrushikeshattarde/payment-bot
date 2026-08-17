@@ -54,13 +54,14 @@ from payment_bot.grounding import GroundingLedger
 from payment_bot.id_filter import MIN_CANDIDATES, IdFilterMode, apply_filter, classify
 from payment_bot.logging import AuditSink, get_logger
 from payment_bot.models import InboundEmail, Intent, SensitiveAction, System
-from payment_bot.roster_candidate import build_candidate, log_candidate
+from payment_bot.roster_candidate import append_manual_entries, build_candidate, log_candidate
 from payment_bot.tools import ToolContext, ToolRegistry, build_default_registry
 from payment_bot.tools.shared import (
     CheckAuthorizationOutput,
     ClassifyIntentOutput,
     DetectSensitiveChangeOutput,
     ExtractIdentifiersOutput,
+    _factor_names_match,
 )
 from payment_bot.tools.submit import SubmitDraftOutput
 
@@ -388,42 +389,21 @@ class PaymentBotPipeline:
         # a phantom id that Transport Pro 400s on ate all 12 iterations retrying it and
         # produced no draft. The gate stays authoritative over what the draft actually
         # discloses; this is an efficiency measure, not a replacement.
-        unauthorized: list[tuple[str, str]] = []
-        authorized_loads: list[str] = []
-        prenoa_loads: list[str] = []
-        #: Requested loads whose authorization could not be RESOLVED, as opposed to resolved
-        #: as a denial. Tracked apart because the two must not be treated alike downstream: a
-        #: denied load is legitimately withheld and the reply should say nothing about it,
-        #: while an unresolvable load is one the sender explicitly asked about and we simply
-        #: do not know — answering the rest and saying nothing about it is misleading. Feeds
-        #: the gate's coverage baseline; see below.
-        unresolved_loads: list[str] = []
-        for load_id in load_ids:
-            auth_out = self._registry.dispatch(
-                "check_authorization",
-                {
-                    "sender_email": email.from_email,
-                    "sender_name": email.from_name,
-                    "load_id": load_id,
-                    "system": routes[load_id].value,
-                },
-                ctx,
+        unauthorized, authorized_loads, prenoa_loads, unresolved_loads = self._authorize_loads(
+            email, load_ids, routes, ctx
+        )
+        # POLICY: add the sender's domain for the factor already on the load, then retry once.
+        # Off by default; see Settings.auto_add_factoring_domains for what this trades away and
+        # the four cases it still refuses.
+        if (
+            not authorized_loads
+            and self._settings.auto_add_factoring_domains
+            and self._auto_add_factoring_domains(email, tuple(load_ids), ctx, correlation_id)
+        ):
+            unauthorized, authorized_loads, prenoa_loads, unresolved_loads = (
+                self._authorize_loads(email, load_ids, routes, ctx)
             )
-            if not auth_out.ok:
-                # Cannot resolve authorization → treat as denied (fail closed, like the gate).
-                unauthorized.append((load_id, f"ERROR({auth_out.payload.get('error')})"))
-                unresolved_loads.append(load_id)
-                continue
-            auth = CheckAuthorizationOutput.model_validate(auth_out.payload)
-            if not auth.authorized:
-                # Carry the tool's reason — it names the fix (e.g. a factoring domain to
-                # add to PAYBOT_FACTORING_DOMAINS), which is what the reviewer acts on.
-                detail = f" ({auth.reason})" if auth.reason else ""
-                unauthorized.append((load_id, f"{auth.decision.value}{detail}"))
-                continue
-            authorized_loads.append(load_id)
-            if auth.pre_noa:
-                prenoa_loads.append(load_id)
+
         if not authorized_loads:
             reason = f"sender not authorized for any load: {_group_by_reason(unauthorized)}"
             # Assemble the roster packet BEFORE escalating, so the reviewer gets the evidence
@@ -810,6 +790,180 @@ class PaymentBotPipeline:
                 "id_filter_failed", extra={"correlation_id": correlation_id, "error": str(exc)}
             )
             return load_ids
+
+    def _authorize_loads(
+        self,
+        email: InboundEmail,
+        load_ids: list[str],
+        routes: dict[str, System],
+        ctx: ToolContext,
+    ) -> tuple[list[tuple[str, str]], list[str], list[str], list[str]]:
+        """Run the authorization pre-check over every load.
+
+        Returns ``(unauthorized, authorized, prenoa, unresolved)``. ``unresolved`` is kept
+        apart from ``unauthorized`` because the two must not be treated alike downstream: a
+        denied load is legitimately withheld and the reply should say nothing about it, while
+        an unresolvable load is one the sender explicitly asked about and we simply do not
+        know — answering the rest and saying nothing about it is misleading. It feeds the
+        gate's coverage baseline.
+
+        A method rather than an inline loop so it can be run a second time after the roster is
+        widened by ``auto_add_factoring_domains``, on the one code path where that happens.
+        """
+
+        unauthorized: list[tuple[str, str]] = []
+        authorized_loads: list[str] = []
+        prenoa_loads: list[str] = []
+        unresolved_loads: list[str] = []
+        for load_id in load_ids:
+            auth_out = self._registry.dispatch(
+                "check_authorization",
+                {
+                    "sender_email": email.from_email,
+                    "sender_name": email.from_name,
+                    "load_id": load_id,
+                    "system": routes[load_id].value,
+                },
+                ctx,
+            )
+            if not auth_out.ok:
+                # Cannot resolve authorization → treat as denied (fail closed, like the gate).
+                unauthorized.append((load_id, f"ERROR({auth_out.payload.get('error')})"))
+                unresolved_loads.append(load_id)
+                continue
+            auth = CheckAuthorizationOutput.model_validate(auth_out.payload)
+            if not auth.authorized:
+                # Carry the tool's reason — it names the fix (e.g. a factoring domain to
+                # add to PAYBOT_FACTORING_DOMAINS), which is what the reviewer acts on.
+                detail = f" ({auth.reason})" if auth.reason else ""
+                unauthorized.append((load_id, f"{auth.decision.value}{detail}"))
+                continue
+            authorized_loads.append(load_id)
+            if auth.pre_noa:
+                prenoa_loads.append(load_id)
+        return unauthorized, authorized_loads, prenoa_loads, unresolved_loads
+
+    def _auto_add_factoring_domains(
+        self,
+        email: InboundEmail,
+        load_ids: tuple[str, ...],
+        ctx: ToolContext,
+        correlation_id: str,
+    ) -> bool:
+        """Roster the sender's domain for the factor already on the load. Policy-gated.
+
+        Returns True when something was added, in which case the caller re-runs the
+        authorization pre-check against the widened roster.
+
+        THE COMPANY HALF NEVER COMES FROM THE MAIL. An entry is only written for a load whose
+        own factor record names the factor, so what is being taken on trust is exactly one
+        thing: that this domain belongs to that company. That is still the thing
+        ``roster_candidate`` says a human should decide, and enabling the switch is the
+        decision to stop asking.
+
+        Four cases are refused even with the switch on, because each would make the roster
+        meaningless rather than merely permissive:
+
+        * a free-mail sender — the domain form would authorise every mailbox at that provider,
+          and ``_roster_entry_matches`` refuses it at lookup, so the entry would be inert;
+        * a domain already rostered to a DIFFERENT company — the Faro/BasicBlock shape, where
+          one factor's real domain arrives on another factor's load. Auto-adding it would let
+          one company answer for another's loads;
+        * a load with no factor on file — there is then no company to attach the domain to,
+          and ``build_candidate`` returns None for exactly this reason;
+        * anything the sensitive-change scan flagged, which escalates before reaching here.
+
+        Every write lands in ``factoring_domains_manual.json`` with an ``AUTO-ADDED`` evidence
+        note and a WARNING in the log, so an entry nobody verified is findable and revocable
+        rather than indistinguishable from one somebody did.
+        """
+
+        added: dict[str, str] = {}
+        for load_id in load_ids:
+            try:
+                system = route_load(load_id).system
+                if system is System.QUICKBOOKS:
+                    if ctx.cargotel is None:
+                        continue
+                    auth = ctx.cargotel.get_authorization_context(load_id)
+                elif system is System.TRANSPORT_PRO:
+                    auth = ctx.tp.get_authorization_context(load_id)
+                else:
+                    continue
+            except PaymentBotError:
+                continue
+            candidate = build_candidate(
+                sender_email=email.from_email,
+                factor_on_file=auth.factoring_company or "",
+                load_ids=(load_id,),
+                settings=self._settings,
+            )
+            if candidate is None:
+                continue  # no factor on file: nothing to attach the domain to
+            if candidate.free_mail:
+                _log.warning(
+                    "auto_roster_refused_free_mail",
+                    extra={
+                        "correlation_id": correlation_id,
+                        "sender_domain": candidate.sender_domain,
+                        "factor_on_file": candidate.factor_on_file,
+                    },
+                )
+                continue
+            elsewhere = sorted(
+                name
+                for name, domains in self._settings.factoring_domains.items()
+                if not _factor_names_match(name, candidate.factor_on_file)
+                and any(
+                    str(d).strip().lower().lstrip("@") == candidate.sender_domain
+                    for d in domains
+                )
+            )
+            if elsewhere:
+                _log.warning(
+                    "auto_roster_refused_rostered_elsewhere",
+                    extra={
+                        "correlation_id": correlation_id,
+                        "sender_domain": candidate.sender_domain,
+                        "factor_on_file": candidate.factor_on_file,
+                        "already_rostered_to": elsewhere,
+                    },
+                )
+                continue
+            added[candidate.roster_key] = candidate.sender_domain
+
+        if not added:
+            return False
+
+        note = (
+            f"AUTO-ADDED {self._today.isoformat()} by PAYBOT_AUTO_ADD_FACTORING_DOMAINS. "
+            f"Sender {email.from_email} wrote about load(s) {', '.join(load_ids)}, whose factor "
+            f"record already named this company; the DOMAIN is attested only by that mail. "
+            f"Nobody verified it — subject {email.subject!r}. Revoke if it does not belong."
+        )
+        try:
+            widened = append_manual_entries(added, note=note, settings=self._settings)
+        except PaymentBotError as exc:
+            _log.warning(
+                "auto_roster_write_failed",
+                extra={"correlation_id": correlation_id, "error": str(exc)},
+            )
+            return False
+
+        # Swap the widened roster in for the rest of this run, so the retry, the gate's own
+        # re-run of check_authorization, and the agent all judge against the same roster.
+        self._settings = widened
+        ctx.settings = widened
+        _log.warning(
+            "auto_roster_entry_added",
+            extra={
+                "correlation_id": correlation_id,
+                "added": added,
+                "sender": email.from_email,
+                "load_ids": list(load_ids),
+            },
+        )
+        return True
 
     def _roster_candidate(
         self,

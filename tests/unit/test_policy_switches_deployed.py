@@ -47,6 +47,11 @@ POLICY_SWITCHES: dict[str, str] = {
     "sensitive_noa_replies": "SensitiveNoaReplies",
     "noa_attachment_replies": "NoaAttachmentReplies",
     "factoring_prenoa_replies": "FactoringPrenoaReplies",
+    "auto_add_factoring_domains": "AutoAddFactoringDomains",
+    # Not a boolean, so the auto-detection below cannot find it. Listed by hand for the same
+    # reason as the rest: `off` in a deployed stack while `enforce` locally is a silent
+    # behaviour difference, which is exactly the class of bug this file exists for.
+    "llm_id_filter": "LlmIdFilter",
 }
 
 
@@ -80,12 +85,17 @@ def test_no_policy_switch_is_missing_from_this_list() -> None:
     template edit, so the failure is a red test rather than production mail escalating.
     """
 
-    reply_switches = {
+    # `*_replies` was the original shape; `allow_*` and `auto_*` were added after
+    # auto_add_factoring_domains — the most consequential switch in the system — slipped past a
+    # guard that only knew about one suffix. A boolean defaulting False is the tell: it gates
+    # behaviour and a deployment that says nothing gets the strict version.
+    behaviour_switches = {
         name
         for name, field in Settings.model_fields.items()
-        if name.endswith("_replies") and field.default is False
+        if field.default is False
+        and (name.endswith("_replies") or name.startswith(("allow_", "auto_")))
     }
-    unlisted = reply_switches - set(POLICY_SWITCHES)
+    unlisted = behaviour_switches - set(POLICY_SWITCHES)
 
     assert not unlisted, (
         f"new policy switch(es) {sorted(unlisted)} are not in POLICY_SWITCHES — add them, then "

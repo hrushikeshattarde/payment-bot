@@ -189,6 +189,31 @@ class Settings(BaseSettings):
     #: documentation — see :func:`_merge_domain_file`.
     carrier_contacts_file: str = ""
 
+    #: Add an unknown factoring sender's domain to the roster automatically, then answer,
+    #: instead of escalating for a human to decide.
+    #:
+    #: A deliberate policy switch like ``allow_factoring``, defaulting to the strict behaviour,
+    #: and the most consequential one here. Turning it on means the roster stops being a list
+    #: of domains somebody verified and becomes a list of domains that wrote in and named a
+    #: factor we already had on the load. ``payment_bot.roster_candidate`` argues at length
+    #: that this decision is not automatable; that argument has not changed and is worth
+    #: reading before enabling this.
+    #:
+    #: What makes it defensible when on: an entry is only ever written for a load that ALREADY
+    #: names that factor, so the company half comes from our data and never from the mail; the
+    #: draft is still human-reviewed before anything is sent; the pre-send gate still applies;
+    #: and every auto-added entry is written to ``factoring_domains_manual.json`` with an
+    #: ``AUTO-ADDED`` evidence note and a WARNING in the audit log, so it can be found and
+    #: revoked later rather than being indistinguishable from a verified one.
+    #:
+    #: What it does NOT relax, because these would make the roster meaningless rather than
+    #: merely permissive: a free-mail domain is never auto-added (it would authorise every
+    #: mailbox at that provider and is refused at lookup anyway); a domain already rostered to
+    #: a DIFFERENT company is never auto-added under a second one; a load with no factor on
+    #: file is never used, since there is then no company for the domain to be attached to;
+    #: and an email carrying a sensitive-change signal still escalates untouched.
+    auto_add_factoring_domains: bool = False
+
     #: Whether the model gets to say which extracted numbers are really load ids.
     #:
     #: ``off`` (default) is today's behaviour: the regex and its seven guards decide alone.

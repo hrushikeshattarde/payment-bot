@@ -134,6 +134,20 @@ Parameters:
       needs a human to verify and file — the draft cannot do either, and the gate's
       change_acknowledgment check forbids the reply from claiming it was filed. Void-check /
       direct-deposit attachments and contact changes escalate in every configuration.
+  AutoAddFactoringDomains:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Add an unknown factoring sender's domain to the roster automatically and answer, instead
+      of escalating. THE MOST CONSEQUENTIAL SWITCH IN THIS STACK: enabled, the roster stops
+      being a list of domains somebody verified and becomes a list of domains that wrote in
+      and named a factor already on the load. payment_bot.roster_candidate argues this decision
+      is not automatable and is worth reading first. Defaults OFF. An entry is only ever
+      written for a load whose factor record already names that company; free mail, domains
+      rostered to another company, loads with no factor on file, and sensitive-change mail are
+      refused regardless. Every auto-add is logged WARNING as auto_roster_entry_added and
+      marked AUTO-ADDED in factoring_domains_manual.json so it can be revoked.
   LlmIdFilter:
     Type: String
     Default: shadow
@@ -349,6 +363,7 @@ Resources:
           PAYBOT_NOA_ATTACHMENT_REPLIES: !Ref NoaAttachmentReplies
           PAYBOT_FACTORING_PRENOA_REPLIES: !Ref FactoringPrenoaReplies
           PAYBOT_LLM_ID_FILTER: !Ref LlmIdFilter
+          PAYBOT_AUTO_ADD_FACTORING_DOMAINS: !Ref AutoAddFactoringDomains
 
           PAYBOT_REPLY_SIGNATURE: !Ref ReplySignature
           PAYBOT_REPLY_CC: !Ref ReplyCc

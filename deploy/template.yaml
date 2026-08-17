@@ -123,6 +123,27 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
+  NoaAttachmentReplies:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Draft past an ATTACHED NOA, distinct from the NOA wording SensitiveNoaReplies governs.
+      Pre-funding factors attach their NOA to routine rate verifications as part of the
+      standard packet, so with this off every one of them escalates unanswered. The NOA still
+      needs a human to verify and file — the draft cannot do either, and the gate's
+      change_acknowledgment check forbids the reply from claiming it was filed. Void-check /
+      direct-deposit attachments and contact changes escalate in every configuration.
+  FactoringPrenoaReplies:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Authorise a roster-verified factor asking about a load that shows NO factor on file —
+      the standard pre-funding flow, where the factor verifies the rate before its NOA
+      reaches us. Off, those senders are DENIED outright ("neither a contact on the carrier's
+      record nor a configured domain for the factor on file"), which is a large share of
+      inbound factoring mail. Needs AllowFactoring=true to have any effect.
 
   ScheduleEnabled:
     Type: String
@@ -313,6 +334,8 @@ Resources:
           PAYBOT_ALLOW_FACTORING: !Ref AllowFactoring
           PAYBOT_SENSITIVE_BANK_REPLIES: !Ref SensitiveBankReplies
           PAYBOT_SENSITIVE_NOA_REPLIES: !Ref SensitiveNoaReplies
+          PAYBOT_NOA_ATTACHMENT_REPLIES: !Ref NoaAttachmentReplies
+          PAYBOT_FACTORING_PRENOA_REPLIES: !Ref FactoringPrenoaReplies
 
           PAYBOT_REPLY_SIGNATURE: !Ref ReplySignature
           PAYBOT_REPLY_CC: !Ref ReplyCc

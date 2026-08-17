@@ -37,6 +37,10 @@
   "AllowFactoring": "true",
   "SensitiveBankReplies": "true",
   "SensitiveNoaReplies": "true",
+  "NoaAttachmentReplies": "true",
+  "FactoringPrenoaReplies": "true",
+  "_NoaAttachmentReplies": "Draft past an ATTACHED NOA, as opposed to the NOA WORDING SensitiveNoaReplies covers. Factors attach their NOA to routine rate verifications as standard, so 'false' escalates every one of them unanswered. The NOA still needs a human to file; the reply is forbidden from claiming it was filed.",
+  "_FactoringPrenoaReplies": "Authorise a roster-verified factor on a load showing NO factor on file — the pre-funding flow. 'false' DENIES those senders outright, which is a large share of inbound factoring mail. Both of these were missing from the template until 2026-08-15, so a deployed stack ran with them off while .env had them on.",
 
   "ReplySignature": "Circle Delivers Payments",
   "ReplyCc": "hrushikesh.attarde@circledelivers.com",

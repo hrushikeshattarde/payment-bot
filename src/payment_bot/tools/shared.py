@@ -116,13 +116,36 @@ LoadIdStr = Annotated[str, BeforeValidator(_coerce_id_to_str)]
 #: Still deliberately excludes ``inv``, for the reason ``ref`` is excluded: carriers write
 #: "INV 2462934" meaning the load itself, so suppressing it would discard real ids. A check
 #: number is different in kind — nobody labels a load "CHK".
+#: Equipment and document labels from a BILL OF LADING, added when PDF attachments started
+#: being read. A BOL is dense with load-id-shaped numbers that are not loads: one real
+#: statement page yielded five phantom ids from ``BOL No``, ``PRO``, ``Trailer``, ``Seal`` and
+#: ``Ref``, and each one costs an authorization lookup against a scraped back office — or, if
+#: it collides with a load the sender IS authorised for, a disclosure. That collision is not
+#: hypothetical: it is the RAD Logistics incident in ``_check_carrier_consistency``.
+#:
+#: ``pro`` and ``ref`` are deliberately NOT here, and cannot be: :data:`_LOAD_LABEL_RE` lists
+#: both as words senders use for OUR load ("Reference#: 2520504" is how factoring templates
+#: write the load itself). Suppressing them would discard real ids to catch phantom ones, so
+#: those two BOL numbers survive by design.
+#:
+#: ``dispatch`` is here because Transport Pro's own Dispatch History screen labels a 7-digit
+#: dispatch id that way — the Forza row read "Dispatch 2707288" beside load 2478889 — so a
+#: pasted row would otherwise grow a phantom load.
+_BOL_EQUIPMENT_LABELS = r"\btrailer\b|\btractor\b|\bseal\b|\bdispatch\b"
+
 _NOT_A_LOAD_LABEL_RE = re.compile(
     r"(?:"
     r"(?:p\.?\s*o\.?\s*box|\bpob\b|\bbox|\bmc\b|\bmc[#-]|\bdot\b|\bsuite\b|\bste\b|\bphone\b"
     r"|\btel\b|\bfax\b|\bext\b|\bzip\b)"
     r"|(?:\bacct\b|\baccount\b|\baba\b|\brouting\b|\bsettlement\b"
-    r"|\bcheck\b|\bchecks\b|\bchk\b|\bck\b|\bcheque\b)"
+    r"|\bcheck\b|\bchecks\b|\bchk\b|\bck\b|\bcheque\b"
+    rf"|{_BOL_EQUIPMENT_LABELS})"
     r"(?:\W{0,3}(?:no|nbr|num|number)\b)?"
+    # `bol` ONLY when explicitly numbered. Bare "BOL 2462934" is how a sender names the
+    # document BY ITS LOAD ("attached BOL 2462934"), so suppressing that would drop the very
+    # id the email is about — the same trap that keeps `inv` out of this list. Requiring
+    # "No"/"#" separates the document's own number from the load it belongs to.
+    r"|\bbol\b\W{0,3}(?:(?:no|nbr|num|number)\b|#)"
     r")\W{0,4}$",
     re.IGNORECASE,
 )

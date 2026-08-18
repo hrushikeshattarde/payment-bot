@@ -104,17 +104,19 @@ def _group_by_reason(entries: list[tuple[str, str]]) -> str:
 #: Kept short and plain on purpose. It also states no count of loads: naming back what the
 #: sender just told us reads as machine-generated, and it is one more number in a body whose
 #: safety rests on containing none.
-_BULK_PORTAL_BODY = """Hi,
+#:
+#: The wording asks for a REVISED LIST rather than "reply if anything looks off", and that is
+#: the operational point rather than a style preference: a factor's collections statement runs
+#: to a dozen or more invoices, and an open-ended "let us know" invites the whole list back.
+#: Asking only for the rows the portal shows as unpaid is what turns the next message into
+#: something answerable. Written for the TAFS collections shape — fourteen invoices across
+#: fourteen carriers, all of which the portal can already answer.
+#:
+#: The URL stays a ``{portal_url}`` placeholder so PAYBOT_PORTAL_URL remains the one place it
+#: is set; hard-coding it here would put the same address in two files.
+_BULK_PORTAL_BODY = """The payment status for these loads are listed on our website - {portal_url}
 
-You can check all of these here:
-
-{portal_url}
-
-It's live, and shows the pay date and any deductions per load.
-
-If anything looks off, reply here and we'll sort it out.
-
-Thanks"""
+Once you have checked the website, please send a revised list for loads that show payment not processed on our Website."""
 
 
 class Outcome(StrEnum):

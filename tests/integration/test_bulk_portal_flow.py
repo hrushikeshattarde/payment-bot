@@ -126,3 +126,50 @@ def test_a_sensitive_bulk_request_still_escalates() -> None:
 
     assert result.outcome is Outcome.ESCALATED
     assert gmail.sent == []
+
+
+@pytest.mark.integration
+def test_the_bulk_reply_says_what_the_business_approved() -> None:
+    """The customer-facing wording, pinned.
+
+    Nothing asserted this before: the bulk tests checked that the portal URL appears and that
+    no load data does, so the sentences around the link could be rewritten silently. This is
+    the one reply in the system a human never composes, so it is the one whose wording most
+    needs a test.
+
+    The ask is for a REVISED LIST rather than an open "let us know", which is the operational
+    point: a factor's collections statement runs to a dozen or more invoices (the TAFS shape
+    was fourteen across fourteen carriers), and "reply if anything looks off" invites the whole
+    list back instead of only the rows the portal could not answer.
+    """
+
+    from payment_bot.config import Settings
+    from payment_bot.pipeline import _BULK_PORTAL_BODY
+
+    body = _BULK_PORTAL_BODY.format(portal_url=Settings(_env_file=None).portal_url)
+
+    assert body.startswith("The payment status for these loads are listed on our website - ")
+    assert "please send a revised list" in body
+    assert "payment not processed" in body
+    # The URL comes from configuration, not from this string.
+    assert "{portal_url}" not in body
+    assert Settings(_env_file=None).portal_url in body
+
+
+@pytest.mark.integration
+def test_the_bulk_reply_asks_for_nothing_the_gate_treats_as_paperwork() -> None:
+    """"please send a revised list" must not read as a document request.
+
+    The paperwork_request check fires on "send" near a document noun, and a body that asked the
+    sender to send anything document-shaped would be blocked on every 6-digit bulk reply. A
+    list is not paperwork, and this pins that the distinction holds.
+    """
+
+    from payment_bot.config import Settings
+    from payment_bot.gate.presend import _deduction_questions, _paperwork_requests
+    from payment_bot.pipeline import _BULK_PORTAL_BODY
+
+    body = _BULK_PORTAL_BODY.format(portal_url=Settings(_env_file=None).portal_url)
+
+    assert _paperwork_requests(body) == []
+    assert _deduction_questions(body) == []

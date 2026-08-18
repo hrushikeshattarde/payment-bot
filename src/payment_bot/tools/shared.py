@@ -1898,17 +1898,26 @@ class ClassifyIntentOutput(BaseModel):
 #: you in Advance, ACDS TEAM" scored rate_verification at 0.9 confidence, so the bot asked a
 #: carrier chasing payment to supply a rate. "fees" and "claim" were the same shape — words
 #: that appear in ordinary payment chatter. Phrases only, and matched as whole words.
+#:
+#: The question forms ("rate is correct", "any advances") are how factoring verification
+#: packets phrase it — "Rate is correct at $550? Any advances taken?" (FirstLine Funding,
+#: load 2545383). None of the statement forms matched, so a fully answerable enquiry read
+#: as keyword_grounded=False, and with an NOA attached that combination must escalate.
 _RATE_SIGNALS = (
     "rate verification", "verify the rate", "verify rate", "confirm the rate", "confirm rate",
     "rate con", "rate confirmation", "rate agreement", "advance payment", "payment advance",
     "cash advance", "deduction", "deductions", "chargeback", "charge back", "short pay",
     "short-pay", "shortpay", "confirm noa", "notice of assignment", "factoring",
+    "rate is correct", "advances taken", "any advances",
 )  # fmt: skip
 _PAYMENT_SIGNALS = (
     "payment status", "when will i be paid", "when do i get paid", "get paid", "estimated payment",
     "estimated pay", "pay date", "payment date", "settle date", "settlement date",
     "missing payment", "haven't been paid", "have not been paid", "not been paid",
     "still waiting on payment", "when is payment",
+    # "Is the paperwork attached sufficient to pay?" — payment-readiness questions from the
+    # same verification packets. "good to pay" is the direct sibling.
+    "sufficient to pay", "good to pay",
 )  # fmt: skip
 _PAPERWORK_SIGNALS = ("pod", "bol", "proof of delivery", "bill of lading", "paperwork")
 

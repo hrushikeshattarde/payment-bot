@@ -115,6 +115,42 @@ def test_rate_verification_survives_when_an_amount_is_quoted(ctx: ToolContext) -
     assert Intent.RATE_VERIFICATION in out.intents
 
 
+#: Verbatim shape of a factoring onboarding packet (FirstLine Funding, load 2545383). Every
+#: question is answerable, but none matched a signal phrase — "Rate is correct at $550?" is
+#: not "confirm the rate" — so keyword_grounded came back False, and change evidence plus an
+#: ungrounded ask escalates in every configuration. The email never got its answers.
+_VERIFICATION_PACKET_BODY = (
+    "We have a new carrier HUNT LOGISTICS coming on with us. We need to confirm the following:\n\n"
+    "Did this carrier deliver load 2545383 without issue ?\n\n"
+    "Rate is correct at $ 550 ?\n\n"
+    "Any advances taken?\n\n"
+    "Do you have any other factor on file for this carrier?\n\n"
+    "Is the paperwork attached sufficient to pay?\n\n"
+    "I have attached the NOA. Please confirm this has been updated in your system.\n"
+)
+
+
+@pytest.mark.unit
+def test_a_verification_packet_grounds_its_questions(ctx: ToolContext) -> None:
+    out = _run(
+        ctx,
+        email_subject="PLEASE CONFIRM - LOAD #2545383 HUNT LOGISTICS",
+        email_body=_VERIFICATION_PACKET_BODY,
+    )
+    assert out.keyword_grounded is True
+    assert Intent.RATE_VERIFICATION in out.intents
+    assert "factoring_setup" in out.secondary_asks
+
+
+@pytest.mark.unit
+def test_question_form_signals_do_not_revive_the_signoff_misread(ctx: ToolContext) -> None:
+    """"any advances" must not bring back what bare "advance" did — see _SIGNOFF_BODY."""
+
+    out = _run(ctx, email_subject="Load 2496737 2nd request", email_body=_SIGNOFF_BODY)
+    assert Intent.RATE_VERIFICATION not in out.intents
+    assert out.keyword_grounded is False
+
+
 @pytest.mark.unit
 def test_quoted_history_does_not_decide_intent(ctx: ToolContext) -> None:
     """An older ask in the quoted thread must not override what was just written."""

@@ -96,7 +96,11 @@ Parameters:
     Default: Circle Delivers Payments
   ReplyCc:
     Type: String
-    Default: ""
+    Default: "[]"
+    Description: >
+      JSON list of addresses, e.g. ["a@x.com"] — never a bare address. reply_cc is a
+      tuple setting, so pydantic-settings json-parses the env var; anything that is not
+      valid JSON (including empty string) kills the worker at startup with SettingsError.
   DocumentsEmail:
     Type: String
     Default: freightpay@circledelivers.com

@@ -66,12 +66,15 @@ $awsCommon = @()
 if ($Region)     { $awsCommon += @("--region", $Region) }
 if ($AwsProfile) { $awsCommon += @("--profile", $AwsProfile) }
 
-# stderr goes to a temp FILE, never `2>&1`. Windows PowerShell wraps a native command's
-# redirected stderr in an ErrorRecord and sets $? false even on exit code 0 — with
-# $ErrorActionPreference = "Stop" that turns pip's ordinary progress output into a fatal
-# error. Redirecting to a file bypasses that machinery entirely.
+# stderr goes to a temp FILE, never `2>&1`, and $ErrorActionPreference drops to Continue
+# for the duration of the call. Windows PowerShell 5.1 wraps a native command's redirected
+# stderr in ErrorRecords even when the target is a file — under the script's global
+# "Stop" preference, the first stderr line aws writes (a routine "bucket not found", say)
+# throws before the exit code is ever consulted. The local Continue keeps stderr flowing
+# to the file and leaves $LASTEXITCODE as the single source of truth.
 function Invoke-Aws {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    $ErrorActionPreference = "Continue"
     $errFile = [System.IO.Path]::GetTempFileName()
     try {
         $output = & aws @Arguments 2>$errFile
@@ -89,6 +92,7 @@ function Invoke-Aws {
 # exist?"). Returns the exit code and swallows the output.
 function Test-AwsSucceeds {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    $ErrorActionPreference = "Continue"
     $errFile = [System.IO.Path]::GetTempFileName()
     try {
         & aws @Arguments 2>$errFile | Out-Null
@@ -193,8 +197,18 @@ if (-not $exists) {
         "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" | Out-Null
     Invoke-Aws @awsCommon s3api put-bucket-versioning --bucket $CodeBucket `
         --versioning-configuration "Status=Enabled" | Out-Null
-    Invoke-Aws @awsCommon s3api put-bucket-encryption --bucket $CodeBucket `
-        --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' | Out-Null
+    # Inline JSON loses its double quotes crossing the PS 5.1 native-argument boundary,
+    # so the CLI receives {Rules:[...]} and rejects it. A file:// reference keeps the
+    # payload out of the shell entirely. ASCII, not UTF8: Out-File's BOM breaks the parse.
+    $sseFile = [System.IO.Path]::GetTempFileName()
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' |
+        Set-Content -Path $sseFile -Encoding Ascii
+    try {
+        Invoke-Aws @awsCommon s3api put-bucket-encryption --bucket $CodeBucket `
+            --server-side-encryption-configuration "file://$sseFile" | Out-Null
+    } finally {
+        Remove-Item $sseFile -Force -ErrorAction SilentlyContinue
+    }
 }
 Write-Ok "bucket    : s3://$CodeBucket"
 
@@ -219,7 +233,9 @@ $overrides.Add("CodeS3Bucket=$CodeBucket")
 $overrides.Add("CodeS3Key=$codeKey")
 
 $overridesFile = Join-Path $env:TEMP "paybot-params-$Env.json"
-$overrides | ConvertTo-Json | Set-Content -Path $overridesFile -Encoding utf8
+# Ascii, not utf8: PS 5.1's utf8 writes a BOM, and the CLI's JSON parser rejects the file
+# outright ("Expecting value: line 1 column 1"). Every parameter value here is ASCII.
+$overrides | ConvertTo-Json | Set-Content -Path $overridesFile -Encoding Ascii
 foreach ($o in $overrides) {
     if ($o -match "^(GmailUser|TransportProBaseUrl|FetchLimit|ScheduleEnabled|CargoTelReplies|Timezone|BedrockModelId)=") {
         Write-Host "  $o"
@@ -247,7 +263,13 @@ $deployArgs = @(
 if ($Plan) { $deployArgs += "--no-execute-changeset" }
 
 if ($Plan) { Write-Step "Plan (nothing will be executed)" } else { Write-Step "Deploy" }
+# Continue, not Stop, around the one long-running call: `cloudformation deploy` writes
+# progress and "No changes to deploy" to stderr, which the global Stop preference would
+# turn fatal before the $LASTEXITCODE check below ever runs.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 & aws @awsCommon @deployArgs
+$ErrorActionPreference = $prevEap
 if ($LASTEXITCODE -ne 0) {
     Write-Warn2 "deploy failed — the most common causes, in order:"
     Write-Host "    * this identity cannot create IAM roles (an SSO read/analyst role usually cannot)"

@@ -258,7 +258,11 @@ $deployArgs = @(
     # be replaced on every stack recreation and every cross-account grant re-pointed.
     "--capabilities", "CAPABILITY_NAMED_IAM",
     "--no-fail-on-empty-changeset",
-    "--tags", "app=payment-bot", "env=$Env"
+    # Project/Environment duplicate app/env under the keys this organisation has ALREADY
+    # activated as cost-allocation tags in the payer account — the only keys Cost Explorer's
+    # tag filter can see. app/env stay for consistency; activating them needs the payer
+    # account, which a member account cannot do.
+    "--tags", "app=payment-bot", "env=$Env", "Project=payment-bot", "Environment=$Env"
 )
 if ($Plan) { $deployArgs += "--no-execute-changeset" }
 

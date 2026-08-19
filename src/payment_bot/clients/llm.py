@@ -206,12 +206,25 @@ class BedrockLlmClient:
         ]
         # Cache checkpoints, one per repeated surface. Tools and system are byte-identical
         # across every turn of every email in a run, and each turn's history is the
-        # previous turn's plus one exchange — so the checkpoint on the newest message is
-        # what lets turn N re-read turns 1..N-1 (the bulky tool results) from cache
-        # instead of re-billing them at full price. Measured before this change: one
-        # 12-turn email re-sent ~120k tokens of prefix at full price.
-        if bedrock_messages:
-            bedrock_messages[-1]["content"].append(_cache_point())
+        # previous turn's plus one exchange — the rolling message checkpoints are what let
+        # turn N re-read turns 1..N-1 (the bulky tool results) from cache instead of
+        # re-billing them at full price.
+        #
+        # The last TWO user messages carry a checkpoint, not just the newest. The marker
+        # is itself a content block, so it is part of the bytes the cache prefix-matches:
+        # a prefix cached "…toolResult, cachePoint" only matches a later request that
+        # still contains that cachePoint. Marking only the newest message removes the
+        # previous marker each turn and every rolling lookup misses — measured live
+        # (2026-08-19): reads collapsed to just the system+tools reuse, ~12% saved where
+        # the shape supports ~70%. Two rolling markers + tools + system = the four the
+        # request allows.
+        marked = 0
+        for message in reversed(bedrock_messages):
+            if message["role"] == Role.USER.value:
+                message["content"].append(_cache_point())
+                marked += 1
+                if marked == 2:
+                    break
         request: dict[str, Any] = {
             "modelId": self._model_id,
             "messages": bedrock_messages,

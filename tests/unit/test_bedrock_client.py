@@ -71,10 +71,15 @@ def test_request_is_shaped_for_converse() -> None:
     assert contents[1][0]["toolUse"] == {"toolUseId": "tu-1", "name": "get_x", "input": {"a": 1}}
     assert contents[2][0]["toolResult"]["toolUseId"] == "tu-1"
     assert contents[2][0]["toolResult"]["status"] == "success"
-    # the newest message carries the rolling cache checkpoint; earlier ones must not,
-    # or the four-checkpoint request limit would be exhausted by history
+    # The last TWO user messages carry rolling checkpoints — the marker is a content
+    # block, so the previous request's marker must still be present or its cached prefix
+    # never byte-matches again (measured live: rolling reads collapsed to zero when only
+    # the newest message was marked). The assistant turn between them carries none, and
+    # older history must not either, or four-checkpoint budget (tools + system + 2)
+    # would be exhausted.
+    assert contents[0][-1] == {"cachePoint": {"type": "default"}}
     assert contents[2][-1] == {"cachePoint": {"type": "default"}}
-    assert not any({"cachePoint": {"type": "default"}} in c for c in contents[:2])
+    assert {"cachePoint": {"type": "default"}} not in contents[1]
 
 
 @pytest.mark.unit

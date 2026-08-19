@@ -59,17 +59,22 @@ def test_request_is_shaped_for_converse() -> None:
     req = fake.last_request
     assert req is not None
     assert req["modelId"] == "test-model"
-    assert req["system"] == [{"text": "be helpful"}]
+    assert req["system"] == [{"text": "be helpful"}, {"cachePoint": {"type": "default"}}]
     assert req["inferenceConfig"] == {"maxTokens": 256, "temperature": 0.0}
-    # tool spec wrapping
+    # tool spec wrapping, with the cache checkpoint as the catalogue's final entry
     assert req["toolConfig"]["tools"][0]["toolSpec"]["name"] == "get_x"
     assert req["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]["type"] == "object"
+    assert req["toolConfig"]["tools"][-1] == {"cachePoint": {"type": "default"}}
     # content-block mapping
     contents = [m["content"] for m in req["messages"]]
     assert contents[0][0] == {"text": "hi"}
     assert contents[1][0]["toolUse"] == {"toolUseId": "tu-1", "name": "get_x", "input": {"a": 1}}
     assert contents[2][0]["toolResult"]["toolUseId"] == "tu-1"
     assert contents[2][0]["toolResult"]["status"] == "success"
+    # the newest message carries the rolling cache checkpoint; earlier ones must not,
+    # or the four-checkpoint request limit would be exhausted by history
+    assert contents[2][-1] == {"cachePoint": {"type": "default"}}
+    assert not any({"cachePoint": {"type": "default"}} in c for c in contents[:2])
 
 
 @pytest.mark.unit
@@ -100,6 +105,29 @@ def test_tool_use_response_is_parsed() -> None:
     assert call.name == "tp_get_load_summary"
     assert call.input == {"load_id": "2462934"}
     assert response.usage == {"inputTokens": 20, "outputTokens": 8}
+
+
+@pytest.mark.unit
+def test_cache_usage_fields_pass_through() -> None:
+    """Converse reports cache reads/writes in usage; the mapping must not drop them —
+    they are the only signal that caching is actually working in production logs."""
+
+    fake = _FakeBedrock(
+        {
+            "output": {"message": {"content": [{"text": "ok"}]}},
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 900,
+                "outputTokens": 40,
+                "cacheReadInputTokens": 11800,
+                "cacheWriteInputTokens": 700,
+            },
+        }
+    )
+    client = BedrockLlmClient(model_id="m", client=fake)
+    response = client.converse(system="s", messages=[Message(Role.USER, [TextBlock("go")])], tools=[])
+    assert response.usage["cacheReadInputTokens"] == 11800
+    assert response.usage["cacheWriteInputTokens"] == 700
 
 
 @pytest.mark.unit

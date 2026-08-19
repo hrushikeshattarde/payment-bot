@@ -132,6 +132,18 @@ def _block_to_bedrock(block: ContentBlock) -> dict[str, Any]:
     }
 
 
+def _cache_point() -> dict[str, Any]:
+    """A Converse prompt-cache checkpoint, built fresh so requests share no mutable state.
+
+    Everything before a checkpoint is cached for ~5 minutes and re-read at ~10% of the
+    input price (the write costs +25%, once). Profitable for any loop of two or more
+    turns, which the agent loop always is; a prefix under the model's minimum cacheable
+    size is silently not cached, so a checkpoint is never worse than absent.
+    """
+
+    return {"cachePoint": {"type": "default"}}
+
+
 def _block_from_bedrock(raw: dict[str, Any]) -> ContentBlock | None:
     if "text" in raw:
         return TextBlock(text=raw["text"])
@@ -188,27 +200,39 @@ class BedrockLlmClient:
         max_tokens: int = 1024,
         temperature: float = 0.0,
     ) -> LlmResponse:
+        bedrock_messages: list[dict[str, Any]] = [
+            {"role": m.role.value, "content": [_block_to_bedrock(b) for b in m.content]}
+            for m in messages
+        ]
+        # Cache checkpoints, one per repeated surface. Tools and system are byte-identical
+        # across every turn of every email in a run, and each turn's history is the
+        # previous turn's plus one exchange — so the checkpoint on the newest message is
+        # what lets turn N re-read turns 1..N-1 (the bulky tool results) from cache
+        # instead of re-billing them at full price. Measured before this change: one
+        # 12-turn email re-sent ~120k tokens of prefix at full price.
+        if bedrock_messages:
+            bedrock_messages[-1]["content"].append(_cache_point())
         request: dict[str, Any] = {
             "modelId": self._model_id,
-            "messages": [
-                {"role": m.role.value, "content": [_block_to_bedrock(b) for b in m.content]}
-                for m in messages
-            ],
+            "messages": bedrock_messages,
             "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
         }
         if system:
-            request["system"] = [{"text": system}]
+            request["system"] = [{"text": system}, _cache_point()]
         if tools:
             request["toolConfig"] = {
                 "tools": [
-                    {
-                        "toolSpec": {
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": {"json": t.input_schema},
+                    *(
+                        {
+                            "toolSpec": {
+                                "name": t.name,
+                                "description": t.description,
+                                "inputSchema": {"json": t.input_schema},
+                            }
                         }
-                    }
-                    for t in tools
+                        for t in tools
+                    ),
+                    _cache_point(),
                 ]
             }
 

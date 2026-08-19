@@ -217,10 +217,33 @@ def test_no_ask_passes_without_consulting_cargotel() -> None:
         "Once you forward the documents we'll get it scheduled.",
         "Could you resend the invoice?",
         "The carrier invoice is missing from our file.",
+        # A real ask must not be laundered by assurance vocabulary in the same sentence —
+        # the clearing spans use containment, and this match starts at "send", before any
+        # clearing span opens.
+        "Please send all outstanding documents so we have everything on file.",
     ],
 )
 def test_every_way_of_asking_is_caught(text: str) -> None:
     assert _paperwork_requests(text), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Verbatim shapes from the G.H. Factor block (load 302618, 2026-08-19): the factor
+        # asked "confirm you have all the documents needed", the draft answered that
+        # nothing was missing, and the matcher read its own required vocabulary as a
+        # request. The thread then re-drafted and re-blocked every 30 minutes for a night.
+        "We have $2,500.00 payable on this load, and all required documents are on file "
+        "— no paperwork is outstanding.",
+        "No paperwork is outstanding on this load.",
+        "None of the documents are missing.",
+        "All required documents are on file.",
+        "Every document has been received.",
+    ],
+)
+def test_an_assurance_is_not_a_request(text: str) -> None:
+    assert _paperwork_requests(text) == [], text
 
 
 @pytest.mark.parametrize(
@@ -249,6 +272,26 @@ def test_a_match_never_straddles_a_sentence_boundary() -> None:
     """The specific false positive a word-window matcher produces on the shipped reply."""
 
     assert _paperwork_requests("Nothing further we need from you. Send my regards.") == []
+
+
+def test_the_gh_factor_assurance_passes_on_a_scheduled_load() -> None:
+    """The inverse of test_a_scheduled_load_still_blocks_the_ask, from the same trap.
+
+    ``scheduled`` still carries missing_documents=('carrier invoice',), and the correct
+    reply to "confirm you have all the documents needed" says nothing is missing. That
+    sentence must be sayable on a scheduled load, or every factor's completeness question
+    blocks — and each block re-drafts every run until a human intervenes.
+    """
+
+    draft = (
+        "Good Day, Carlin!\n\n"
+        "We have $600.00 payable on this load, and all required documents are on file — "
+        "no paperwork is outstanding. The load was scheduled for payment on Sunday, "
+        "August 9, 2026; someone from our team will follow up.\n\n"
+        "Circle Delivers Payments"
+    )
+    passed, detail = _check(draft, [CGT_LOAD], ap_terms="Check Net 30")
+    assert passed is True, detail
 
 
 # --- the reason this needed a gate check ------------------------------------

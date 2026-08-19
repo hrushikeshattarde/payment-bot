@@ -232,10 +232,64 @@ _PAPERWORK_REQUEST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def _paperwork_requests(text: str) -> list[str]:
-    """Labels of every way ``text`` puts a document back on the sender."""
+#: Wording that CLEARS paperwork rather than requesting it. Two live shapes betrayed the
+#: request patterns above (G.H. Factor, load 302618, 2026-08-19): a NEGATED claim — "no
+#: paperwork is outstanding" contains "paperwork … outstanding" — and an adjectival
+#: predicate — "all required documents are on file" contains "required … documents". Both
+#: sentences hand the sender nothing; they assert the opposite, and the factor had asked
+#: "confirm you have all the documents needed", so the reply could not avoid the
+#: vocabulary. A request match sitting ENTIRELY inside one of these spans is an assurance
+#: and is discarded. Containment rather than overlap, on purpose: "please send all
+#: outstanding documents so everything is on file" starts its match at "send", before any
+#: clearing span opens, and must keep blocking. Same lesson the intake scan's
+#: ``_NEGATED_CHANGE_RE`` learned from the Far West footer: negation flips meaning, and a
+#: shape-matcher cannot see it without help.
+_PAPERWORK_CLEARED_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "no paperwork is outstanding", "none of the documents are missing"
+    re.compile(
+        rf"\b(?:no|none|nothing)\b[^.!?\n]{{0,30}}?\b(?:{_PAPERWORK_NOUN})\b"
+        rf"[^.!?\n]{{0,30}}?\b(?:outstanding|missing|needed|required|due)\b",
+        re.IGNORECASE,
+    ),
+    # negation first, noun trailing or absent — "nothing outstanding on the documents"
+    re.compile(
+        rf"\b(?:no|none|nothing)\b[^.!?\n]{{0,30}}?"
+        rf"\b(?:outstanding|missing|needed|required)\b"
+        rf"(?:[^.!?\n]{{0,40}}?\b(?:{_PAPERWORK_NOUN})\b)?",
+        re.IGNORECASE,
+    ),
+    # "all required documents are on file", "every document has been received"
+    re.compile(
+        rf"\b(?:all|every)\b[^.!?\n]{{0,50}}?\b(?:{_PAPERWORK_NOUN})\b"
+        rf"[^.!?\n]{{0,40}}?\b(?:on\s+file|received|in\s+order|complete"
+        rf"|accounted\s+for|in\s+our\s+system)\b",
+        re.IGNORECASE,
+    ),
+)
 
-    return [label for label, pattern in _PAPERWORK_REQUEST_PATTERNS if pattern.search(text)]
+
+def _paperwork_cleared_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of every phrase asserting paperwork is complete or not needed."""
+
+    return [m.span() for p in _PAPERWORK_CLEARED_PATTERNS for m in p.finditer(text)]
+
+
+def _paperwork_requests(text: str) -> list[str]:
+    """Labels of every way ``text`` puts a document back on the sender.
+
+    A match wholly inside a cleared span is an assurance wearing request vocabulary —
+    "no paperwork is outstanding" — and does not count.
+    """
+
+    cleared = _paperwork_cleared_spans(text)
+    labels: list[str] = []
+    for label, pattern in _PAPERWORK_REQUEST_PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if not any(start >= c_start and end <= c_end for c_start, c_end in cleared):
+                labels.append(label)
+                break
+    return labels
 
 
 #: Phrases that mean a sender is asking whether the payable is net of anything.

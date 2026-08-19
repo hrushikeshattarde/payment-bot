@@ -30,6 +30,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from payment_bot.block_ledger import BlockLedger
 from payment_bot.clients import (
     GMAIL_DRAFT_SCOPES,
     CargoTelClient,
@@ -237,11 +238,16 @@ def process_inbox(
     limit: int | None = None,
     dry_run: bool = False,
     clients: _Clients | None = None,
+    block_ledger: BlockLedger | None = None,
 ) -> list[PipelineResult]:
     """Fetch mail and produce a reviewable draft for each answerable message.
 
     Args:
         clients: Pre-built clients, for tests. Built from configuration when omitted.
+        block_ledger: Cross-run gate-block counts. A message that has already spent
+            ``settings.gate_block_retry_limit`` blocks is skipped before the agent loop —
+            still unread, still a human's, just no longer re-billed every run. ``None``
+            (local runs) keeps today's behaviour: every fetch is attempted.
     """
 
     # Force draft-only rather than trusting configuration: a local run must never send,
@@ -263,6 +269,24 @@ def process_inbox(
     results: list[PipelineResult] = []
 
     for email in emails:
+        if block_ledger is not None and block_ledger.exhausted(
+            email.message_id, resolved.gate_block_retry_limit
+        ):
+            _log.warning(
+                "gate_block_retries_exhausted",
+                extra={
+                    "correlation_id": email.message_id,
+                    "blocks": block_ledger.blocks(email.message_id),
+                    "limit": resolved.gate_block_retry_limit,
+                    "subject": email.subject,
+                },
+            )
+            print(
+                f"  skipped  : {email.subject!r} — gate-blocked "
+                f"{block_ledger.blocks(email.message_id)}x, retry budget spent; "
+                "a human must reply (or raise GateBlockRetryLimit)"
+            )
+            continue
         audit = InMemoryAuditSink()
         pipeline = PaymentBotPipeline(
             tp=clients.tp_factory(),
@@ -276,6 +300,18 @@ def process_inbox(
         )
         result = pipeline.process_email(email)
         results.append(result)
+        if result.outcome is Outcome.BLOCKED and block_ledger is not None:
+            blocks = block_ledger.record(email.message_id, result.detail)
+            if block_ledger.exhausted(email.message_id, resolved.gate_block_retry_limit):
+                _log.warning(
+                    "gate_block_retry_limit_reached",
+                    extra={
+                        "correlation_id": email.message_id,
+                        "blocks": blocks,
+                        "limit": resolved.gate_block_retry_limit,
+                        "subject": email.subject,
+                    },
+                )
         print(_render(email, result, audit, resolved))
 
         draft = None if dry_run else _save_draft(clients, email, result, resolved)

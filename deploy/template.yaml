@@ -91,6 +91,19 @@ Parameters:
     Type: String
     Default: ""
 
+  GateBlockRetryLimit:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 50
+    Description: >
+      How many times a gate-BLOCKED message may re-run the full agent loop before later
+      runs skip it and leave it to a human. Blocks are the expensive retry — the whole
+      model loop re-bills every run until someone acts (measured: one stuck thread,
+      ~48 retries and several dollars a night). Counted per message id in
+      state/gate_block_ledger.json inside RosterBucket; 0 disables the cap. Escalations
+      are unaffected: they stop before any model call and re-checking them is near-free.
+
   ReplySignature:
     Type: String
     Default: Circle Delivers Payments
@@ -278,6 +291,15 @@ Resources:
                   Action: s3:GetObject
                   Resource: !Sub "arn:aws:s3:::${RosterBucket}/${RosterKey}"
                 - !Ref AWS::NoValue
+              # The gate-block retry ledger — the worker's own bookkeeping, so this is the
+              # one prefix it may WRITE. Scoped to state/* so it can never touch the
+              # operator-owned rosters above.
+              - !If
+                - HasRoster
+                - Effect: Allow
+                  Action: [s3:GetObject, s3:PutObject]
+                  Resource: !Sub "arn:aws:s3:::${RosterBucket}/state/*"
+                - !Ref AWS::NoValue
               # Scoped to the one key, like the roster above — not the bucket. Both objects
               # are authorization data; read-only, and nothing else in that bucket is ours.
               - !If
@@ -367,6 +389,7 @@ Resources:
           PAYBOT_NOA_ATTACHMENT_REPLIES: !Ref NoaAttachmentReplies
           PAYBOT_FACTORING_PRENOA_REPLIES: !Ref FactoringPrenoaReplies
           PAYBOT_LLM_ID_FILTER: !Ref LlmIdFilter
+          PAYBOT_GATE_BLOCK_RETRY_LIMIT: !Ref GateBlockRetryLimit
           PAYBOT_AUTO_ADD_FACTORING_DOMAINS: !Ref AutoAddFactoringDomains
 
           PAYBOT_REPLY_SIGNATURE: !Ref ReplySignature
@@ -415,7 +438,7 @@ Resources:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref WorkerLogGroup
-      FilterPattern: '{ $.event = "gmail_api_draft_created" }'
+      FilterPattern: '{ $.message = "gmail_api_draft_created" }'
       MetricTransformations:
         - MetricName: DraftsCreated
           MetricNamespace: !Sub "PaymentBot/${StackEnv}"
@@ -426,9 +449,23 @@ Resources:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref WorkerLogGroup
-      FilterPattern: '{ $.event = "gate_blocked" }'
+      FilterPattern: '{ $.message = "gate_blocked" }'
       MetricTransformations:
         - MetricName: GateBlocked
+          MetricNamespace: !Sub "PaymentBot/${StackEnv}"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  # A message that spent its GateBlockRetryLimit and is now skipped every run. Like
+  # PolicyAllowedChangeWording below, each of these is a TASK: the mail sits unread with
+  # no draft and nothing will retry it — a human must reply or raise the limit.
+  GateBlockRetriesExhaustedMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref WorkerLogGroup
+      FilterPattern: '{ $.message = "gate_block_retries_exhausted" }'
+      MetricTransformations:
+        - MetricName: GateBlockRetriesExhausted
           MetricNamespace: !Sub "PaymentBot/${StackEnv}"
           MetricValue: "1"
           DefaultValue: 0
@@ -437,7 +474,7 @@ Resources:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref WorkerLogGroup
-      FilterPattern: '{ $.event = "escalated" }'
+      FilterPattern: '{ $.message = "escalated" }'
       MetricTransformations:
         - MetricName: Escalations
           MetricNamespace: !Sub "PaymentBot/${StackEnv}"
@@ -468,7 +505,7 @@ Resources:
     Condition: CargoTelOn
     Properties:
       LogGroupName: !Ref WorkerLogGroup
-      FilterPattern: '{ $.event = "cargotel_cookie_unavailable" }'
+      FilterPattern: '{ $.message = "cargotel_cookie_unavailable" }'
       MetricTransformations:
         - MetricName: CargoTelCookieUnavailable
           MetricNamespace: !Sub "PaymentBot/${StackEnv}"
@@ -482,7 +519,7 @@ Resources:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref WorkerLogGroup
-      FilterPattern: '{ $.event = "bank_change_language_allowed_by_policy" }'
+      FilterPattern: '{ $.message = "bank_change_language_allowed_by_policy" }'
       MetricTransformations:
         - MetricName: PolicyAllowedChangeWording
           MetricNamespace: !Sub "PaymentBot/${StackEnv}"

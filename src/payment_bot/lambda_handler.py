@@ -30,6 +30,7 @@ import os
 from collections.abc import MutableMapping
 from typing import Any
 
+from payment_bot.block_ledger import BlockLedger
 from payment_bot.clients import (
     CargoTelClient,
     NullSlackClient,
@@ -52,6 +53,12 @@ ROSTER_PATH = "/tmp/factoring_domains.json"
 
 #: Where the carrier contact list is written, same reasoning.
 CONTACTS_PATH = "/tmp/carrier_contacts.json"
+
+#: Where the gate-block retry ledger lives, inside the same config bucket the rosters use
+#: (one bucket, one lifecycle, one IAM story — same reasoning as the carrier contacts).
+#: Deliberately under ``state/`` so a human browsing the bucket can tell operator-owned
+#: config from bot-owned bookkeeping at a glance.
+BLOCK_LEDGER_KEY = "state/gate_block_ledger.json"
 
 #: Secret ARN/name in the environment → the ``PAYBOT_*`` variable its value becomes.
 #:
@@ -173,6 +180,47 @@ def load_carrier_contacts(
     )
 
 
+def load_block_ledger(env: dict[str, str] | None = None) -> tuple[BlockLedger, str | None]:
+    """Read the gate-block ledger from the config bucket; ``(ledger, bucket)``.
+
+    No bucket configured (or no ledger written yet) is an ordinary state — the run
+    proceeds with an empty ledger, which simply means every message still has its full
+    retry budget. Any other read error also degrades to empty rather than failing the
+    run: the ledger is bookkeeping, and losing it costs at most a few duplicate retries,
+    while raising would stop every draft over it.
+    """
+
+    environ = os.environ if env is None else env
+    bucket = environ.get("PAYBOT_ROSTER_BUCKET", "").strip()
+    if not bucket:
+        return BlockLedger(), None
+    client = _boto3().client("s3")
+    try:
+        raw = client.get_object(Bucket=bucket, Key=BLOCK_LEDGER_KEY)["Body"].read()
+        return BlockLedger.from_json(raw.decode("utf-8")), bucket
+    except client.exceptions.NoSuchKey:
+        return BlockLedger(), bucket
+    except Exception as exc:
+        _log.warning("block_ledger_load_failed", extra={"error": str(exc)})
+        return BlockLedger(), bucket
+
+
+def save_block_ledger(ledger: BlockLedger, bucket: str | None) -> None:
+    """Write the ledger back when anything changed. Failure is logged, never raised."""
+
+    if not bucket or not ledger.dirty:
+        return
+    try:
+        _boto3().client("s3").put_object(
+            Bucket=bucket,
+            Key=BLOCK_LEDGER_KEY,
+            Body=ledger.to_json().encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:
+        _log.warning("block_ledger_save_failed", extra={"error": str(exc)})
+
+
 def bootstrap() -> Settings:
     """Cold-start work: logging, secrets, roster — then a settings object built on top."""
 
@@ -257,11 +305,18 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
     if limit is None:
         limit = settings.gmail_fetch_limit
 
-    results: list[PipelineResult] = process_inbox(
-        settings,
-        limit=limit,
-        clients=build_clients(settings),
-    )
+    ledger, ledger_bucket = load_block_ledger()
+    try:
+        results: list[PipelineResult] = process_inbox(
+            settings,
+            limit=limit,
+            clients=build_clients(settings),
+            block_ledger=ledger,
+        )
+    finally:
+        # Saved even when the run raises or is cut off mid-batch: blocks recorded before
+        # the interruption must count, or a timeout-looping run never spends its budget.
+        save_block_ledger(ledger, ledger_bucket)
 
     counts: dict[str, int] = {}
     for result in results:

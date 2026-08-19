@@ -284,7 +284,7 @@ def test_the_handler_summarises_outcomes_and_honours_a_limit(
 
     calls: dict[str, Any] = {}
 
-    def fake_process_inbox(settings: Any, *, limit: int | None = None, clients: Any = None):
+    def fake_process_inbox(settings: Any, *, limit: int | None = None, clients: Any = None, block_ledger: Any = None):
         calls["limit"] = limit
         return [
             PipelineResult(Outcome.AWAITING_REVIEW, "drafted", "c1"),
@@ -313,7 +313,7 @@ def test_the_handler_falls_back_to_the_configured_fetch_limit(
 
     calls: dict[str, Any] = {}
 
-    def fake_process_inbox(settings: Any, *, limit: int | None = None, clients: Any = None):
+    def fake_process_inbox(settings: Any, *, limit: int | None = None, clients: Any = None, block_ledger: Any = None):
         calls["limit"] = limit
         return []
 

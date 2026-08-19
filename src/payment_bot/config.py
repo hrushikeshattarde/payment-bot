@@ -301,6 +301,17 @@ class Settings(BaseSettings):
     #: ``agent_iterations_per_extra_load``.
     agent_max_iterations: int = Field(default=12, ge=1, le=50)
 
+    #: How many times a gate-BLOCKED message may re-run the full agent loop before later
+    #: runs skip it and leave it to a human. Blocks are the expensive retry: no draft is
+    #: saved, the thread stays unread, and the stateless re-scan re-bills the whole loop
+    #: every run — one stuck thread cost several dollars a night before this cap existed
+    #: (G.H. Factor, load 302618). The count is per MESSAGE id, kept in a small ledger the
+    #: Lambda handler stores in the config bucket; a sender's follow-up is a new message
+    #: and earns a fresh budget. Without a ledger (local runs), the cap has no effect.
+    #: 0 disables it. Escalations are unaffected — they stop before any model call and
+    #: re-checking them is deliberate and near-free.
+    gate_block_retry_limit: int = Field(default=2, ge=0, le=50)
+
     #: Extra iterations granted per load beyond the first.
     #:
     #: The skill procedures are per-load ("`tp_get_load_summary` for each load id"), so a

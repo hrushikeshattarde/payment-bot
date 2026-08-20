@@ -58,6 +58,26 @@ def _trim(text: str, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _gmail_link(message_id: str) -> str:
+    """A link that opens the carrier's email in the CLICKER's own Gmail.
+
+    ``rfc822msgid:`` search rather than a thread URL on purpose: Gmail thread ids are
+    per-mailbox, so no single thread URL works for every space member — but every
+    member of the group has their own copy of the message under the same RFC 822 id,
+    and this search lands each person in their own copy.
+    """
+
+    query = urllib.parse.quote(f"rfc822msgid:{message_id.strip('<>')}", safe="")
+    return f"https://mail.google.com/mail/u/0/#search/{query}"
+
+
+def _open_email_button(message_id: str) -> dict[str, Any]:
+    return {
+        "text": "Open the email in Gmail",
+        "onClick": {"openLink": {"url": _gmail_link(message_id)}},
+    }
+
+
 def approval_card(
     *,
     entry_id: str,
@@ -70,12 +90,15 @@ def approval_card(
     subject: str = "",
     interactive: bool = False,
     status: str = "",
+    message_id: str = "",
 ) -> dict[str, Any]:
     """The approval card, shared by the poster and the callback's in-place updates.
 
-    ``status`` non-empty renders the terminal form: status line shown, buttons gone —
-    what a card becomes after a click or an expiry, so the feed doubles as the audit
-    trail humans read.
+    ``status`` non-empty renders the terminal form: status line shown, action buttons
+    gone — what a card becomes after a click or an expiry, so the feed doubles as the
+    audit trail humans read. ``message_id`` adds an "Open the email in Gmail" link
+    button in every form, including terminal ones: finding the conversation is useful
+    before acting and after.
     """
 
     recipients = [
@@ -111,62 +134,44 @@ def approval_card(
         },
     ]
 
-    if status:
-        sections.append({"widgets": [{"decoratedText": {"topLabel": "Status", "text": status}}]})
-    elif interactive:
+    buttons: list[dict[str, Any]] = []
+    if interactive and not status:
         parameters = [{"key": "entry", "value": entry_id}]
-        sections.append(
+        buttons = [
             {
-                "widgets": [
-                    {
-                        "buttonList": {
-                            "buttons": [
-                                {
-                                    "text": "Approve & send as me",
-                                    "onClick": {
-                                        "action": {
-                                            "function": ACTION_APPROVE,
-                                            "parameters": parameters,
-                                        }
-                                    },
-                                },
-                                {
-                                    "text": "Move to my Gmail Drafts",
-                                    "onClick": {
-                                        "action": {
-                                            "function": ACTION_MOVE,
-                                            "parameters": parameters,
-                                        }
-                                    },
-                                },
-                                {
-                                    "text": "Reject",
-                                    "onClick": {
-                                        "action": {
-                                            "function": ACTION_REJECT,
-                                            "parameters": parameters,
-                                        }
-                                    },
-                                },
-                            ]
-                        }
-                    }
-                ]
+                "text": "Approve & send as me",
+                "onClick": {"action": {"function": ACTION_APPROVE, "parameters": parameters}},
+            },
+            {
+                "text": "Move to my Gmail Drafts",
+                "onClick": {"action": {"function": ACTION_MOVE, "parameters": parameters}},
+            },
+            {
+                "text": "Reject",
+                "onClick": {"action": {"function": ACTION_REJECT, "parameters": parameters}},
+            },
+        ]
+    if message_id:
+        # A plain link, not an action: it opens in the clicker's Gmail without a round
+        # trip to the callback, so it survives every state the card can be in.
+        buttons.append(_open_email_button(message_id))
+
+    tail: list[dict[str, Any]] = []
+    if status:
+        tail.append({"decoratedText": {"topLabel": "Status", "text": status}})
+    elif not interactive:
+        tail.append(
+            {
+                "decoratedText": {
+                    "topLabel": "Status",
+                    "text": "Shadow mode — review and send from Gmail Drafts as usual.",
+                }
             }
         )
-    else:
-        sections.append(
-            {
-                "widgets": [
-                    {
-                        "decoratedText": {
-                            "topLabel": "Status",
-                            "text": "Shadow mode — review and send from Gmail Drafts as usual.",
-                        }
-                    }
-                ]
-            }
-        )
+    if buttons:
+        tail.append({"buttonList": {"buttons": buttons}})
+    if tail:
+        sections.append({"widgets": tail})
 
     title = "Draft reply — approve to send as yourself" if interactive else "Draft reply"
     return {
@@ -193,36 +198,37 @@ def notice_card(
     """
 
     title = "Blocked by the pre-send gate" if kind == "blocked" else "Escalated — no draft"
+    widgets: list[dict[str, Any]] = [
+        {
+            "decoratedText": {
+                "topLabel": "Why",
+                "text": _trim(reason, _REASON_LIMIT) or "(no reason recorded)",
+                "wrapText": True,
+            }
+        },
+        {
+            "decoratedText": {
+                "topLabel": "Loads",
+                "text": ", ".join(load_ids) or "(none named)",
+            }
+        },
+        {
+            "decoratedText": {
+                "topLabel": "Next",
+                "text": "Needs a human reply from the group mailbox — "
+                "nothing was drafted or sent.",
+            }
+        },
+    ]
+    # The correlation id IS the inbound message id, so the card that says "a human must
+    # reply" can also take them straight to the email that needs the reply.
+    if correlation_id:
+        widgets.append({"buttonList": {"buttons": [_open_email_button(correlation_id)]}})
     return {
         "cardId": f"notice-{entry_id_for(correlation_id)}",
         "card": {
             "header": {"title": title, "subtitle": f"severity: {severity}"},
-            "sections": [
-                {
-                    "widgets": [
-                        {
-                            "decoratedText": {
-                                "topLabel": "Why",
-                                "text": _trim(reason, _REASON_LIMIT) or "(no reason recorded)",
-                                "wrapText": True,
-                            }
-                        },
-                        {
-                            "decoratedText": {
-                                "topLabel": "Loads",
-                                "text": ", ".join(load_ids) or "(none named)",
-                            }
-                        },
-                        {
-                            "decoratedText": {
-                                "topLabel": "Next",
-                                "text": "Needs a human reply from the group mailbox — "
-                                "nothing was drafted or sent.",
-                            }
-                        },
-                    ]
-                }
-            ],
+            "sections": [{"widgets": widgets}],
         },
     }
 
@@ -297,6 +303,7 @@ class GoogleChatClient:
             reply_to=self._reply_to,
             body=draft_reply,
             interactive=self._interactive,
+            message_id=correlation_id,
         )
         name = self._post_card(
             card,

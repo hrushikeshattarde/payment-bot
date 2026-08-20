@@ -125,6 +125,42 @@ def test_shadow_and_status_cards_have_no_buttons() -> None:
     assert "Sent by p@x" in json.dumps(terminal)
 
 
+def test_open_in_gmail_link_survives_every_card_state() -> None:
+    """The link is a plain openLink, not an action — it needs no callback round trip,
+    so it belongs on live cards, terminal cards, and notice cards alike. rfc822msgid
+    search is what makes one URL work for every space member: each lands in their own
+    copy of the message."""
+
+    interactive = approval_card(
+        entry_id="e1", from_email="a@x", load_ids=(), to="a@x", cc=(), reply_to="",
+        body="text", interactive=True, message_id="<abc123@mail.carrier.test>",
+    )
+    assert _buttons(interactive) == [
+        "Approve & send as me",
+        "Move to my Gmail Drafts",
+        "Reject",
+        "Open the email in Gmail",
+    ]
+    rendered = json.dumps(interactive)
+    assert "rfc822msgid%3Aabc123%40mail.carrier.test" in rendered
+    assert "<abc123" not in rendered  # angle brackets stripped from the search
+
+    terminal = approval_card(
+        entry_id="e1", from_email="a@x", load_ids=(), to="a@x", cc=(), reply_to="",
+        body="text", status="Sent by p@x", message_id="<abc123@mail.carrier.test>",
+    )
+    assert _buttons(terminal) == ["Open the email in Gmail"]
+
+    notice = notice_card(
+        correlation_id="<abc123@mail.carrier.test>",
+        kind="escalated",
+        severity="review",
+        reason="no valid load id",
+        load_ids=(),
+    )
+    assert _buttons(notice) == ["Open the email in Gmail"]
+
+
 def test_long_bodies_are_trimmed_in_the_card_only() -> None:
     body = "x" * 5000
     card = approval_card(

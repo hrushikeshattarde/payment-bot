@@ -574,6 +574,7 @@ def _update_card_response(
         subject=entry.subject,
         body=entry.body,
         status=status,
+        message_id=entry.message_id,
     )
     return _http(
         200,

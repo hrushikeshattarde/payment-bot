@@ -383,6 +383,7 @@ def _sweep_approvals(
                         f"EXPIRED — no action for {settings.approval_expiry_days} days. "
                         "The mail sits unread; a human must reply from the group mailbox."
                     ),
+                    message_id=entry.message_id,
                 ),
             )
 

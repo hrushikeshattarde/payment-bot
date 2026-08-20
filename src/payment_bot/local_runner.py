@@ -31,7 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from payment_bot.approvals import ApprovalStore, PendingApproval, entry_id_for
-from payment_bot.block_ledger import BlockLedger
+from payment_bot.block_ledger import KIND_AGENT_ESCALATION, KIND_ESCALATION, BlockLedger
 from payment_bot.clients import (
     GMAIL_DRAFT_SCOPES,
     CargoTelClient,
@@ -280,6 +280,38 @@ def _render(
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+def _escalation_limit_for(kind: str, resolved: Settings) -> int:
+    """The attempt budget for one escalation kind.
+
+    A zero ``agent_escalation_retry_limit`` falls back to the general escalation budget
+    rather than disabling the cap outright. Everywhere else 0 means "no limit", and it
+    cannot mean that here: this is the tighter budget on the more expensive class, so
+    switching it off must leave the looser one standing, not leave the class unbudgeted.
+    """
+
+    if kind == KIND_AGENT_ESCALATION:
+        return resolved.agent_escalation_retry_limit or resolved.escalation_retry_limit
+    return resolved.escalation_retry_limit
+
+
+def _spent_escalation_kind(
+    block_ledger: BlockLedger | None, message_id: str, resolved: Settings
+) -> str | None:
+    """Which escalation budget this message has already spent, or ``None`` if neither.
+
+    Both are checked because the pre-check runs before the pipeline and therefore cannot
+    know which kind THIS attempt would produce — only which ones are already spent. The
+    expensive kind is checked first so its name is the one reported.
+    """
+
+    if block_ledger is None:
+        return None
+    for kind in (KIND_AGENT_ESCALATION, KIND_ESCALATION):
+        if block_ledger.exhausted(message_id, _escalation_limit_for(kind, resolved), kind=kind):
+            return kind
+    return None
+
+
 def process_inbox(
     settings: Settings | None = None,
     *,
@@ -293,10 +325,12 @@ def process_inbox(
 
     Args:
         clients: Pre-built clients, for tests. Built from configuration when omitted.
-        block_ledger: Cross-run gate-block counts. A message that has already spent
-            ``settings.gate_block_retry_limit`` blocks is skipped before the agent loop —
-            still unread, still a human's, just no longer re-billed every run. ``None``
-            (local runs) keeps today's behaviour: every fetch is attempted.
+        block_ledger: Cross-run attempt counts, per outcome kind. A message that has spent
+            ``settings.gate_block_retry_limit`` gate blocks, or
+            ``settings.escalation_retry_limit`` escalations, is skipped before the pipeline
+            runs — still unread, still a human's, just no longer re-billed every run. Both
+            budgets are independent. ``None`` (local runs) keeps today's behaviour: every
+            fetch is attempted.
         approval_store: Pending chat approvals (CHAT_APPROVAL_PLAN.md). With
             ``approval_mode=chat`` AND a store, a gate-passed reply becomes a pending
             entry + chat card instead of a Gmail draft, and messages/threads with a
@@ -372,6 +406,30 @@ def process_inbox(
                 "a human must reply (or raise GateBlockRetryLimit)"
             )
             continue
+        spent_escalation_kind = _spent_escalation_kind(block_ledger, email.message_id, resolved)
+        if spent_escalation_kind is not None:
+            # Escalated before, and nothing about a re-scan changes the verdict. The
+            # escalation already reached a human; re-deriving it costs the id-filter call and,
+            # on the `agent produced no draft` reason, the entire agent loop. Skipped BEFORE
+            # the pipeline for exactly that reason — a skip after it would save nothing.
+            assert block_ledger is not None  # for the type-checker; _spent_* returned a kind
+            spent = block_ledger.blocks(email.message_id, kind=spent_escalation_kind)
+            _log.warning(
+                "escalation_retries_exhausted",
+                extra={
+                    "correlation_id": email.message_id,
+                    "kind": spent_escalation_kind,
+                    "escalations": spent,
+                    "limit": _escalation_limit_for(spent_escalation_kind, resolved),
+                    "subject": email.subject,
+                },
+            )
+            print(
+                f"  skipped  : {email.subject!r} — escalated {spent}x "
+                f"({spent_escalation_kind}), retry budget spent; a human must handle it "
+                "(or raise EscalationRetryLimit)"
+            )
+            continue
         audit = InMemoryAuditSink()
         pipeline = PaymentBotPipeline(
             tp=clients.tp_factory(),
@@ -394,6 +452,22 @@ def process_inbox(
                         "correlation_id": email.message_id,
                         "blocks": blocks,
                         "limit": resolved.gate_block_retry_limit,
+                        "subject": email.subject,
+                    },
+                )
+        if result.outcome is Outcome.ESCALATED and block_ledger is not None:
+            # Priced by what the attempt actually cost, not by the fact that it escalated.
+            kind = KIND_AGENT_ESCALATION if result.after_agent else KIND_ESCALATION
+            limit = _escalation_limit_for(kind, resolved)
+            escalations = block_ledger.record(email.message_id, result.detail, kind=kind)
+            if block_ledger.exhausted(email.message_id, limit, kind=kind):
+                _log.warning(
+                    "escalation_retry_limit_reached",
+                    extra={
+                        "correlation_id": email.message_id,
+                        "kind": kind,
+                        "escalations": escalations,
+                        "limit": limit,
                         "subject": email.subject,
                     },
                 )

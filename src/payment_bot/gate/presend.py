@@ -132,6 +132,97 @@ _NOA_REQUEST_RE = re.compile(
 )
 
 
+#: The sender asking us to CONFIRM where their money goes.
+#:
+#: Distinct from :data:`_CONFIRM_CHANGE_RE` on the intake side, which wants a change word
+#: near a payment noun. This shape has no change word in it at all — live on an RTS
+#: statement: "confirm all payments will be made to RTS Financial Service P.O. Box 840267".
+#: Nothing is being changed; we are being asked to affirm a remit address, which §7 forbids
+#: a reply from doing just as firmly.
+#:
+#: "confirm the payment status" is the commonest sentence in this inbox and must never match,
+#: which is why a direction verb is required after the noun rather than the noun alone.
+_REMIT_CONFIRMATION_REQUEST_RE = re.compile(
+    r"\bconfirm\w*\b\W(?:\w+\W){0,8}?"
+    r"(?:\b(?:payments?|funds|checks?|remittances?)\b\W(?:\w+\W){0,4}?"
+    r"\b(?:made|sent|remitted|paid|issued|directed|go|going)\b"
+    r"|\bremit(?:tance)?\s*(?:to|address)\b)",
+    re.IGNORECASE,
+)
+
+#: A reply asserting where money will GO. Direction, never timing.
+#:
+#: "payment will be issued on Thursday" is the answer this inbox exists to give and must not
+#: match; "payment will be directed accordingly" is the same sentence pointed at a payee and
+#: must. The difference is entirely in what follows the verb, so a destination is required:
+#: ``to <someone>``, or an anaphor like ``accordingly`` that points back at whatever the
+#: sender just asked for. That anaphor is the live case — the draft never repeated the
+#: address, it agreed to it.
+_PAYMENT_DIRECTION_RE = re.compile(
+    r"\b(?:payments?|funds|remittances?|checks?)\b\W(?:\w+\W){0,4}?"
+    r"\b(?:will|shall)\b\W(?:\w+\W){0,3}?"
+    r"\b(?:made|sent|remitted|paid|issued|directed|go)\b\W(?:\w+\W){0,2}?"
+    r"(?:\bto\b|\baccordingly\b|\bas\s+(?:requested|instructed|directed|indicated)\b)",
+    re.IGNORECASE,
+)
+
+
+def _confirms_payment_direction(draft_body: str, email: InboundEmail) -> str | None:
+    """The draft agreeing to where payment goes, when the sender asked it to.
+
+    The third arm of :meth:`PreSendGate._check_change_acknowledgment`, and the one the other
+    two could not reach. Both of those hunt a change VERB near a payment noun. An RTS
+    statement asked us to "confirm all payments will be made to RTS Financial Service P.O.
+    Box 840267", and the draft answered "payment will be directed accordingly" — no change
+    verb anywhere, so bank phrases, change wording and NOA action all came back empty and the
+    reply confirmed a remit address on the way past.
+
+    Armed by the INBOUND, which is what keeps it narrow: a payment-status reply may say
+    whatever it likes about direction on a thread where nobody asked. Only when the sender
+    has asked us to affirm where their money goes does agreeing to it become the §7 problem.
+    """
+
+    asked = "\n".join(
+        part
+        for part in (email.subject, strip_quoted(email.body), strip_quoted(email.html_text))
+        if part
+    )
+    if not _REMIT_CONFIRMATION_REQUEST_RE.search(asked):
+        return None
+    match = _PAYMENT_DIRECTION_RE.search(draft_body)
+    return " ".join(match.group(0).split()) if match else None
+
+
+def _noa_action_problems(body: str, noa_request_expected: bool) -> list[str]:
+    """NOA actions in a draft, minus the one the intake told it to write.
+
+    ``_NOA_ACTION_RE`` was written to read the SENDER's mail, where a change verb near the
+    NOA noun means they are asking us to set one up. The gate reuses it on our own reply,
+    and the pattern has no notion of who is asking whom. On the pre-NOA flow that misreads
+    the sanctioned ask as an acknowledgment: a draft for load 2546075 said "To get this set
+    up, please email the NOA and all billing paperwork" and was blocked for "NOA action 'set
+    up, please email the NOA'" in the same run where ``noa_request`` passed it as "NOA
+    request present, per the intake". Two checks, one sentence, opposite verdicts.
+
+    Scoped by SPAN OVERLAP rather than by suppressing the arm outright. Only the stretch of
+    text that IS the sanctioned request is forgiven; "we have set up your NOA" elsewhere in
+    the same draft does not overlap it and still blocks, which is the shape this check
+    exists for. And only when the intake actually asked for one — an unsanctioned request
+    fails ``noa_request`` anyway, and leaving this arm to fail too keeps the reason honest.
+    """
+
+    sanctioned: list[tuple[int, int]] = (
+        [m.span() for m in _NOA_REQUEST_RE.finditer(body)] if noa_request_expected else []
+    )
+    problems: list[str] = []
+    for match in _NOA_ACTION_RE_GATE.finditer(body):
+        start, end = match.span()
+        if any(max(start, s) < min(end, e) for s, e in sanctioned):
+            continue
+        problems.append(f"NOA action {match.group(0).strip()!r}")
+    return problems
+
+
 #: Wording that characterises whether a 6-digit load has been paid — in either direction.
 #:
 #: On the CargoTel path this is unanswerable, not merely unverified: ``BillingState`` has
@@ -409,7 +500,7 @@ class PreSendGate:
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
             self._check_carrier_consistency(draft, email, ctx),
-            self._check_change_acknowledgment(draft),
+            self._check_change_acknowledgment(draft, email, noa_request_expected),
             self._check_noa_request(draft, noa_request_expected),
         ]
         allowed = all(c.passed for c in checks)
@@ -531,13 +622,21 @@ class PreSendGate:
             name="sensitive_change", passed=True, detail="no bank/NOA/contact change detected"
         )
 
-    def _check_change_acknowledgment(self, draft: SubmitDraftOutput) -> GateCheck:
+    def _check_change_acknowledgment(
+        self,
+        draft: SubmitDraftOutput,
+        email: InboundEmail,
+        noa_request_expected: bool = False,
+    ) -> GateCheck:
         """The reply must never acknowledge or act on a remittance/bank/NOA instruction.
 
         This is the §7 compensating control that makes the boilerplate narrowing safe: the
         bot cannot change remittance, so the only real risk was a reply that *reads as if
         it did*. The draft body is scanned with the same patterns the email scan uses — a
         change word near a payment noun, an explicit request phrase, an NOA action.
+
+        ``noa_request_expected`` is threaded through for :func:`_noa_action_problems`, which
+        is where reusing the email's patterns on a reply stops being free.
         """
 
         body = draft.reply_body
@@ -548,9 +647,10 @@ class PreSendGate:
         match = _BANK_CHANGE_REQUEST_RE_GATE.search(body)
         if match:
             problems.append(f"change wording {' '.join(match.group(0).split())!r}")
-        noa = _NOA_ACTION_RE_GATE.search(body)
-        if noa:
-            problems.append(f"NOA action {noa.group(0).strip()!r}")
+        problems.extend(_noa_action_problems(body, noa_request_expected))
+        agreed = _confirms_payment_direction(body, email)
+        if agreed:
+            problems.append(f"payment direction {agreed!r} answering a confirmation request")
         if problems:
             return GateCheck(
                 name="change_acknowledgment",

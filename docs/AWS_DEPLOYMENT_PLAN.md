@@ -311,6 +311,8 @@ Metric filters → CloudWatch metrics (per run):
 | `DraftsCreated` | `gmail_api_draft_created` | — |
 | `Escalations` (dimension: reason) | `escalated` | Spike alarm (>3× 7-day baseline) |
 | `GateBlocked` | `gate_blocked` | >2/day — the model is misbehaving |
+| `LlmInputTokens` / `LlmOutputTokens` | the per-turn `llm_usage` event (agent loop + id filter) | `LlmSpend`: input tokens over a rolling day above `DailyInputTokenAlarm`. **The only metric that measures cost rather than outcomes.** Bedrock is ~90% of the bill, and the expensive failure is a run that produces no outcome at all and repeats — invisible to every other metric here. Cache reads are not broken out: Converse reports them separately from `inputTokens`, so a cache that stops matching appears as a step change in `LlmInputTokens` on unchanged traffic |
+| `EscalationRetriesExhausted` | `escalation_retry_limit_reached` — the once-per-message event, not the `escalation_retries_exhausted` line logged on every later skip | Digest, with one exception. Each entry is a TASK — the mail sits unread and nothing will retry it. Watch for a spike right after an infrastructure outage: that means mail escalated on a transient failure and spent its attempts on it, and those threads need re-sending by hand |
 | `LlmFailures` | Bedrock client errors | >3/hour |
 | `PolicyAllowedChangeWording` | `bank_change_language_allowed_by_policy` | Daily digest — every one of these needs a human to action the request |
 | `RunFailures` | Lambda errors / DLQ depth | Any → page |
@@ -410,6 +412,35 @@ the workstation setup remains intact until step 4 and is a two-minute restore.
 | CloudWatch (logs + alarms) | $2–5 | JSON logs, short retention (90 days) |
 | S3 (roster + CargoTel cookie reads) | ~$0 | A few GETs per run; negligible |
 | **Total** | **~$12–30/month** | Dominated by the model; scales linearly with mail volume |
+
+> **This estimate assumes each email is processed once. It was not.** Every row above is
+> priced per email; the bill is priced per *attempt*. Until 2026-08-20 only two of the four
+> no-reply outcomes had a retry budget:
+>
+> | Outcome | What stops the re-scan | Before 2026-08-20 |
+> |---|---|---|
+> | `AWAITING_REVIEW`, drafts mode | Gmail `DRAFT` label in the thread | ✅ |
+> | `AWAITING_REVIEW`, chat mode | live pending approval entry | ✅ |
+> | `BLOCKED` | `GateBlockRetryLimit` | ✅ |
+> | `ESCALATED` | — | ❌ **uncapped** |
+>
+> An escalation leaves the thread with no draft and no reply, so the thread-skip in
+> `_thread_reply_target` never fires on it and `newer_than:2d` keeps it fetchable for ~96 runs
+> at a 30-minute cadence. Escalations are also the majority outcome — 23 of 37 processed emails
+> in the 2026-08-11 log. Two things made that expensive rather than merely wasteful: the LLM id
+> filter runs at intake *ahead of every escalation check*, so a refusal pays a model call each
+> time it is re-derived; and the `agent produced no draft` reason is raised only *after* the
+> whole agent loop, at 12 turns for one load and up to 50 for five. At the ~$0.10/attempt
+> measured on gate blocks, one thread stuck in that shape is ~$9.60 before it ages out.
+>
+> `EscalationRetryLimit` (default 3) closes it, cutting a stuck thread's ~96 billings by ~97%.
+> It also cuts Lambda GB-seconds by the same factor, since most of that wall-clock was spent
+> waiting on Bedrock for an answer already known.
+>
+> **The figures above remain estimates, not measurements** — nothing recorded token spend until
+> the `llm_usage` line landed the same day. `LlmInputTokens` / `LlmOutputTokens` are what will
+> replace this table with real numbers; revisit it after a week of data, and tighten
+> `DailyInputTokenAlarm` at the same time.
 
 Cheaper lever if volume grows 10×: route classification-adjacent turns to Claude Haiku and
 keep Sonnet for drafting (the PRD's §8.1.1 two-model split; the `LlmClient` seam supports

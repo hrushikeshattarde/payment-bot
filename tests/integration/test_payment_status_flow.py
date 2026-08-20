@@ -495,3 +495,127 @@ def test_noa_attachment_still_escalates_despite_the_bank_policy() -> None:
 
     assert result.outcome is Outcome.ESCALATED
     assert "noa_setup_change" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# An attachment's load ids: which ones the reply is allowed to be about, and
+# whether the filter that judges them can actually see them.
+# ---------------------------------------------------------------------------
+def _narrowing_pipeline() -> PaymentBotPipeline:
+    return _build(
+        AutoApproveResolver(), MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    )
+
+
+@pytest.mark.integration
+def test_an_authorized_load_the_sender_never_named_is_not_answered() -> None:
+    """Live on an RTS paperwork verification (load 2536617, 2026-08-20).
+
+    The body named ONE load; the attached packet contributed 1504077. Unlike the MDR
+    reference numbers above, that id is a REAL load — of a different carrier, and RTS is
+    that carrier's factor, so authorization was right to allow it. The reply then
+    volunteered a paragraph about a load nobody had asked about.
+
+    Authorization is the wrong question for this one, which is why only writtenness drops it.
+    """
+
+    pipeline = _narrowing_pipeline()
+
+    assert pipeline._narrow_to_written(["2536617", "1504077"], ["2536617"], "cid") == ["2536617"]
+
+
+@pytest.mark.integration
+def test_a_statement_naming_no_load_still_answers_its_attachment() -> None:
+    """The McLeod shape: "see the attached statement", ids attachment-only.
+
+    Dropping them would leave nothing to answer OR deflect, so the fallback keeps the set.
+    """
+
+    pipeline = _narrowing_pipeline()
+    found = ["2520001", "2520002", "2520003"]
+
+    assert pipeline._narrow_to_written(found, [], "cid") == found
+
+
+@pytest.mark.integration
+def test_narrowing_is_a_no_op_when_the_sender_wrote_every_id() -> None:
+    pipeline = _narrowing_pipeline()
+
+    assert pipeline._narrow_to_written(["2462934", "2520001"], ["2462934", "2520001"], "cid") == [
+        "2462934",
+        "2520001",
+    ]
+
+
+@pytest.mark.integration
+def test_the_id_filter_is_shown_the_attachment_its_candidates_came_from() -> None:
+    """The filter classifies candidates IN CONTEXT, and the context omitted attachments.
+
+    An id living only in a PDF was handed to the model with nothing to judge it against, and
+    ``id_filter`` only ever removes a candidate it has something coherent to say about — so
+    an attachment-only id survived by construction.
+    """
+
+    from payment_bot.clients.llm import LlmResponse, Message, ToolSpec, ToolUseBlock
+    from payment_bot.models import EmailAttachment
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def converse(
+            self,
+            system: str,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            *,
+            max_tokens: int = 1024,
+            temperature: float = 0.0,
+        ) -> LlmResponse:
+            self.prompts.append(messages[0].content[0].text)  # type: ignore[union-attr]
+            return LlmResponse(
+                stop_reason="tool_use",
+                content=[
+                    ToolUseBlock(
+                        tool_use_id="t1",
+                        name="report_identifier_kinds",
+                        input={
+                            "identifiers": [
+                                {"value": "2462934", "kind": "load", "why": "named in the body"},
+                                {"value": "1504077", "kind": "load", "why": "in the packet"},
+                            ]
+                        },
+                    )
+                ],
+            )
+
+    recorder = _Recorder()
+    pipeline = PaymentBotPipeline(
+        tp=sample_transport_pro_client(),
+        gmail=MockGmailClient(),
+        slack=MockSlackClient(),
+        llm=recorder,  # type: ignore[arg-type]
+        approval_resolver=AutoApproveResolver(),
+        audit_sink=InMemoryAuditSink(),
+        settings=Settings(llm_id_filter="shadow"),
+    )
+    email = sample_payment_status_email().model_copy(
+        update={
+            "attachments": [
+                EmailAttachment(
+                    filename="pod.pdf",
+                    mime_type="application/pdf",
+                    extracted_text="PROOF OF DELIVERY\nOrder 1504077\nGSM TRANSPORT LLC\n",
+                )
+            ]
+        }
+    )
+
+    pipeline._filter_ids(["2462934", "1504077"], email, "cid")
+
+    assert recorder.prompts, "the filter should have called the model"
+    # "1504077" alone proves nothing — `classify` lists the candidates either way. What has
+    # to be there is the text the candidate came FROM, which is what the model classifies
+    # against and what the omission removed.
+    assert "Order 1504077" in recorder.prompts[0]
+    assert "PROOF OF DELIVERY" in recorder.prompts[0]

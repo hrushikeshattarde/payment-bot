@@ -19,7 +19,7 @@ from payment_bot.config import Settings
 from payment_bot.domain import compute_carrier_rate as domain_carrier_rate
 from payment_bot.domain import compute_scheduled_pay_date as domain_scheduled_pay_date
 from payment_bot.domain import route_load as domain_route_load
-from payment_bot.errors import ToolError
+from payment_bot.errors import LoadCancelledError, ToolError
 from payment_bot.logging import get_logger
 from payment_bot.models import (
     AuthDecision,
@@ -933,6 +933,7 @@ class ExtractIdentifiers(Tool):
         load_ids = _prefer_declared_id_length_across_systems(load_ids, text)
 
         stated_rates: list[StatedRate] = []
+        unbound: list[Decimal] = []
         for line in text.splitlines():
             if not _MONEY_RE.search(line):
                 continue
@@ -952,18 +953,43 @@ class ExtractIdentifiers(Tool):
             if not amounts:
                 continue
             if not line_ids and len(load_ids) > 1:
-                # An amount on a line naming no load, in an email naming several. It belongs
-                # to one of them and nothing says which, so it is neither a rate the sender
-                # stated about a load nor something a reply can quote without picking a load
-                # on its behalf. A line that DOES carry ids stays — which of them is
-                # ambiguous, and the skill renders that honestly as "unattributed".
-                _log.info(
-                    "unattributed_amount_dropped",
-                    extra={"amounts": [str(a) for a in amounts], "load_count": len(load_ids)},
-                )
+                # An amount on a line naming no load, in an email naming several. Held back
+                # rather than kept: it belongs to one of them, or to all of them, and the
+                # line itself does not say which. Decided below, once the bound amounts are
+                # known. A line that DOES carry ids stays here — which of them is ambiguous,
+                # and the skill renders that honestly as "unattributed".
+                unbound.extend(amounts)
                 continue
             load_ref = line_ids[0] if len(line_ids) == 1 else None
             stated_rates.extend(StatedRate(load_id=load_ref, amount=a) for a in amounts)
+
+        # The one unattributed amount a multi-load email may legitimately state is the TOTAL,
+        # and refusing it blocked a real reply. A Love's Financial rate verification listed
+        # five loads at $275.00 each and asked "will the full amount of $1375 be paid?"; the
+        # $1375 named no load because it is about all of them, was dropped as ambiguous, and
+        # the draft that answered the question was then blocked by grounding for stating an
+        # amount nothing had recorded.
+        #
+        # Recognised by arithmetic rather than by wording: an unattributed figure equal to the
+        # sum of what the sender bound to loads IS that sum, whatever sentence carries it, and
+        # a figure that is not equal to it remains the ambiguous case this guard was for. The
+        # sum is over DISTINCT (load, amount) pairs — an invoice table that prints the same row
+        # under two column headings would otherwise double it and match nothing.
+        if unbound:
+            distinct_rows = {(r.load_id, r.amount) for r in stated_rates if r.load_id is not None}
+            bound_total = sum((amount for _, amount in distinct_rows), Decimal(0))
+            for amount in unbound:
+                if bound_total and amount == bound_total:
+                    stated_rates.append(StatedRate(load_id=None, amount=amount))
+                else:
+                    _log.info(
+                        "unattributed_amount_dropped",
+                        extra={
+                            "amount": str(amount),
+                            "bound_total": str(bound_total),
+                            "load_count": len(load_ids),
+                        },
+                    )
 
         # Which of the surviving ids the sender actually wrote. A subset of the guarded result
         # rather than a fresh scan, so every guard above still applies — an id the label rules
@@ -1523,7 +1549,18 @@ class CheckAuthorization(Tool):
                 f"authorization source not wired for system {params.system.value!r}"
             )
 
-        auth = ctx.tp.get_authorization_context(params.load_id)
+        try:
+            auth = ctx.tp.get_authorization_context(params.load_id)
+        except LoadCancelledError as exc:
+            # Reported as an outcome, not an error envelope. As an error it landed in the
+            # pipeline's `unauthorized` list and the escalation read "sender not authorized
+            # for any load: 2476946=ERROR(... HTTP 400)" - which blamed the sender for a
+            # cancelled load and read like a Transport Pro outage.
+            return CheckAuthorizationOutput(
+                decision=AuthDecision.CANCELLED,
+                authorized=False,
+                reason=str(exc),
+            )
         sender = params.sender_email.strip().lower()
         domain = sender.split("@")[-1].replace(".", "")
 

@@ -147,8 +147,10 @@ def test_unknown_load_fails_closed_at_intake_and_never_sends() -> None:
     result = pipeline.process_email(email)
 
     assert result.outcome is Outcome.ESCALATED
-    assert "not authorized for any load" in result.detail
-    assert "ERROR" in result.detail  # authorization unresolved → fail closed
+    # Still fails closed — but the reason names the load, not the sender. Reported as
+    # "not authorized" this blamed a carrier for a load that no longer exists.
+    assert "cancelled" in result.detail
+    assert "not authorized" not in result.detail
     assert result.draft is None
     assert gmail.sent == []
     assert len(slack.escalations) == 1

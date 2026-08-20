@@ -185,10 +185,12 @@ before it is its rollback.
 |---|---|
 | Is it running? | Lambda → `paybot-worker-prod` → Monitor: an Invocation dot per scheduled firing, Errors flat zero |
 | What did it do? | CloudWatch → Log groups → `/aws/lambda/paybot-worker-prod` → newest stream |
-| Is anything wrong? | CloudWatch → Alarms → the four `paybot-prod-*` alarms green |
+| Is anything wrong? | CloudWatch → Alarms → the five `paybot-prod-*` alarms green |
 | What is it deciding? | CloudWatch → Metrics → `PaymentBot/prod` (DraftsCreated / Escalations / GateBlocked) |
 | Everything it owns | CloudFormation → `paybot-prod` → Resources tab |
-| What is it costing? | Cost Explorer → group by Service ("Amazon Bedrock" ≈ the bot's real cost); Budgets alert recommended (~$10/month threshold) |
+| What is it costing? | CloudWatch → Metrics → `PaymentBot/prod` → `LlmInputTokens` / `LlmOutputTokens`, Sum, 1 day. This is the leading indicator and it moves within the hour; Cost Explorer grouped by Service ("Amazon Bedrock") is the same story a day late. A Budgets alert (~$10/month) is still worth having as the backstop |
+| Why is it costing that? | Logs Insights over the worker log group. Per-skill spend: `filter message="llm_usage" \| stats sum(input_tokens), sum(output_tokens), count(*) by label`. Is the prompt cache working: add `sum(cache_read_tokens)` — near zero past turn 2 on a multi-turn run means the rolling checkpoints have stopped matching. Is one thread being re-billed: `filter message="llm_usage" \| stats sum(input_tokens) as spend by correlation_id \| sort spend desc \| limit 10` — a single correlation_id at the top of a quiet day is the shape `EscalationRetryLimit` exists to stop |
+| Is anything stranded? | `EscalationRetriesExhausted` and `GateBlockRetriesExhausted`. Each entry is mail sitting unread that nothing will retry. A spike in the first right after an outage means threads escalated on a transient failure and used up their attempts — those need re-sending by hand |
 
 ## Failure signatures seen in the wild
 
@@ -198,5 +200,7 @@ before it is its rollback.
 | `SettingsError: error parsing value for field "reply_cc"` | `ReplyCc` passed as a bare address → JSON list string |
 | `AccessDeniedException` on first model call | Anthropic use-case form not cleared (Phase 1), or `BedrockModelId` not the exact listed id |
 | Alarm emails silently stop | Mail scanner hit the SNS unsubscribe link → Phase 6 protected re-confirm |
+| A carrier says they never got an answer, and the log shows nothing for hours | The message may have spent its retry budget: `escalation_retries_exhausted` or `gate_block_retries_exhausted` in the log, keyed by `correlation_id`. Both are working as designed — the mail is a human's now. Reply by hand; raise `EscalationRetryLimit` / `GateBlockRetryLimit` only if the underlying cause was transient and is now fixed. Note that raising the limit does **not** re-queue mail already past its window: `newer_than:2d` will have dropped it |
+| `LlmSpend` alarm fires on a quiet day | Almost never volume. Run the "Why is it costing that?" query above and group by `correlation_id` — one message re-processing is the usual cause. Check it has not somehow escaped the ledger (unreadable `state/gate_block_ledger.json` resets every counter and logs `block_ledger_unreadable_reset`) |
 | Run killed near 15 minutes | Backlog × `FetchLimit` exceeded the Lambda ceiling → lower the limit (mail is not lost; next run retries) |
 | `Runtime.ImportModuleError: pydantic_core` | Zip built outside `deploy.ps1` with Windows wheels → always build via the script |

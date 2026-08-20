@@ -71,6 +71,13 @@
   "_ScheduleEnabled": "Deploy disabled. Invoke manually once, diff against the workstation log, then flip to true and redeploy (cutover step 2).",
   "ScheduleExpression": "cron(15,35,55 * * * ? *)",
 
+  "EscalationRetryLimit": 3,
+  "AgentEscalationRetryLimit": 2,
+  "_AgentEscalationRetryLimit": "The same budget for the one escalation reason raised AFTER the agent loop \u2014 'agent produced no draft'. Separate and tighter than EscalationRetryLimit because a pre-model escalation repeats for one id-filter call while this one repeats the whole loop. Listed explicitly even though it matches the template default: the deployed value of a cost knob should be readable here, not inferred from the template.",
+  "_EscalationRetryLimit": "How many times an ESCALATED message may be re-processed before later runs skip it. An escalation leaves the thread with no draft and no reply, so Gmail's thread-skip never fires on it and the intake window keeps it fetchable for ~96 runs at a 30-minute cadence \u2014 and it is not the free outcome it once was, since the LLM id filter runs ahead of every escalation check and 'agent produced no draft' is raised only after the whole agent loop. Above GateBlockRetryLimit on purpose: a transient Transport Pro or CargoTel failure escalates for a reason that fixes itself, and a spent budget does not come back when the cause is fixed. Watch EscalationRetriesExhausted after an outage.",
+
   "LogRetentionDays": 90,
+  "DailyInputTokenAlarm": 2000000,
+  "_DailyInputTokenAlarm": "Input tokens (cache reads included) in a rolling day above which the LlmSpend alarm fires. A runaway detector, not a budget \u2014 the shape it catches is one stuck thread re-billing the agent loop every run. Tighten it once a week of llm_usage log lines says what normal is.",
   "AlarmEmail": ""
 }

@@ -109,13 +109,24 @@ def test_tool_use_response_is_parsed() -> None:
     call = response.tool_uses[0]
     assert call.name == "tp_get_load_summary"
     assert call.input == {"load_id": "2462934"}
-    assert response.usage == {"inputTokens": 20, "outputTokens": 8}
+    # Neutral names, not Converse's — see USAGE_KEYS. A cache-free turn still reports both
+    # cache counters, as zeroes, because the metric filters match on field name.
+    assert response.usage == {
+        "input_tokens": 20,
+        "output_tokens": 8,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
 
 
 @pytest.mark.unit
 def test_cache_usage_fields_pass_through() -> None:
     """Converse reports cache reads/writes in usage; the mapping must not drop them —
-    they are the only signal that caching is actually working in production logs."""
+    they are the only signal that caching is actually working in production logs.
+
+    They reach those logs under the neutral names, which is what the ``llm_usage`` line in
+    the agent loop spreads and what a metric filter can therefore find.
+    """
 
     fake = _FakeBedrock(
         {
@@ -131,8 +142,10 @@ def test_cache_usage_fields_pass_through() -> None:
     )
     client = BedrockLlmClient(model_id="m", client=fake)
     response = client.converse(system="s", messages=[Message(Role.USER, [TextBlock("go")])], tools=[])
-    assert response.usage["cacheReadInputTokens"] == 11800
-    assert response.usage["cacheWriteInputTokens"] == 700
+    assert response.usage["cache_read_tokens"] == 11800
+    assert response.usage["cache_write_tokens"] == 700
+    assert response.usage["input_tokens"] == 900
+    assert response.usage["output_tokens"] == 40
 
 
 @pytest.mark.unit

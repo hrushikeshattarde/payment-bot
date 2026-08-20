@@ -53,7 +53,7 @@ from payment_bot.gate import GateResult, PreSendGate
 from payment_bot.grounding import GroundingLedger
 from payment_bot.id_filter import MIN_CANDIDATES, IdFilterMode, apply_filter, classify
 from payment_bot.logging import AuditSink, get_logger
-from payment_bot.models import InboundEmail, Intent, SensitiveAction, System
+from payment_bot.models import AuthDecision, InboundEmail, Intent, SensitiveAction, System
 from payment_bot.roster_candidate import append_manual_entries, build_candidate, log_candidate
 from payment_bot.tools import ToolContext, ToolRegistry, build_default_registry
 from payment_bot.tools.shared import (
@@ -141,6 +141,13 @@ class PipelineResult:
     draft: SubmitDraftOutput | None = None
     gate_result: GateResult | None = None
     sent_message: SentMessage | None = None
+    #: True when the agent loop had already run when this outcome was decided.
+    #:
+    #: Only the retry budget reads it, and only to price a repeat. Escalating BEFORE the loop
+    #: costs one id-filter call; escalating after it costs the whole loop — twelve turns for
+    #: one load, up to fifty for five. A budget counted in attempts prices those the same,
+    #: which is what made the expensive one worth three of them.
+    after_agent: bool = False
 
 
 class PaymentBotPipeline:
@@ -253,7 +260,7 @@ class PaymentBotPipeline:
             ctx,
         )
         identifiers = ExtractIdentifiersOutput.model_validate(ident_out.payload)
-        load_ids = self._filter_ids(list(identifiers.load_ids), email, correlation_id)
+        load_ids = list(identifiers.load_ids)
         if not load_ids:
             # No valid id — carrier-name lookup / clarification is out of this slice.
             return self._escalate(
@@ -332,7 +339,22 @@ class PaymentBotPipeline:
         # case working AND keeps it cheap: a McLeod statement says only "see the attached
         # statement for invoice detail", so its ids are attachment-only, the fallback fires,
         # and it deflects here without spending an authorization lookup per load.
-        written_ids = [lid for lid in load_ids if lid in set(identifiers.written_load_ids)]
+        written = set(identifiers.written_load_ids)
+        written_ids = [lid for lid in load_ids if lid in written]
+        id_filter_spent = False
+        if len(written_ids or load_ids) > self._settings.bulk_threshold:
+            # About to deflect on a count taken from UNFILTERED candidates, which the filter
+            # exists to correct. A WEX-shaped collections table writes MC numbers, an account
+            # number and an invoice number beside the one real load; six of those in the body
+            # clear this threshold and would send a portal link in answer to a one-load
+            # question — the MDR failure again, through a different door.
+            #
+            # So the filter is spent HERE when it can still change the answer, and only on the
+            # borderline email. Everything else still reaches authorization without paying for
+            # it. A model call is cheap next to deflecting a real question.
+            load_ids = self._filter_ids(load_ids, email, correlation_id)
+            id_filter_spent = True
+            written_ids = [lid for lid in load_ids if lid in written]
         if len(written_ids or load_ids) > self._settings.bulk_threshold:
             return self._finalize(
                 email,
@@ -404,8 +426,8 @@ class PaymentBotPipeline:
         # a phantom id that Transport Pro 400s on ate all 12 iterations retrying it and
         # produced no draft. The gate stays authoritative over what the draft actually
         # discloses; this is an efficiency measure, not a replacement.
-        unauthorized, authorized_loads, prenoa_loads, unresolved_loads = self._authorize_loads(
-            email, load_ids, routes, ctx
+        unauthorized, authorized_loads, prenoa_loads, unresolved_loads, cancelled_loads = (
+            self._authorize_loads(email, load_ids, routes, ctx)
         )
         # POLICY: add the sender's domain for the factor already on the load, then retry once.
         # Off by default; see Settings.auto_add_factoring_domains for what this trades away and
@@ -415,12 +437,24 @@ class PaymentBotPipeline:
             and self._settings.auto_add_factoring_domains
             and self._auto_add_factoring_domains(email, tuple(load_ids), ctx, correlation_id)
         ):
-            unauthorized, authorized_loads, prenoa_loads, unresolved_loads = (
+            unauthorized, authorized_loads, prenoa_loads, unresolved_loads, cancelled_loads = (
                 self._authorize_loads(email, load_ids, routes, ctx)
             )
 
         if not authorized_loads:
-            reason = f"sender not authorized for any load: {_group_by_reason(unauthorized)}"
+            # Two different failures, reported as two. Folding a cancelled load into
+            # "sender not authorized" blamed the sender for a load that no longer exists and
+            # read like a Transport Pro outage; on a Cleanpeace enquiry the one line carried
+            # three genuine denials and one cancellation with no way to tell them apart.
+            parts: list[str] = []
+            if unauthorized:
+                parts.append(f"sender not authorized for any load: {_group_by_reason(unauthorized)}")
+            if cancelled_loads:
+                parts.append(
+                    f"load(s) cancelled — Transport Pro holds no payable record: "
+                    f"{', '.join(cancelled_loads)}"
+                )
+            reason = "; ".join(parts) or "no load could be authorized"
             # Assemble the roster packet BEFORE escalating, so the reviewer gets the evidence
             # in the same place as the refusal rather than having to go and find it. This
             # decides nothing — the escalation is unchanged either way; see roster_candidate.
@@ -434,16 +468,65 @@ class PaymentBotPipeline:
                 tuple(load_ids),
                 correlation_id,
             )
-        if unauthorized:
+        if unauthorized or cancelled_loads:
+            # `cancelled_loads` belongs in this condition as much as `unauthorized` does.
+            # When a cancelled load was the ONLY non-authorized one, `unauthorized` is empty,
+            # and narrowing to `authorized_loads` was skipped — so the cancelled id stayed in
+            # the answerable set and the agent was sent to look up a load Transport Pro has
+            # already said it holds nothing for.
             _log.info(
                 "authorization_precheck_partial",
                 extra={
                     "correlation_id": correlation_id,
                     "unauthorized": _group_by_reason(unauthorized),
+                    "cancelled": cancelled_loads,
                     "proceeding_with": authorized_loads,
                 },
             )
             load_ids = authorized_loads
+
+        # Loads the sender NAMED that this reply will not cover, so the draft can say so
+        # without naming them. DENY only: a load Transport Pro resolved and this sender is
+        # not entitled to. Cancellations and lookup failures are excluded on purpose — the
+        # first is answerable and the second is already surfaced as `unlocated_loads`, and
+        # since the id filter now runs after authorization, a phantom id fails as CANCELLED
+        # rather than DENY and so cannot inflate this.
+        withheld_named = [
+            lid
+            for lid, reason in unauthorized
+            if lid in written and reason.startswith(AuthDecision.DENY.value)
+        ]
+
+        # The id filter runs HERE rather than at intake, and the move is a cost decision.
+        #
+        # It is one model call, and it used to be paid by every email that reached intake with
+        # two or more candidates — including every email that was about to be refused. Most of
+        # them are: escalations are the majority outcome, and an authorization refusal is the
+        # commonest reason. Those calls bought nothing, because nothing downstream ever ran.
+        #
+        # Sound because the filter can only ever REMOVE candidates (see id_filter's module
+        # docstring). If no id in the unfiltered set authorizes, none in any subset of it can
+        # either, so the refusal above is the same refusal it would have produced afterwards.
+        # What the filter still does here is what it was built for: drop an id that is not a
+        # load at all but that the sender happens to be authorized for, before the reply
+        # discloses it.
+        #
+        # The trade, taken deliberately: authorization now runs over the unfiltered set, so a
+        # phantom costs a Transport Pro call it used to be spared. Those are free and about
+        # half a second; the model call was neither.
+        filtered = load_ids if id_filter_spent else self._filter_ids(
+            load_ids, email, correlation_id
+        )
+        if filtered and filtered != load_ids:
+            dropped = [lid for lid in load_ids if lid not in set(filtered)]
+            _log.info(
+                "authorized_ids_filtered",
+                extra={"correlation_id": correlation_id, "dropped": dropped},
+            )
+            load_ids = filtered
+            keep = set(load_ids)
+            prenoa_loads = [lid for lid in prenoa_loads if lid in keep]
+            unresolved_loads = [lid for lid in unresolved_loads if lid in keep]
 
         # The bulk decision's SECOND half, on the set that survived authorization. This is the
         # count that actually matters: a phantom id from an attachment fails authorization and
@@ -466,6 +549,13 @@ class PaymentBotPipeline:
                 _BULK_PORTAL_SKILL_ID,
             )
 
+        # Deflection is ruled out, so this reply will name loads — and only now is it safe to
+        # ask which ones the sender actually asked about. Not earlier: both bulk checks above
+        # need the unnarrowed set to tell "one written, nine reference numbers" from "one
+        # written, forty real loads", and the second one is decided by authorization, not by
+        # writtenness.
+        load_ids = self._narrow_to_written(load_ids, identifiers.written_load_ids, correlation_id)
+
         # 2. Select the skill by intent -------------------------------------
         # Built from load_ids, not routes: dropped loads (non-TP, unauthorized) must not
         # reappear in the intake prompt.
@@ -479,6 +569,7 @@ class PaymentBotPipeline:
             system,
             prenoa_loads,
             unresolved_loads,
+            len(withheld_named),
         )
 
         # 3. Agent tool-use loop --------------------------------------------
@@ -489,6 +580,7 @@ class PaymentBotPipeline:
             allowed_tools=skill.allowed_tools,
             ctx=ctx,
             max_iterations=budget,
+            label=skill.id,
         )
         if agent_result.draft is None:
             # Include what the model wrote. Without it "produced no draft" is unactionable —
@@ -507,6 +599,7 @@ class PaymentBotPipeline:
                 f"agent produced no draft (stop_reason={agent_result.stop_reason}){aside}",
                 tuple(load_ids),
                 correlation_id,
+                after_agent=True,
             )
         draft = agent_result.draft
 
@@ -629,6 +722,7 @@ class PaymentBotPipeline:
         system: System,
         prenoa_loads: list[str],
         unlocated_loads: list[str],
+        withheld_count: int = 0,
     ) -> tuple[Skill, str]:
         """Pick the skill + build its intake from the classified intent.
 
@@ -698,6 +792,7 @@ class PaymentBotPipeline:
                 signature=self._settings.reply_signature,
                 documents_email=self._settings.documents_email,
                 unlocated_loads=unlocated_loads,
+                withheld_count=withheld_count,
                 rate_question=wants_rate,
                 stated_rates=identifiers.stated_rates,
             )
@@ -713,6 +808,7 @@ class PaymentBotPipeline:
                 documents_email=self._settings.documents_email,
                 prenoa_loads=prenoa_loads,
                 unlocated_loads=unlocated_loads,
+                withheld_count=withheld_count,
             )
         return PAYMENT_STATUS_SKILL, build_payment_status_intake(
             email,
@@ -722,6 +818,7 @@ class PaymentBotPipeline:
             documents_email=self._settings.documents_email,
             prenoa_loads=prenoa_loads,
             unlocated_loads=unlocated_loads,
+            withheld_count=withheld_count,
         )
 
     def _bulk_portal_draft(self, email: InboundEmail) -> SubmitDraftOutput:
@@ -814,12 +911,28 @@ class PaymentBotPipeline:
             return load_ids
 
         try:
+            # Attachment text belongs here, last and truncatable but present. Without it the
+            # filter was handed candidates that appear NOWHERE in what it was shown: an RTS
+            # paperwork verification naming load 2536617 carried a packet whose 1504077 the
+            # regex proposed, and the model was asked to classify a number it could not see.
+            # `id_filter` only ever removes a candidate it has something coherent to say
+            # about, so an attachment-only id survived by construction and was answered.
+            #
+            # Last on purpose. MAX_CONTEXT_CHARS still truncates, and the sender's own words
+            # are what disambiguate the ids they wrote; a long statement losing its tail is
+            # the pre-existing cap, not a new failure.
             text = "\n".join(
                 p
-                for p in (email.subject, email.body, email.html_text, email.thread_text)
+                for p in (
+                    email.subject,
+                    email.body,
+                    email.html_text,
+                    email.thread_text,
+                    *(a.extracted_text for a in email.attachments if a.extracted_text),
+                )
                 if p
             )
-            verdicts = classify(self._llm, load_ids, text)
+            verdicts = classify(self._llm, load_ids, text, correlation_id=correlation_id)
             return apply_filter(mode, load_ids, verdicts, correlation_id=correlation_id)
         except Exception as exc:  # never let the filter break intake
             _log.warning(
@@ -827,16 +940,63 @@ class PaymentBotPipeline:
             )
             return load_ids
 
+    def _narrow_to_written(
+        self, load_ids: list[str], written_load_ids: list[str], correlation_id: str
+    ) -> list[str]:
+        """Answer the loads the sender NAMED, not every load-shaped number we could find.
+
+        Both bulk checks knew the difference between an id the sender wrote and one an
+        attachment contributed; the reply did not. Everything from skill selection down ran
+        on the raw set, on the reasoning that authorization had already dropped the phantoms.
+        It had — but authorization is the wrong question. Observed live: an RTS paperwork
+        verification named ONE load, 2536617, and its attached packet contributed 1504077.
+        That id is a REAL load, of a different carrier, and RTS is that carrier's factor, so
+        authorization was right to allow it. The reply then volunteered a paragraph about a
+        load nobody had asked about. ``id_filter``'s docstring names this exact risk: an id
+        the sender happens to be authorized for, disclosed without anyone asking for it.
+
+        Runs LAST, after both portal decisions, and that ordering is the whole design. The
+        first check needs the raw count to deflect a statement whose ids are attachment-only;
+        the second needs the post-authorization count to tell "one written, nine reference
+        numbers" (answer the one) from "one written, forty of the sender's real loads"
+        (deflect). Narrowing before either would collapse both into "answer the one".
+
+        Falls back to the full set when the sender named NONE — the statement case, where the
+        ids are attachment-only and dropping them would leave nothing to answer.
+
+        THE TRADE: an email naming one load that also attaches a FEW of the sender's real
+        loads — few enough to stay under the bulk threshold — now answers only the named one
+        instead of all of them. That is the intended reading of "which loads is this about",
+        and the drop is logged rather than silent so a deployment meeting the mixed shape
+        often can see it happening.
+        """
+
+        written = [lid for lid in load_ids if lid in set(written_load_ids)]
+        if not written or len(written) == len(load_ids):
+            return load_ids
+        _log.info(
+            "unwritten_load_ids_dropped",
+            extra={
+                "correlation_id": correlation_id,
+                "answered": written,
+                "dropped": [lid for lid in load_ids if lid not in set(written)],
+            },
+        )
+        return written
+
     def _authorize_loads(
         self,
         email: InboundEmail,
         load_ids: list[str],
         routes: dict[str, System],
         ctx: ToolContext,
-    ) -> tuple[list[tuple[str, str]], list[str], list[str], list[str]]:
+    ) -> tuple[list[tuple[str, str]], list[str], list[str], list[str], list[str]]:
         """Run the authorization pre-check over every load.
 
-        Returns ``(unauthorized, authorized, prenoa, unresolved)``. ``unresolved`` is kept
+        Returns ``(unauthorized, authorized, prenoa, unresolved, cancelled)``. ``cancelled``
+        is a load Transport Pro no longer holds a payable record for; it is neither allowed
+        nor denied, because the authorization context comes from the payload that is gone.
+        ``unresolved`` is kept
         apart from ``unauthorized`` because the two must not be treated alike downstream: a
         denied load is legitimately withheld and the reply should say nothing about it, while
         an unresolvable load is one the sender explicitly asked about and we simply do not
@@ -851,6 +1011,7 @@ class PaymentBotPipeline:
         authorized_loads: list[str] = []
         prenoa_loads: list[str] = []
         unresolved_loads: list[str] = []
+        cancelled_loads: list[str] = []
         for load_id in load_ids:
             auth_out = self._registry.dispatch(
                 "check_authorization",
@@ -868,6 +1029,11 @@ class PaymentBotPipeline:
                 unresolved_loads.append(load_id)
                 continue
             auth = CheckAuthorizationOutput.model_validate(auth_out.payload)
+            if auth.decision is AuthDecision.CANCELLED:
+                # Not a denial and not a fault. Kept out of `unauthorized` so the escalation
+                # stops saying "sender not authorized" about a load that no longer exists.
+                cancelled_loads.append(load_id)
+                continue
             if not auth.authorized:
                 # Carry the tool's reason — it names the fix (e.g. a factoring domain to
                 # add to PAYBOT_FACTORING_DOMAINS), which is what the reviewer acts on.
@@ -877,7 +1043,7 @@ class PaymentBotPipeline:
             authorized_loads.append(load_id)
             if auth.pre_noa:
                 prenoa_loads.append(load_id)
-        return unauthorized, authorized_loads, prenoa_loads, unresolved_loads
+        return unauthorized, authorized_loads, prenoa_loads, unresolved_loads, cancelled_loads
 
     def _auto_add_factoring_domains(
         self,
@@ -1095,6 +1261,7 @@ class PaymentBotPipeline:
         *,
         gate_result: GateResult | None = None,
         draft: SubmitDraftOutput | None = None,
+        after_agent: bool = False,
     ) -> PipelineResult:
         channel = (
             self._settings.slack_security_channel
@@ -1112,4 +1279,5 @@ class PaymentBotPipeline:
             correlation_id,
             draft,
             gate_result,
+            after_agent=after_agent,
         )

@@ -104,6 +104,43 @@ Parameters:
       state/gate_block_ledger.json inside RosterBucket; 0 disables the cap. Escalations
       are unaffected: they stop before any model call and re-checking them is near-free.
 
+  EscalationRetryLimit:
+    Type: Number
+    Default: 3
+    MinValue: 0
+    MaxValue: 50
+    Description: >
+      How many times an ESCALATED message may be re-processed before later runs skip it.
+      An escalation leaves the thread with no draft and no reply, so Gmail's thread-skip never
+      fires on it and the intake window keeps it fetchable for ~96 runs at this cadence. It is
+      not the free outcome it used to be: the LLM id filter runs ahead of every escalation
+      check, and one reason ("agent produced no draft") is raised only after the whole agent
+      loop has run. Escalations are the majority outcome, which makes this the largest single
+      source of repeat model spend. Counted per message id in state/gate_block_ledger.json;
+      0 disables the cap. A sender's follow-up is a new message and earns a fresh budget.
+
+      Deliberately above GateBlockRetryLimit: most escalations are deterministic and would be
+      served by 1, but a transient Transport Pro or CargoTel failure escalates for a reason
+      that fixes itself, and a spent budget does NOT come back when the cause is fixed — the
+      mail sits unread with nothing retrying it. Watch EscalationRetriesExhausted for a spike
+      after an outage; those threads need re-sending by hand.
+
+  AgentEscalationRetryLimit:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 50
+    Description: >
+      The same budget for the one escalation reason raised AFTER the agent loop has run,
+      "agent produced no draft". Separate because the two cost nothing like the same to
+      repeat: a pre-model escalation repeats for one id-filter call, this one repeats twelve
+      model turns for a single load and up to fifty for five. Counting both in attempts
+      bought three of the most expensive repeat in the system at the price set for the
+      cheapest. Two rather than one because a model that answers in prose instead of calling
+      submit_draft is sometimes flaky rather than stuck, and one retry is worth having.
+      0 falls back to EscalationRetryLimit rather than removing the cap — switching off the
+      tighter budget must leave the looser one standing.
+
   ReplySignature:
     Type: String
     Default: Circle Delivers Payments
@@ -264,6 +301,19 @@ Parameters:
   LogRetentionDays:
     Type: Number
     Default: 90
+
+  DailyInputTokenAlarm:
+    Type: Number
+    Default: 2000000
+    MinValue: 0
+    Description: >
+      Input tokens (cache reads included) in a rolling day above which the LlmSpend alarm
+      fires. A RUNAWAY detector, not a budget: the shape it exists to catch is a stuck thread
+      re-billing the agent loop every run, which is how this system spends real money without
+      anything else looking wrong. 2,000,000/day is roughly $6/day at Sonnet's input rate —
+      far above a normal day's traffic and far below a month of silence.
+      Tighten it once a week of llm_usage lines says what normal actually is; 0 disables by
+      firing constantly, so raise rather than zero it if you want it quiet.
 
   AlarmEmail:
     Type: String
@@ -459,6 +509,8 @@ Resources:
           PAYBOT_FACTORING_PRENOA_REPLIES: !Ref FactoringPrenoaReplies
           PAYBOT_LLM_ID_FILTER: !Ref LlmIdFilter
           PAYBOT_GATE_BLOCK_RETRY_LIMIT: !Ref GateBlockRetryLimit
+          PAYBOT_ESCALATION_RETRY_LIMIT: !Ref EscalationRetryLimit
+          PAYBOT_AGENT_ESCALATION_RETRY_LIMIT: !Ref AgentEscalationRetryLimit
           PAYBOT_AUTO_ADD_FACTORING_DOMAINS: !Ref AutoAddFactoringDomains
 
           PAYBOT_REPLY_SIGNATURE: !Ref ReplySignature
@@ -703,6 +755,62 @@ Resources:
           MetricValue: "1"
           DefaultValue: 0
 
+  # The cost signal. Bedrock is ~90% of this stack's bill and nothing else here measures it:
+  # every other metric counts OUTCOMES, and the expensive failure is a run that produces no
+  # outcome at all and repeats. Both filters read the per-turn `llm_usage` line the agent loop
+  # and the id filter emit, so the count covers drafting and intake alike.
+  #
+  # Cache reads are NOT broken out as a third metric — Converse reports them separately from
+  # inputTokens, so a cache that stops matching shows up as a step change in LlmInputTokens
+  # on unchanged traffic. That keeps this to two metrics: with these, ten custom metrics are
+  # in use against CloudWatch's ten free, so the ELEVENTH is a knowing $0.30/month decision.
+  # Per-turn cache detail stays in the logs, where a Logs Insights query over `llm_usage`
+  # answers tuning questions without a metric standing by around the clock.
+  LlmInputTokensMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref WorkerLogGroup
+      FilterPattern: '{ $.message = "llm_usage" }'
+      MetricTransformations:
+        - MetricName: LlmInputTokens
+          MetricNamespace: !Sub "PaymentBot/${StackEnv}"
+          MetricValue: "$.input_tokens"
+          DefaultValue: 0
+
+  LlmOutputTokensMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref WorkerLogGroup
+      FilterPattern: '{ $.message = "llm_usage" }'
+      MetricTransformations:
+        - MetricName: LlmOutputTokens
+          MetricNamespace: !Sub "PaymentBot/${StackEnv}"
+          MetricValue: "$.output_tokens"
+          DefaultValue: 0
+
+  # A message that spent its EscalationRetryLimit: it escalated, a human was told, and later
+  # runs now skip it before any model call. Same class of entry as GateBlockRetriesExhausted —
+  # a TASK, not a log line. Worth watching for one shape in particular: a spike here right
+  # after an infrastructure outage means mail escalated on a transient failure and used up its
+  # attempts on it, so those threads need re-sending by hand once the cause is fixed.
+  #
+  # Reads `escalation_retry_limit_reached` — logged ONCE, on the run that spends the budget —
+  # and NOT the `escalation_retries_exhausted` line beside it, which is logged on every
+  # subsequent skip. Deliberately unlike GateBlockRetriesExhausted above, which points at its
+  # repeated event: that makes one stranded thread worth ~93 data points before it ages out of
+  # the intake window, so its count is really a skip rate and no threshold over it means much.
+  # This one counts stranded threads, one apiece, which is the number a human would act on.
+  EscalationRetriesExhaustedMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref WorkerLogGroup
+      FilterPattern: '{ $.message = "escalation_retry_limit_reached" }'
+      MetricTransformations:
+        - MetricName: EscalationRetriesExhausted
+          MetricNamespace: !Sub "PaymentBot/${StackEnv}"
+          MetricValue: "1"
+          DefaultValue: 0
+
   RunFailuresAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -732,6 +840,24 @@ Resources:
       Period: 86400
       EvaluationPeriods: 1
       Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  LlmSpendAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "paybot-${StackEnv}-LlmSpend"
+      AlarmDescription: >
+        Model input tokens over a rolling day are far above normal traffic. Almost always one
+        message being re-processed every run rather than a busy inbox: check for a repeating
+        correlation_id across llm_usage lines before assuming volume.
+      Namespace: !Sub "PaymentBot/${StackEnv}"
+      MetricName: LlmInputTokens
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref DailyInputTokenAlarm
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlarmTopic]

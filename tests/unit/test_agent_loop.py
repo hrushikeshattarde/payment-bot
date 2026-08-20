@@ -206,3 +206,68 @@ def test_nudging_can_be_disabled(ctx: ToolContext) -> None:
 
     assert result.draft is None
     assert len(llm.calls) == 1
+
+
+@pytest.mark.unit
+def test_every_turn_logs_usage_under_the_neutral_field_names(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The token counters must reach the log, per turn, under the names USAGE_KEYS defines.
+
+    This is a wire contract, not a nicety: the `LlmInputTokens` / `LlmOutputTokens` metric
+    filters in deploy/template.yaml select on `$.message = "llm_usage"` and read
+    `$.input_tokens` / `$.output_tokens`. A metric filter over a field that is absent or
+    renamed records NOTHING and raises nothing — the cost signal would just quietly stop,
+    which is the failure this test exists to make loud.
+    """
+
+    ctx, audit = _ctx()
+    registry = build_default_registry(audit)
+    llm = ScriptedLlmClient(
+        [
+            LlmResponse(
+                stop_reason="tool_use",
+                content=[ToolUseBlock("tu-1", "tp_get_load_summary", {"load_id": "2462934"})],
+                usage={
+                    "input_tokens": 900,
+                    "output_tokens": 40,
+                    "cache_read_tokens": 11800,
+                    "cache_write_tokens": 700,
+                },
+            ),
+            LlmResponse(stop_reason="end_turn", content=[TextBlock("done")]),
+        ]
+    )
+    loop = AgentLoop(llm, registry, max_iterations=4, max_submit_nudges=0)
+
+    with caplog.at_level("INFO", logger="payment_bot.agent"):
+        loop.run(
+            system=PAYMENT_STATUS_SKILL.system_prompt,
+            intake_prompt="handle load 2462934",
+            allowed_tools=PAYMENT_STATUS_SKILL.allowed_tools,
+            ctx=ctx,
+            label=PAYMENT_STATUS_SKILL.id,
+        )
+
+    usage = [r for r in caplog.records if r.message == "llm_usage"]
+    assert len(usage) == 2, "one line per turn, including the turn that ended in prose"
+
+    first = usage[0]
+    assert first.input_tokens == 900
+    assert first.output_tokens == 40
+    assert first.cache_read_tokens == 11800
+    assert first.cache_write_tokens == 700
+    assert first.label == PAYMENT_STATUS_SKILL.id
+    assert first.correlation_id == "loop-test"
+    assert first.iteration == 1
+
+    # A response that reported no usage still carries all four counters as zeroes, so the
+    # metric filter sees a data point rather than a gap.
+    second = usage[1]
+    assert second.iteration == 2
+    assert (
+        second.input_tokens,
+        second.output_tokens,
+        second.cache_read_tokens,
+        second.cache_write_tokens,
+    ) == (0, 0, 0, 0)

@@ -31,7 +31,7 @@ from payment_bot.clients.transport_pro_http import (
     build_transport_pro_client,
 )
 from payment_bot.config import Settings
-from payment_bot.errors import ClientError
+from payment_bot.errors import ClientError, LoadCancelledError
 
 
 def _client(transport: FakeTransport) -> TransportProHttpClient:
@@ -142,16 +142,42 @@ def test_integer_timezone_offset_is_tolerated() -> None:
 
 
 @pytest.mark.unit
-def test_empty_result_array_means_not_found() -> None:
+def test_an_empty_result_array_means_the_load_was_cancelled() -> None:
+    """Transport Pro's way of saying it holds no payable record."""
+
     transport = FakeTransport({"payment_information": []})
-    with pytest.raises(ClientError, match="not found"):
+    with pytest.raises(LoadCancelledError, match="cancelled"):
         _client(transport).get_load("9999999")
 
 
 @pytest.mark.unit
-def test_http_404_is_a_client_error() -> None:
-    with pytest.raises(ClientError, match="not found"):
-        _client(FakeTransport()).get_load("2462934")
+@pytest.mark.parametrize("status", [400, 404])
+def test_a_gone_status_means_the_load_was_cancelled(status: int) -> None:
+    """400 and 404 on this path are the same fact, and it is not a fault."""
+
+    transport = FakeTransport()
+    transport.force_status = [status]
+    with pytest.raises(LoadCancelledError, match="cancelled") as caught:
+        _client(transport).get_load("2462934")
+    assert str(status) in str(caught.value)
+
+
+@pytest.mark.unit
+def test_cancelled_is_still_a_client_error_for_callers_that_catch_broadly() -> None:
+    with pytest.raises(ClientError):
+        _client(FakeTransport({"payment_information": []})).get_load("9999999")
+
+
+@pytest.mark.unit
+def test_a_genuine_upstream_fault_is_not_reported_as_a_cancellation() -> None:
+    """The narrowing has to hold: a 500 is Transport Pro being unwell, not a cancelled load."""
+
+    transport = FakeTransport()
+    transport.force_status = [500]
+    with pytest.raises(ClientError) as caught:
+        _client(transport).get_load("2462934")
+    assert not isinstance(caught.value, LoadCancelledError)
+    assert "cancelled" not in str(caught.value)
 
 
 @pytest.mark.unit

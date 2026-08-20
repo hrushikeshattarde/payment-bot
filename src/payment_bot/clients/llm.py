@@ -15,12 +15,52 @@ keep the loop independent of any single vendor's wire format.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from payment_bot.config import Settings, get_settings
 from payment_bot.errors import ClientError
+
+#: The neutral token counters every client reports, in the order a reader wants them.
+#:
+#: Providers disagree on spelling — Bedrock says ``inputTokens``, the OpenAI wire format says
+#: ``prompt_tokens`` — so each client maps onto these names and nothing downstream has to know
+#: which provider answered. That matters more than tidiness: these names are what the
+#: CloudWatch metric filters in ``deploy/template.yaml`` match on, and a filter reads a field
+#: by NAME. Rename one here and the metric silently stops recording rather than failing.
+#:
+#: All four are always present, zero-filled. A metric filter over an ABSENT field produces no
+#: data point at all rather than a zero, so a run whose cache missed entirely would leave a
+#: gap exactly where the spend spike is — the one shape worth alarming on.
+USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+
+
+def empty_usage() -> dict[str, int]:
+    """The four counters, all zero. The default for a response that reported none."""
+
+    return dict.fromkeys(USAGE_KEYS, 0)
+
+
+def normalise_usage(raw: Any, keys: Mapping[str, str]) -> dict[str, int]:
+    """Map one provider's usage payload onto :data:`USAGE_KEYS`.
+
+    ``keys`` is that provider's ``wire name -> neutral name`` table. Anything missing,
+    non-numeric or unmapped is dropped rather than guessed at: a token count is only worth
+    logging when the provider actually sent it, and a zero is the honest reading of absence.
+    ``bool`` is excluded explicitly because it is an ``int`` subclass in Python and would
+    otherwise arrive as a plausible-looking 0 or 1.
+    """
+
+    usage = empty_usage()
+    if not isinstance(raw, Mapping):
+        return usage
+    for wire_key, neutral_key in keys.items():
+        value = raw.get(wire_key)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            usage[neutral_key] = int(value)
+    return usage
 
 
 class Role(StrEnum):
@@ -80,7 +120,9 @@ class LlmResponse:
 
     stop_reason: str  # "tool_use" | "end_turn" | "max_tokens" | ...
     content: list[ContentBlock]
-    usage: dict[str, int] = field(default_factory=dict)
+    #: Token counters under :data:`USAGE_KEYS`, always all four. This is the only per-turn
+    #: record of what a run cost, so the agent loop and the id filter log it verbatim.
+    usage: dict[str, int] = field(default_factory=empty_usage)
     #: Provider state to carry into the assistant message — see :class:`Message`.
     provider_state: dict[str, Any] | None = None
 
@@ -130,6 +172,18 @@ def _block_to_bedrock(block: ContentBlock) -> dict[str, Any]:
             "status": "error" if block.is_error else "success",
         }
     }
+
+
+#: Bedrock Converse's ``usage`` spellings. ``cacheReadInputTokens`` is billed at ~10% of the
+#: input rate and ``cacheWriteInputTokens`` at ~125%, and Converse reports both SEPARATELY
+#: from ``inputTokens`` rather than folded into it — which is what makes a broken cache
+#: visible as a jump in ``input_tokens`` rather than a silent price rise.
+_BEDROCK_USAGE_KEYS = {
+    "inputTokens": "input_tokens",
+    "outputTokens": "output_tokens",
+    "cacheReadInputTokens": "cache_read_tokens",
+    "cacheWriteInputTokens": "cache_write_tokens",
+}
 
 
 def _cache_point() -> dict[str, Any]:
@@ -266,7 +320,7 @@ class BedrockLlmClient:
         return LlmResponse(
             stop_reason=response.get("stopReason", "end_turn"),
             content=blocks,
-            usage=response.get("usage", {}) or {},
+            usage=normalise_usage(response.get("usage"), _BEDROCK_USAGE_KEYS),
         )
 
 

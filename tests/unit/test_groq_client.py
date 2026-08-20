@@ -166,7 +166,15 @@ def test_tool_call_response_is_parsed() -> None:
     assert call.tool_use_id == "call_9"
     assert call.name == "compute_carrier_rate"
     assert call.input == {"load_id": "2462934"}
-    assert response.usage == {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28}
+    # Mapped onto the neutral names so a local run and a Bedrock run log the same fields.
+    # `total_tokens` is dropped on purpose: it is derived, and the two cache counters stay
+    # zero because this wire format reports cached reads in a nested shape we do not read.
+    assert response.usage == {
+        "input_tokens": 20,
+        "output_tokens": 8,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
 
 
 @pytest.mark.unit

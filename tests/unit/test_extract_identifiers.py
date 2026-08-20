@@ -923,3 +923,69 @@ def test_the_same_amount_is_kept_when_the_email_names_one_load(ctx: ToolContext)
 
     assert [str(r.amount) for r in out.stated_rates] == ["2850.00"]
     assert out.stated_rates[0].load_id is None
+
+
+# ---------------------------------------------------------------------------
+# The total is the one unattributed amount a multi-load email may state.
+# ---------------------------------------------------------------------------
+_LOVES_BODY = (
+    "I am reaching out to verify the rate for loads#\n"
+    "2542489 -$275.00\n"
+    "2542480 -$275.00\n"
+    "2542484 -$275.00\n"
+    "2542493 -$275.00\n"
+    "2542482 - $275.00\n"
+    "for Chuck And Jackie Trucking LLC\n"
+    "Will the full amount of $1375 be paid to Loves? If not, please list any advances, "
+    "deductions, or issues.\n"
+)
+
+
+@pytest.mark.unit
+def test_a_total_over_the_listed_loads_is_kept(ctx: ToolContext) -> None:
+    """Live block: five loads at $275.00 and one question about "$1375".
+
+    The total names no load because it is about all of them. Dropping it as ambiguous left
+    the draft that answered the question stating an amount nothing had recorded, and the
+    grounding check blocked the send.
+    """
+
+    out = _run(ctx, body=_LOVES_BODY)
+
+    assert len(out.load_ids) == 5
+    assert (None, "1375") in [(r.load_id, str(r.amount)) for r in out.stated_rates]
+    assert Decimal("1375") in ctx.ledger.sender_stated_amounts
+
+
+@pytest.mark.unit
+def test_an_unattributed_amount_that_is_not_the_total_is_still_dropped(
+    ctx: ToolContext,
+) -> None:
+    """The ambiguous case the guard was written for is unchanged."""
+
+    body = _LOVES_BODY.replace("$1375", "$500")
+    out = _run(ctx, body=body)
+
+    assert Decimal("500") not in {r.amount for r in out.stated_rates}
+    assert Decimal("500") not in ctx.ledger.sender_stated_amounts
+    assert {r.amount for r in out.stated_rates} == {Decimal("275.00")}
+
+
+@pytest.mark.unit
+def test_a_row_printed_twice_does_not_double_the_total(ctx: ToolContext) -> None:
+    """An invoice table prints the same row under two column headings.
+
+    Summing the repeats would put the total at 1,100 and the sender's real 550 would then
+    look like the ambiguous case.
+    """
+
+    out = _run(
+        ctx,
+        body=(
+            "2542489 | 2542489 | $275.00\n"
+            "2542480 | 2542480 | $275.00\n"
+            "Total due: $550.00\n"
+        ),
+    )
+
+    assert (None, "550.00") in [(r.load_id, str(r.amount)) for r in out.stated_rates]

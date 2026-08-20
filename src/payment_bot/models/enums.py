@@ -23,6 +23,11 @@ class AuthDecision(StrEnum):
     ALLOW = "ALLOW"
     DENY = "DENY"
     FACTORING = "FACTORING"
+    #: The load was cancelled, so there is nothing to be authorized FOR. A third outcome,
+    #: not a denial: the sender may well be entitled to this load, and nobody can tell,
+    #: because the authorization context comes from the same payload that no longer exists.
+    #: Everything that asks "may this be disclosed?" must read it as no.
+    CANCELLED = "CANCELLED"
 
 
 class SensitiveFlag(StrEnum):

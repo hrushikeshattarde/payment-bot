@@ -135,12 +135,22 @@ class Verdict:
 
 
 def classify(
-    llm: LlmClient, candidates: list[str], email_text: str, *, max_tokens: int = 1024
+    llm: LlmClient,
+    candidates: list[str],
+    email_text: str,
+    *,
+    max_tokens: int = 1024,
+    correlation_id: str = "",
 ) -> list[Verdict]:
     """Ask the model what each candidate is. Returns ``[]`` when it cannot say.
 
     Never raises. The caller treats an empty result as "no opinion", which keeps every
     failure mode identical to not having called at all.
+
+    ``correlation_id`` only labels the ``llm_usage`` line. This call is easy to overlook in
+    a cost review — it is one turn against an email that may never reach the agent loop at
+    all — so it reports its tokens under the same event name and field names the loop uses,
+    and the ``label`` is what separates the two in the total.
     """
 
     if len(candidates) < MIN_CANDIDATES:
@@ -161,6 +171,16 @@ def classify(
     except Exception as exc:
         _log.warning("id_filter_call_failed", extra={"error": str(exc)})
         return []
+
+    _log.info(
+        "llm_usage",
+        extra={
+            "correlation_id": correlation_id,
+            "label": "id_filter",
+            "iteration": 1,
+            **response.usage,
+        },
+    )
 
     payload: Any = None
     for block in response.content:

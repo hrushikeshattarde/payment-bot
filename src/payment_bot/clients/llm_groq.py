@@ -45,12 +45,27 @@ from payment_bot.clients.llm import (
     ToolResultBlock,
     ToolSpec,
     ToolUseBlock,
+    normalise_usage,
 )
 from payment_bot.config import Settings, get_settings
 from payment_bot.errors import ClientError
 from payment_bot.logging import get_logger
 
 _log = get_logger("clients.groq")
+
+#: The OpenAI-compatible ``usage`` spellings, mapped onto the neutral counters so a local run
+#: logs the same field names as Bedrock does and one dashboard reads both. ``total_tokens`` is
+#: deliberately dropped — it is the sum of the other two, and a derived field that can
+#: disagree with its own inputs is worse than no field.
+#:
+#: Prompt caching has no entry: this wire format reports cached reads under
+#: ``prompt_tokens_details``, a nested object, and the providers behind this client differ on
+#: whether they send it at all. Those two counters stay zero here rather than being guessed
+#: at from a shape we have not confirmed.
+_USAGE_KEYS = {
+    "prompt_tokens": "input_tokens",
+    "completion_tokens": "output_tokens",
+}
 
 DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
@@ -301,12 +316,7 @@ class GroqLlmClient:
         if not isinstance(message, dict):
             raise ClientError("Groq returned a choice with no message")
 
-        usage_raw = data.get("usage") or {}
-        usage = {
-            key: int(value)
-            for key, value in usage_raw.items()
-            if isinstance(value, int | float) and not isinstance(value, bool)
-        }
+        usage = normalise_usage(data.get("usage"), _USAGE_KEYS)
 
         finish = str(choice.get("finish_reason") or "stop")
         return LlmResponse(

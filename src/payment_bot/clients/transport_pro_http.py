@@ -28,7 +28,8 @@ call therefore serves ``payment_status`` (per-line pay dates via the Mon/Thu rul
 Three live-API details this client absorbs so the rest of the codebase never sees them:
 
 1. **The payload is array-wrapped.** ``payment_information`` returns ``[ { …load… } ]``,
-   not a bare object. An empty array means "no such load" → :class:`ClientError`.
+   not a bare object. An empty array means the load was CANCELLED →
+   :class:`~payment_bot.errors.LoadCancelledError`, same as the 400 that path returns.
 2. **The echoed ``load_id`` is not the id you asked for.** The ``/voiceai/load/…`` paths
    take the carrier-facing load number but return Transport Pro's internal record id
    (``/voiceai/load/2333606`` → ``load_id: 1303298``; likewise
@@ -57,7 +58,7 @@ from typing import Any
 
 from payment_bot.clients.http import HttpResponse, HttpTransport, UrllibTransport
 from payment_bot.config import Settings, get_settings
-from payment_bot.errors import ClientError
+from payment_bot.errors import ClientError, LoadCancelledError
 from payment_bot.logging import get_logger
 
 __all__ = [
@@ -82,6 +83,10 @@ _log = get_logger("clients.transport_pro")
 #: Transport Pro document types that evidence factoring / assignment on a load. Taken
 #: from the live ``GET /files/document_types`` vocabulary (ids 21 and 76).
 _FACTORING_DOC_TYPES = ("carrier factoring agr", "factoring agreement", "notice of assignment")
+
+#: Statuses Transport Pro returns on ``payment_information`` for a load it no longer
+#: holds a payable record for. Both mean cancelled; neither means the API is unwell.
+_LOAD_GONE_STATUSES = frozenset({400, 404})
 
 _JSON_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 
@@ -192,9 +197,11 @@ class TransportProHttpClient:
             resp = self._send(url)
 
         if resp.status == 404:
-            raise ClientError(f"Transport Pro: not found ({path})")
+            raise ClientError(f"Transport Pro: not found ({path})", status=404)
         if resp.status >= 400:
-            raise ClientError(f"Transport Pro GET {path} failed (HTTP {resp.status})")
+            raise ClientError(
+                f"Transport Pro GET {path} failed (HTTP {resp.status})", status=resp.status
+            )
         return resp.json()
 
     def _send(self, url: str) -> HttpResponse:
@@ -235,10 +242,26 @@ class TransportProHttpClient:
         if cached is not None:
             return cached
 
-        payload = self._get(f"/voiceai/load/{urllib.parse.quote(key)}/payment_information")
+        # Both "no payable record" signals mean the same thing and are translated here rather
+        # than in `_get`: 400/404 is generic at that level, but on THIS path it is Transport
+        # Pro saying the load was cancelled. See LoadCancelledError.
+        try:
+            payload = self._get(f"/voiceai/load/{urllib.parse.quote(key)}/payment_information")
+        except LoadCancelledError:
+            raise
+        except ClientError as exc:
+            if exc.status in _LOAD_GONE_STATUSES:
+                raise LoadCancelledError(
+                    f"Transport Pro holds no payable record for load {load_id!r} "
+                    f"(HTTP {exc.status}) — the load was cancelled"
+                ) from exc
+            raise
         rows = self._results(payload, path="payment_information")
         if not rows:
-            raise ClientError(f"Transport Pro: load {load_id!r} not found")
+            raise LoadCancelledError(
+                f"Transport Pro holds no payable record for load {load_id!r} "
+                "(empty result) — the load was cancelled"
+            )
 
         record = dict(rows[0])
         # Preserve the id the carrier asked about; the echoed load_id is TP's internal one.

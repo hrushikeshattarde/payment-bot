@@ -732,3 +732,197 @@ def test_an_amount_both_sides_state_is_not_sender_only(
     assert result.allowed, result.reasons
     assert _checks(result)["sender_amount_attribution"] is True
     assert "quoted from the sender" not in _detail(result, "grounding")
+
+
+# ---------------------------------------------------------------------------
+# The pre-NOA ask is not an acknowledgment. Two checks read the same sentence
+# and used to disagree about it.
+# ---------------------------------------------------------------------------
+_PRE_NOA_BODY = (
+    "Load 2462934 has not yet been billed. To get this set up, please email the NOA and "
+    "all billing paperwork to freightpay@circledelivers.com."
+)
+
+
+@pytest.mark.unit
+def test_the_sanctioned_noa_ask_is_not_an_acknowledgment(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Live block on load 2546075.
+
+    ``change_acknowledgment`` failed on "set up, please email the NOA" in the very run where
+    ``noa_request`` passed the same words as "NOA request present, per the intake".
+    """
+
+    result = PreSendGate().evaluate(
+        draft=_draft(body=_PRE_NOA_BODY),
+        email=sample_email,
+        ctx=grounded_ctx,
+        noa_request_expected=True,
+    )
+
+    assert _checks(result)["change_acknowledgment"] is True, result.reasons
+    assert _checks(result)["noa_request"] is True
+    assert result.allowed, result.reasons
+
+
+@pytest.mark.unit
+def test_an_unsanctioned_noa_ask_still_fails_both_checks(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The exemption is the intake's to grant, not the wording's."""
+
+    result = PreSendGate().evaluate(
+        draft=_draft(body=_PRE_NOA_BODY),
+        email=sample_email,
+        ctx=grounded_ctx,
+        noa_request_expected=False,
+    )
+
+    assert not result.allowed
+    assert _checks(result)["noa_request"] is False
+    assert _checks(result)["change_acknowledgment"] is False
+
+
+@pytest.mark.unit
+def test_claiming_the_noa_was_set_up_is_still_blocked(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The shape the check exists for, on the flow that is allowed to ask for one."""
+
+    result = PreSendGate().evaluate(
+        draft=_draft(body="Load 2462934: we have set up your NOA as requested."),
+        email=sample_email,
+        ctx=grounded_ctx,
+        noa_request_expected=True,
+    )
+
+    assert not result.allowed
+    assert _checks(result)["change_acknowledgment"] is False
+    assert any("set up your NOA" in r for r in result.reasons)
+
+
+@pytest.mark.unit
+def test_an_acknowledgment_beside_the_sanctioned_ask_is_caught(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Why the exemption is scoped to the matching span and not to the whole draft."""
+
+    result = PreSendGate().evaluate(
+        draft=_draft(body=_PRE_NOA_BODY + " We have also added the NOA to the file."),
+        email=sample_email,
+        ctx=grounded_ctx,
+        noa_request_expected=True,
+    )
+
+    assert not result.allowed
+    assert _checks(result)["change_acknowledgment"] is False
+    assert any("added the NOA" in r for r in result.reasons)
+    # The sanctioned ask is not what was reported.
+    assert not any("please email the NOA" in r for r in result.reasons)
+
+
+# ---------------------------------------------------------------------------
+# Answering "confirm all payments will be made to X" is confirming it, even
+# with no change verb anywhere in the sentence.
+# ---------------------------------------------------------------------------
+_ASKS_TO_CONFIRM_REMIT = (
+    "Accounts payable,\n\nPlease provide payment status on the invoices below and confirm "
+    "all payments will be made to RTS Financial Service P.O. Box 840267 Dallas, TX "
+    "75284-0267.\n\nThanks,\nMax"
+)
+
+
+def _remit_email(sample_email: InboundEmail) -> InboundEmail:
+    return sample_email.model_copy(update={"body": _ASKS_TO_CONFIRM_REMIT})
+
+
+@pytest.mark.unit
+def test_agreeing_to_a_remit_address_is_blocked(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Live on an RTS statement, 2026-08-20.
+
+    The sender asked us to confirm a P.O. Box. The draft answered "payment will be directed
+    accordingly" — no change verb, so bank phrases, change wording and NOA action all came
+    back empty and the reply confirmed a remit address on the way past.
+    """
+
+    body = (
+        "Load 2462934 is pending. We have your NOA on file for RTS Financial Service, Inc., "
+        "so once the load is cleared and settles, payment will be directed accordingly."
+    )
+    result = PreSendGate().evaluate(
+        draft=_draft(body=body), email=_remit_email(sample_email), ctx=grounded_ctx
+    )
+
+    assert not result.allowed
+    assert _checks(result)["change_acknowledgment"] is False
+    assert any("payment direction" in r for r in result.reasons)
+
+
+@pytest.mark.unit
+def test_a_payment_date_is_not_a_payment_direction(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The false positive this arm must never produce.
+
+    "Payment will be issued on Thursday" is the answer this inbox exists to give. It differs
+    from the blocked sentence only in what follows the verb — a date, not a payee — and it is
+    said under the very same confirmation request.
+    """
+
+    body = "Load 2462934 is BILLED. Payment will be issued on Thursday, August 20, 2026."
+    result = PreSendGate().evaluate(
+        draft=_draft(body=body), email=_remit_email(sample_email), ctx=grounded_ctx
+    )
+
+    assert _checks(result)["change_acknowledgment"] is True, result.reasons
+
+
+@pytest.mark.unit
+def test_payment_direction_is_only_policed_when_the_sender_asked(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Armed by the inbound. On a thread where nobody asked, the arm stays down."""
+
+    body = (
+        "Load 2462934 is pending. We have your NOA on file for RTS Financial Service, Inc., "
+        "so once the load is cleared and settles, payment will be directed accordingly."
+    )
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=sample_email, ctx=grounded_ctx)
+
+    assert _checks(result)["change_acknowledgment"] is True, result.reasons
+
+
+@pytest.mark.unit
+def test_confirm_the_payment_status_is_not_a_remit_request() -> None:
+    """The commonest sentence in this inbox must never arm the check."""
+
+    from payment_bot.gate.presend import _confirms_payment_direction
+
+    ordinary = InboundEmail(
+        message_id="m",
+        thread_id="t",
+        from_email="billing@ideaexpedited.com",
+        body="Could you confirm the payment status for load 2462934?",
+    )
+    agreeing = "Payment will be remitted to the address on file."
+
+    assert _confirms_payment_direction(agreeing, ordinary) is None
+
+
+# ---------------------------------------------------------------------------
+# Loads the sender named that the reply does not cover.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_the_withheld_line_never_leaks_the_count_or_the_ids() -> None:
+    """The agent is told how many so it knows the situation; the reply must not say."""
+
+    from payment_bot.agent.skills import _withheld_line
+
+    assert _withheld_line(0) == []
+    line = _withheld_line(3)[0]
+    assert "3" not in line
+    assert "do not name" in line.lower()
+    assert "not addressed here" in line.lower()

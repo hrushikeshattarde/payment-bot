@@ -312,6 +312,45 @@ class Settings(BaseSettings):
     #: re-checking them is deliberate and near-free.
     gate_block_retry_limit: int = Field(default=2, ge=0, le=50)
 
+    #: How many times an ESCALATED message may be re-processed before later runs skip it.
+    #:
+    #: Escalations leave a thread with no draft and no reply, so the Gmail thread-skip never
+    #: fires on them and `newer_than:2d` keeps them fetchable for ~96 runs. They stopped being
+    #: free when the LLM id filter moved ahead of every escalation check, and one reason —
+    #: `agent produced no draft` — is raised only after the entire agent loop has run.
+    #: Escalations are also the majority outcome (23 of 37 in the 2026-08-11 log), so this is
+    #: the largest single source of repeat model spend in the system.
+    #:
+    #: Default 3, deliberately above the gate-block limit of 2. Most escalations are
+    #: deterministic — an authorization refusal reaches the identical verdict every time — so
+    #: 1 would be enough for them and would save perhaps another 1% over 3. What the extra
+    #: attempts buy is the transient case: Transport Pro 500s, a stale CargoTel cookie. Those
+    #: escalate for reasons that fix themselves, and once the budget is spent, fixing the cause
+    #: does NOT bring the mail back — it sits unread with nothing retrying it. Three attempts
+    #: still cuts a stuck thread's ~96 billings by ~97%; the marginal 1% is not worth the
+    #: chance of stranding a thread on a blip. 0 disables the cap.
+    #:
+    #: Spending it logs `escalation_retry_limit_reached` at WARNING ONCE, on the run that
+    #: spends the budget, and that is the line the EscalationRetriesExhausted metric filter
+    #: reads. The `escalation_retries_exhausted` line beside it fires on every LATER skip, so
+    #: counting that one would make a single stranded thread worth ~93 data points before it
+    #: ages out of the intake window — a skip rate, not a count of threads. Tune the alarm
+    #: against the once-per-thread event; a spike right after an outage means some threads
+    #: need re-sending by hand.
+    escalation_retry_limit: int = Field(default=3, ge=0, le=50)
+
+    #: Attempts for an escalation raised AFTER the agent loop ran, i.e. ``agent produced no
+    #: draft``. Lower than :attr:`escalation_retry_limit` because it is not the same purchase:
+    #: the higher budget there buys recovery from a transient outage for the price of one
+    #: id-filter call per attempt, while an attempt here costs the entire loop — twelve turns
+    #: for one load, up to fifty for five, the most expensive repeat the system has.
+    #:
+    #: Two rather than one: a model that stops without calling ``submit_draft`` is sometimes
+    #: flaky rather than stuck, and one retry is worth having. Beyond that the same prompt is
+    #: being paid for repeatedly with no reason to expect a different answer. 0 disables the
+    #: cap, in which case such escalations fall back to the general escalation budget.
+    agent_escalation_retry_limit: int = Field(default=2, ge=0, le=50)
+
     #: Extra iterations granted per load beyond the first.
     #:
     #: The skill procedures are per-load ("`tp_get_load_summary` for each load id"), so a

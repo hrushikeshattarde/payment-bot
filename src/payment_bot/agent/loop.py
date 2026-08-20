@@ -87,6 +87,7 @@ class AgentLoop:
         allowed_tools: tuple[str, ...],
         ctx: ToolContext,
         max_iterations: int | None = None,
+        label: str = "",
     ) -> AgentResult:
         """Drive the tool-use loop until a draft, an end-turn, or the iteration cap.
 
@@ -95,6 +96,10 @@ class AgentLoop:
                 caller knows how much work the email actually implies — the per-load
                 procedure costs the same again for every extra load — and a fixed cap
                 cannot serve a variable number of loads. ``None`` keeps the default.
+            label: What this loop is for, carried onto every ``llm_usage`` line. The skill
+                id in practice: without it the token counters say what a run cost but not
+                what it was spent on, and per-skill cost is the number that decides which
+                skill is worth moving to a cheaper model.
         """
 
         budget = self._max_iterations if max_iterations is None else max(1, max_iterations)
@@ -106,6 +111,21 @@ class AgentLoop:
         for iteration in range(1, budget + 1):
             response = self._llm.converse(
                 system=system, messages=messages, tools=specs, max_tokens=self._max_tokens
+            )
+            # Logged per TURN, not per email. The turn is the billing unit — each one
+            # re-reads the whole transcript — so a per-email total would hide the thing
+            # worth knowing: whether the cost is many cheap turns or a few expensive ones.
+            # `cache_read_tokens` near zero on turn 3 and beyond means the rolling cache
+            # checkpoints have stopped matching and the run is paying full price for
+            # history it already paid to write (see `_cache_point` in clients/llm.py).
+            _log.info(
+                "llm_usage",
+                extra={
+                    "correlation_id": ctx.correlation_id,
+                    "label": label or "agent",
+                    "iteration": iteration,
+                    **response.usage,
+                },
             )
             # provider_state carries anything the provider needs echoed back next turn —
             # a reasoning model's chain of thought, without which it forgets this turn.

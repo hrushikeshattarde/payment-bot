@@ -125,6 +125,29 @@ def test_shadow_and_status_cards_have_no_buttons() -> None:
     assert "Sent by p@x" in json.dumps(terminal)
 
 
+def test_action_buttons_carry_the_endpoint_url_and_the_verb_in_parameters() -> None:
+    """The add-ons runtime treats `function` as THE ENDPOINT TO CALL — a bare verb
+    there dispatches the click to an endpoint named "reject" and nothing answers
+    (diagnosed live 2026-08-20). The verb must ride in the parameters instead."""
+
+    url = "https://xyz.lambda-url.us-east-1.on.aws/"
+    card = approval_card(
+        entry_id="e1", from_email="a@x", load_ids=(), to="a@x", cc=(), reply_to="",
+        body="text", interactive=True, action_url=url,
+    )
+    buttons = [
+        widget["buttonList"]["buttons"]
+        for section in card["card"]["sections"]
+        for widget in section.get("widgets", [])
+        if "buttonList" in widget
+    ][0]
+    for button, verb in zip(buttons, ["approve", "move_to_drafts", "reject"], strict=False):
+        action = button["onClick"]["action"]
+        assert action["function"] == url
+        assert {"key": "action", "value": verb} in action["parameters"]
+        assert any(p["key"] == "entry" and p["value"] == "e1" for p in action["parameters"])
+
+
 def test_open_in_gmail_link_survives_every_card_state() -> None:
     """The link is a plain openLink, not an action — it needs no callback round trip,
     so it belongs on live cards, terminal cards, and notice cards alike. rfc822msgid

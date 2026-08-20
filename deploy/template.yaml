@@ -471,6 +471,11 @@ Resources:
           PAYBOT_REVIEWERS: !Ref Reviewers
           PAYBOT_CHAT_SPACE: !Ref ChatSpace
           PAYBOT_APPROVAL_EXPIRY_DAYS: !Ref ApprovalExpiryDays
+          # The callback's own URL, stamped into every action button's `function` field.
+          # The add-ons runtime the console provisions Chat apps onto treats `function`
+          # as THE ENDPOINT TO CALL for a click — a bare verb there dispatches the click
+          # to an endpoint named "reject" and the space shows the generic red failure.
+          PAYBOT_CHAT_ACTION_URL: !If [HasChatSpace, !GetAtt CallbackUrl.FunctionUrl, ""]
 
   Schedule:
     Type: AWS::Events::Rule

@@ -569,9 +569,12 @@ def _normalise_event(chat_event: dict[str, Any]) -> tuple[str, str, str, str, bo
         user = chat.get("user") if isinstance(chat.get("user"), dict) else {}
         clicker = str(user.get("email") or "").strip().lower()
         common = chat_event.get("commonEventObject") or {}
-        action = str(common.get("invokedFunction") or "")
-        parameters = common.get("parameters")
-        entry = str(parameters.get("entry") or "") if isinstance(parameters, dict) else ""
+        parameters = common.get("parameters") if isinstance(common.get("parameters"), dict) else {}
+        # The verb rides in the parameters: on the add-ons runtime the `function` field
+        # holds the endpoint URL, so invokedFunction is the URL, not the action. The
+        # fallback keeps cards posted before that fix clickable.
+        action = str(parameters.get("action") or common.get("invokedFunction") or "")
+        entry = str(parameters.get("entry") or "")
         return kind, clicker, action, entry, True
 
     kind = str(chat_event.get("type") or "")
@@ -580,21 +583,23 @@ def _normalise_event(chat_event: dict[str, Any]) -> tuple[str, str, str, str, bo
 
     common = chat_event.get("common") or {}
     action_obj = chat_event.get("action") or {}
+    values: dict[str, str] = {}
+    parameters = common.get("parameters")
+    if isinstance(parameters, dict):
+        values = {str(k): str(v) for k, v in parameters.items()}
+    for item in action_obj.get("parameters") or []:
+        if isinstance(item, dict) and item.get("key") is not None:
+            values.setdefault(str(item["key"]), str(item.get("value") or ""))
+    # Parameters first for the same reason as the add-ons branch: `function` carries
+    # the endpoint URL on current cards, so it stopped naming the verb.
     action = str(
-        common.get("invokedFunction")
+        values.get("action")
+        or common.get("invokedFunction")
         or action_obj.get("actionMethodName")
         or action_obj.get("function")
         or ""
     )
-    entry = ""
-    parameters = common.get("parameters")
-    if isinstance(parameters, dict):
-        entry = str(parameters.get("entry") or "")
-    if not entry:
-        for item in action_obj.get("parameters") or []:
-            if isinstance(item, dict) and str(item.get("key")) == "entry":
-                entry = str(item.get("value") or "")
-                break
+    entry = values.get("entry", "")
     return kind, clicker, action, entry, False
 
 

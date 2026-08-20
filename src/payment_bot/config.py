@@ -537,6 +537,16 @@ class Settings(BaseSettings):
     #: project **number** of the Chat app. Callback-only; the worker never reads it.
     chat_audience: str = ""
 
+    #: The callback's own URL, stamped into every action button's ``function`` field.
+    #: Chat apps provisioned through the console run on the Workspace **add-ons**
+    #: runtime, where an Action's ``function`` is not a name but "the HTTPS endpoint if
+    #: using HTTP deployments" — with a bare name there, Google dispatches the click to
+    #: an endpoint called "reject", nothing answers, and the space shows its generic
+    #: "unable to process your request" (diagnosed live 2026-08-20 via the Chat error
+    #: log's ``deploymentFunction`` field). The verb travels in the button's parameters
+    #: instead. Blank falls back to bare action names, which only suits tests.
+    chat_action_url: str = ""
+
     #: Days a posted approval card may sit with no click before it is marked expired.
     #: Same semantics as the gate-block retry cap: expired mail sits unread, nothing
     #: retries it, and the card says a human must act.

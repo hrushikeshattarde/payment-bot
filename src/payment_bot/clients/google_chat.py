@@ -78,6 +78,32 @@ def _open_email_button(message_id: str) -> dict[str, Any]:
     }
 
 
+def _action_button(text: str, action: str, entry_id: str, action_url: str) -> dict[str, Any]:
+    """One action button, add-ons-runtime correct.
+
+    On the add-ons runtime that console-configured Chat apps run on, ``function`` must
+    be **the HTTPS endpoint to call** — a bare verb there sends the click to an
+    endpoint literally named "reject", which answers nothing, and the space shows the
+    generic red failure (learned live 2026-08-20; the Chat error log's
+    ``deploymentFunction: "reject"`` was the giveaway). So the verb rides in the
+    parameters, where the callback dispatches on it; ``action_url`` blank falls back
+    to the bare name for tests and any legacy-provisioned app.
+    """
+
+    return {
+        "text": text,
+        "onClick": {
+            "action": {
+                "function": action_url or action,
+                "parameters": [
+                    {"key": "action", "value": action},
+                    {"key": "entry", "value": entry_id},
+                ],
+            }
+        },
+    }
+
+
 def approval_card(
     *,
     entry_id: str,
@@ -91,6 +117,7 @@ def approval_card(
     interactive: bool = False,
     status: str = "",
     message_id: str = "",
+    action_url: str = "",
 ) -> dict[str, Any]:
     """The approval card, shared by the poster and the callback's in-place updates.
 
@@ -136,20 +163,10 @@ def approval_card(
 
     buttons: list[dict[str, Any]] = []
     if interactive and not status:
-        parameters = [{"key": "entry", "value": entry_id}]
         buttons = [
-            {
-                "text": "Approve & send as me",
-                "onClick": {"action": {"function": ACTION_APPROVE, "parameters": parameters}},
-            },
-            {
-                "text": "Move to my Gmail Drafts",
-                "onClick": {"action": {"function": ACTION_MOVE, "parameters": parameters}},
-            },
-            {
-                "text": "Reject",
-                "onClick": {"action": {"function": ACTION_REJECT, "parameters": parameters}},
-            },
+            _action_button("Approve & send as me", ACTION_APPROVE, entry_id, action_url),
+            _action_button("Move to my Gmail Drafts", ACTION_MOVE, entry_id, action_url),
+            _action_button("Reject", ACTION_REJECT, entry_id, action_url),
         ]
     if message_id:
         # A plain link, not an action: it opens in the clicker's Gmail without a round
@@ -256,6 +273,7 @@ class GoogleChatClient:
         *,
         reply_to: str = "",
         interactive: bool = False,
+        action_url: str = "",
         post_ledger: ChatPostLedger | None = None,
         transport: HttpTransport | None = None,
         timeout: float = 30.0,
@@ -266,6 +284,7 @@ class GoogleChatClient:
         self._space = space.strip().strip("/")
         self._reply_to = reply_to
         self._interactive = interactive
+        self._action_url = action_url.strip()
         self._ledger = post_ledger
         self._transport: HttpTransport = transport or UrllibTransport()
         self._timeout = timeout
@@ -304,6 +323,7 @@ class GoogleChatClient:
             body=draft_reply,
             interactive=self._interactive,
             message_id=correlation_id,
+            action_url=self._action_url,
         )
         name = self._post_card(
             card,
@@ -476,6 +496,7 @@ def build_google_chat_client(
         settings.chat_space,
         reply_to=settings.reply_to,
         interactive=interactive,
+        action_url=settings.chat_action_url,
         post_ledger=post_ledger,
         transport=transport,
         timeout=settings.google_timeout_seconds,

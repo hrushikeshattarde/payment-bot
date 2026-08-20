@@ -237,6 +237,27 @@ def test_normalise_reads_all_three_event_shapes() -> None:
     assert _normalise_event({}) == ("", "", "", "", False)
 
 
+def test_the_action_parameter_beats_the_function_field() -> None:
+    """Current cards put the endpoint URL in `function` (the add-ons runtime calls
+    whatever is named there), so the verb arrives as a parameter and must win over
+    invokedFunction — which is now a URL, not an action."""
+
+    event = {
+        "chat": {"user": {"email": "priya@circledelivers.com"}, "buttonClickedPayload": {}},
+        "commonEventObject": {
+            "invokedFunction": "https://xyz.lambda-url.us-east-1.on.aws/",
+            "parameters": {"action": "approve", "entry": "e9"},
+        },
+    }
+    assert _normalise_event(event) == (
+        "CARD_CLICKED",
+        "priya@circledelivers.com",
+        "approve",
+        "e9",
+        True,
+    )
+
+
 def test_addons_events_get_addons_shaped_responses() -> None:
     """Add-ons-delivered events ignore the legacy reply shape — Chat renders its
     generic failure banner instead — so the response schema must match the event's."""

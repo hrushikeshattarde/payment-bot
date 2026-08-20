@@ -47,9 +47,22 @@
   "_FactoringPrenoaReplies": "Authorise a roster-verified factor on a load showing NO factor on file — the pre-funding flow. 'false' DENIES those senders outright, which is a large share of inbound factoring mail. Both of these were missing from the template until 2026-08-15, so a deployed stack ran with them off while .env had them on.",
 
   "ReplySignature": "Circle Delivers Payments",
-  "ReplyCc": "hrushikesh.attarde@circledelivers.com",
+  "ReplyCc": "[\"hrushikesh.attarde@circledelivers.com\"]",
+  "_ReplyCc": "JSON list, never a bare address — reply_cc is a tuple setting, and a non-JSON value kills the worker at startup with SettingsError.",
   "DocumentsEmail": "freightpay@circledelivers.com",
   "PortalUrl": "",
+
+  "ApprovalMode": "drafts",
+  "_ApprovalMode": "drafts | chat (docs/CHAT_APPROVAL_PLAN.md). Keep at drafts until cutover step 4: with a ChatSpace set this is shadow mode — cards for visibility, Gmail Drafts unchanged. Flipping back to drafts is the whole rollback.",
+  "Reviewers": "[]",
+  "_Reviewers": "JSON list of Workspace addresses allowed to click Approve. Same footgun as ReplyCc. Start with one address (the operator) for cutover step 3.",
+  "ChatSpace": "",
+  "_ChatSpace": "spaces/XXXX from the Google Chat space URL. Blank = no cards, no callback function, no URL — the not-live default.",
+  "ChatAudience": "",
+  "_ChatAudience": "The Chat app's GCP project NUMBER (not id). Blank makes the callback reject everything — fail closed.",
+  "ApprovalExpiryDays": 3,
+  "ReplyTo": "",
+  "_ReplyTo": "Set to paystatus@circledelivers.com when enabling chat approval, so plain replies return to the group whoever's name the reply carried.",
 
   "Timezone": "America/New_York",
   "_Timezone": "Correctness input, not a logging detail — the gate's tense check judges dates against it. Use the zone name; TZ=EST pins UTC-5 all year and is wrong every summer.",

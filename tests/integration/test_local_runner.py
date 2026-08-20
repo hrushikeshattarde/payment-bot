@@ -229,6 +229,140 @@ def test_the_draft_reaches_slack_when_one_is_configured() -> None:
     assert gmail.drafts[0].body == PAYMENT_STATUS_DRAFT_BODY
 
 
+# --- Chat-approval mode (docs/CHAT_APPROVAL_PLAN.md) -------------------------
+class _FakeChatHttp:
+    """Chat API stand-in: succeeds with a message name, or refuses everything."""
+
+    def __init__(self, *, boom: bool = False) -> None:
+        self.boom = boom
+        self.posts: list[bytes | None] = []
+        self._counter = 0
+
+    def request(self, method: str, url: str, *, headers: Any, body: Any = None, timeout: float = 30.0) -> Any:
+        from payment_bot.clients.http import HttpResponse
+
+        if self.boom:
+            raise OSError("chat is down")
+        self.posts.append(body)
+        self._counter += 1
+        return HttpResponse(200, f'{{"name": "spaces/TEST/messages/M{self._counter}"}}'.encode())
+
+
+class _FakeChatTokens:
+    def token(self) -> str:
+        return "ya29.chat"
+
+
+def _chat_clients(gmail: Any, *, boom: bool = False, turns: int = 1) -> tuple[_Clients, Any]:
+    from payment_bot.clients.google_chat import GoogleChatClient
+
+    chat = GoogleChatClient(
+        _FakeChatTokens(),
+        "spaces/TEST",
+        reply_to="paystatus@circledelivers.com",
+        interactive=True,
+        transport=_FakeChatHttp(boom=boom),
+    )
+    return _clients(gmail, chat, turns=turns), chat
+
+
+def _chat_settings(**overrides: Any) -> Settings:
+    return _settings(
+        approval_mode="chat",
+        chat_space="spaces/TEST",
+        reviewers=("priya@circledelivers.com",),
+        reply_to="paystatus@circledelivers.com",
+        **overrides,
+    )
+
+
+@pytest.mark.integration
+def test_chat_mode_stores_a_pending_entry_instead_of_a_gmail_draft() -> None:
+    from payment_bot.approvals import InMemoryApprovalStore, entry_id_for
+
+    gmail = MockGmailClient(inbox=[sample_payment_status_email()])
+    clients, chat = _chat_clients(gmail)
+    store = InMemoryApprovalStore()
+
+    results = process_inbox(_chat_settings(), clients=clients, approval_store=store)
+
+    assert results[0].outcome is Outcome.AWAITING_REVIEW
+    assert gmail.drafts == []  # the card is the review surface now
+    assert gmail.sent == []
+
+    email_in = sample_payment_status_email()
+    entry = store.pending(entry_id_for(email_in.message_id))
+    assert entry is not None
+    assert entry.to == email_in.from_email
+    assert entry.body == PAYMENT_STATUS_DRAFT_BODY
+    assert entry.reply_to == "paystatus@circledelivers.com"
+    assert entry.chat_message == chat.posts[email_in.message_id]
+
+
+@pytest.mark.integration
+def test_chat_outage_falls_back_to_a_gmail_draft(capsys: pytest.CaptureFixture[str]) -> None:
+    """Plan §3: a chat failure degrades to today's workflow, never to silence."""
+
+    from payment_bot.approvals import InMemoryApprovalStore
+
+    gmail = MockGmailClient(inbox=[sample_payment_status_email()])
+    clients, _chat = _chat_clients(gmail, boom=True)
+    store = InMemoryApprovalStore()
+
+    results = process_inbox(_chat_settings(), clients=clients, approval_store=store)
+
+    assert results[0].outcome is Outcome.AWAITING_REVIEW
+    assert store.live_entries() == []  # no card → no entry
+    assert len(gmail.drafts) == 1  # the fallback
+    assert "falling back to a Gmail draft" in capsys.readouterr().out
+
+
+@pytest.mark.integration
+def test_a_live_pending_entry_skips_the_message_and_its_thread() -> None:
+    """The duplicate guard the draft-in-thread check can no longer provide: a message
+    (or a follow-up in its thread) with a live card must not re-run the agent loop."""
+
+    from payment_bot.approvals import InMemoryApprovalStore, PendingApproval, entry_id_for
+
+    email_in = sample_payment_status_email()
+    follow_up = email_in.model_copy(update={"message_id": "msg-follow-up"})
+    gmail = MockGmailClient(inbox=[email_in, follow_up])
+    clients, _chat = _chat_clients(gmail)
+    store = InMemoryApprovalStore()
+    store.put_pending(
+        PendingApproval(
+            entry_id=entry_id_for(email_in.message_id),
+            message_id=email_in.message_id,
+            thread_id=email_in.thread_id,
+            to=email_in.from_email,
+            cc=(),
+            reply_to="",
+            subject="Re: x",
+            body="pending",
+            load_ids=(),
+        )
+    )
+
+    results = process_inbox(_chat_settings(), clients=clients, approval_store=store)
+
+    # Both skipped: the original by message id, the follow-up by thread id.
+    assert results == []
+    assert gmail.drafts == []
+
+
+@pytest.mark.integration
+def test_without_a_store_chat_mode_keeps_drafting_to_gmail() -> None:
+    """Chat mode cannot be half-on: no store (local runs) means Gmail drafts as ever."""
+
+    gmail = MockGmailClient(inbox=[sample_payment_status_email()])
+    clients, _chat = _chat_clients(gmail)
+
+    results = process_inbox(_chat_settings(), clients=clients, approval_store=None)
+
+    assert results[0].outcome is Outcome.AWAITING_REVIEW
+    assert len(gmail.drafts) == 1
+
+
 # --- CLI --------------------------------------------------------------------
 @pytest.mark.integration
 def test_check_reports_missing_configuration(capsys: pytest.CaptureFixture[str]) -> None:

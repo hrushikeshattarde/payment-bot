@@ -30,6 +30,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from payment_bot.approvals import ApprovalStore, PendingApproval, entry_id_for
 from payment_bot.block_ledger import BlockLedger
 from payment_bot.clients import (
     GMAIL_DRAFT_SCOPES,
@@ -180,6 +181,53 @@ def _save_draft(
         return None
 
 
+def _store_pending_approval(
+    email: InboundEmail,
+    result: PipelineResult,
+    settings: Settings,
+    store: ApprovalStore,
+    chat_message: str,
+) -> bool:
+    """Persist a gate-passed reply as a pending chat approval. True when stored.
+
+    This is the chat-mode counterpart of :func:`_save_draft`, and the entry it writes
+    is the ONLY content the callback will ever send — the card's buttons carry just the
+    entry id (CHAT_APPROVAL_PLAN.md §7). False sends the caller down the Gmail-draft
+    fallback, so a store outage degrades to today's workflow.
+    """
+
+    if result.draft is None or result.outcome is not Outcome.AWAITING_REVIEW:
+        return False
+    from payment_bot.clients.mime import reply_subject
+
+    entry = PendingApproval(
+        entry_id=entry_id_for(email.message_id),
+        message_id=email.message_id,
+        thread_id=email.thread_id,
+        to=email.from_email,
+        cc=settings.reply_cc,
+        reply_to=settings.reply_to,
+        subject=reply_subject(email.subject),
+        body=result.draft.reply_body,
+        load_ids=tuple(result.draft.load_ids),
+        chat_message=chat_message,
+    )
+    try:
+        store.put_pending(entry)
+    except Exception as exc:
+        print(f"  ! could not store the pending approval: {exc}")
+        _log.warning(
+            "approval_store_failed",
+            extra={"correlation_id": email.message_id, "error": str(exc)},
+        )
+        return False
+    _log.info(
+        "approval_pending_stored",
+        extra={"correlation_id": email.message_id, "entry_id": entry.entry_id},
+    )
+    return True
+
+
 def _render(
     email: InboundEmail,
     result: PipelineResult,
@@ -239,6 +287,7 @@ def process_inbox(
     dry_run: bool = False,
     clients: _Clients | None = None,
     block_ledger: BlockLedger | None = None,
+    approval_store: ApprovalStore | None = None,
 ) -> list[PipelineResult]:
     """Fetch mail and produce a reviewable draft for each answerable message.
 
@@ -248,12 +297,37 @@ def process_inbox(
             ``settings.gate_block_retry_limit`` blocks is skipped before the agent loop —
             still unread, still a human's, just no longer re-billed every run. ``None``
             (local runs) keeps today's behaviour: every fetch is attempted.
+        approval_store: Pending chat approvals (CHAT_APPROVAL_PLAN.md). With
+            ``approval_mode=chat`` AND a store, a gate-passed reply becomes a pending
+            entry + chat card instead of a Gmail draft, and messages/threads with a
+            live entry are skipped before the agent loop — the duplicate guard that
+            the draft-in-thread check can no longer provide once drafts stop living in
+            the reading mailbox. ``None`` (local runs) keeps drafts in Gmail whatever
+            the mode says, so chat mode cannot be half-on locally.
     """
 
     # Force draft-only rather than trusting configuration: a local run must never send,
     # whatever PAYBOT_DRAFT_ONLY or PAYBOT_ROLLOUT_PHASE happen to say.
     resolved = (settings or get_settings()).model_copy(update={"draft_only": True})
     clients = clients or _build_clients(resolved, dry_run=dry_run)
+    chat_mode = resolved.chat_approval_on and approval_store is not None
+
+    # One read per run: the live pending set is small (bounded by the cards humans have
+    # not clicked yet) and consulting S3 per email would be per-email latency for no
+    # per-email information.
+    pending_messages: set[str] = set()
+    pending_threads: set[str] = set()
+    if chat_mode and approval_store is not None:  # the second test is for the type-checker
+        try:
+            for entry in approval_store.live_entries():
+                pending_messages.add(entry.message_id)
+                if entry.thread_id:
+                    pending_threads.add(entry.thread_id)
+        except Exception as exc:
+            # An unreadable store degrades to "no memory" like the ledgers do: the cost
+            # is a possible duplicate card, and the callback's claim still prevents any
+            # double send. Failing the run would stop every draft over bookkeeping.
+            _log.warning("approval_store_unreadable", extra={"error": str(exc)})
 
     emails = clients.gmail.fetch_new()
     if limit is not None:
@@ -269,6 +343,17 @@ def process_inbox(
     results: list[PipelineResult] = []
 
     for email in emails:
+        if chat_mode and (
+            email.message_id in pending_messages or email.thread_id in pending_threads
+        ):
+            # A live card already covers this conversation — a follow-up in the same
+            # thread included. Re-drafting would post a second card for one reply.
+            _log.info(
+                "approval_already_pending",
+                extra={"correlation_id": email.message_id, "thread_id": email.thread_id},
+            )
+            print(f"  skipped  : {email.subject!r} — approval card already pending in chat")
+            continue
         if block_ledger is not None and block_ledger.exhausted(
             email.message_id, resolved.gate_block_retry_limit
         ):
@@ -314,7 +399,26 @@ def process_inbox(
                 )
         print(_render(email, result, audit, resolved))
 
-        draft = None if dry_run else _save_draft(clients, email, result, resolved)
+        stored_in_chat = False
+        if chat_mode and not dry_run and result.outcome is Outcome.AWAITING_REVIEW:
+            # The card must exist before the entry matters: a reply nobody can see has
+            # no review surface. A failed post (`failed` below) or a failed store write
+            # falls through to the Gmail draft, so a chat outage degrades to today's
+            # workflow (CHAT_APPROVAL_PLAN.md §3), never to silence.
+            # Only a captured message name proves a card exists. This also covers the
+            # client having silently been a NullSlackClient (chat misconfigured): no
+            # posts attribute, no name, no entry — the reply stays a Gmail draft.
+            posted = getattr(clients.slack, "posts", {}).get(result.correlation_id, "")
+            if posted and approval_store is not None:  # second test for the type-checker
+                stored_in_chat = _store_pending_approval(
+                    email, result, resolved, approval_store, posted
+                )
+            if stored_in_chat:
+                print("  saved to : chat approval card (Approve there sends as the clicker)")
+            else:
+                print("  ! chat approval unavailable — falling back to a Gmail draft")
+
+        draft = None if dry_run or stored_in_chat else _save_draft(clients, email, result, resolved)
         if draft is not None:
             print(f"  saved to : {draft.folder}  (open Gmail → Drafts, review, then Send)")
         elif dry_run and result.outcome is Outcome.AWAITING_REVIEW:

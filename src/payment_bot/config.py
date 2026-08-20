@@ -508,6 +508,52 @@ class Settings(BaseSettings):
     slack_approval_channel: str = "#payments-approvals"
     slack_security_channel: str = "#payments-security"
 
+    # --- Chat approval (docs/CHAT_APPROVAL_PLAN.md) ---------------------------
+    #: Where a gate-passing reply waits for its human.
+    #:
+    #: ``drafts`` (default) is today's behaviour: the reply is saved to the reading
+    #: mailbox's Gmail Drafts. ``chat`` posts it as a Google Chat card instead and the
+    #: reply goes out **from whoever clicks Approve** — the send happens in the separate
+    #: callback Lambda, never here. Anything that is not exactly ``chat`` behaves as
+    #: ``drafts``, so a typo fails toward the established flow rather than toward a
+    #: card nobody's callback is wired to.
+    approval_mode: str = "drafts"
+
+    #: The people allowed to act on approval cards, by Workspace address. JSON list like
+    #: ``reply_cc`` — never a bare address — and the same footgun applies: a non-JSON
+    #: value kills startup with SettingsError. Empty means nobody can approve, which
+    #: makes ``approval_mode=chat`` post cards that only reject clicks; deliberate, so
+    #: an unconfigured roster cannot silently authorise anyone.
+    reviewers: tuple[str, ...] = ()
+
+    #: Google Chat space to post cards into (``spaces/XXXX``). Blank posts nothing —
+    #: with ``approval_mode=drafts`` and a space set, cards post WITHOUT buttons: the
+    #: shadow mode of CHAT_APPROVAL_PLAN.md §10 step 2, visibility with zero behaviour
+    #: change. Every processed email lands here: gate-passing drafts as approval cards,
+    #: escalations and gate blocks as informational cards carrying the short reason.
+    chat_space: str = ""
+
+    #: Audience the callback verifies Google Chat's bearer token against — the GCP
+    #: project **number** of the Chat app. Callback-only; the worker never reads it.
+    chat_audience: str = ""
+
+    #: Days a posted approval card may sit with no click before it is marked expired.
+    #: Same semantics as the gate-block retry cap: expired mail sits unread, nothing
+    #: retries it, and the card says a human must act.
+    approval_expiry_days: int = Field(default=3, ge=1, le=30)
+
+    #: ``Reply-To`` header on every draft and callback send. Set it to the group
+    #: address so a carrier's plain Reply returns to the monitored mailbox rather than
+    #: to the individual whose name the reply went out under. Blank omits the header,
+    #: which is exactly today's behaviour.
+    reply_to: str = ""
+
+    @property
+    def chat_approval_on(self) -> bool:
+        """True when replies wait in chat cards instead of Gmail Drafts."""
+
+        return self.approval_mode.strip().lower() == "chat" and bool(self.chat_space.strip())
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

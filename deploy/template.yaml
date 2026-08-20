@@ -114,6 +114,56 @@ Parameters:
       JSON list of addresses, e.g. ["a@x.com"] — never a bare address. reply_cc is a
       tuple setting, so pydantic-settings json-parses the env var; anything that is not
       valid JSON (including empty string) kills the worker at startup with SettingsError.
+  ReplyTo:
+    Type: String
+    Default: ""
+    Description: >
+      Reply-To header on every draft and chat-approved send. Set it to the group address
+      so a carrier's plain Reply returns to the monitored mailbox rather than to the
+      individual whose name the reply went out under. Blank omits the header (today's
+      behaviour).
+
+  # ---- Chat approval (docs/CHAT_APPROVAL_PLAN.md). All default OFF: a deploy with ----
+  # ---- these untouched is behaviourally identical to the stack before they existed. --
+  ApprovalMode:
+    Type: String
+    Default: drafts
+    AllowedValues: [drafts, chat]
+    Description: >
+      Where a gate-passing reply waits for its human. `drafts` (default) saves it to the
+      reading mailbox's Gmail Drafts — today's behaviour. `chat` posts it as a Google
+      Chat card whose Approve button sends AS THE CLICKER via the callback function.
+      The rollback for the whole chat flow is flipping this back to drafts.
+  Reviewers:
+    Type: String
+    Default: "[]"
+    Description: >
+      JSON list of the Workspace addresses allowed to act on approval cards — same
+      JSON-list footgun as ReplyCc. Empty means no click can send anything.
+  ChatSpace:
+    Type: String
+    Default: ""
+    Description: >
+      Google Chat space (spaces/XXXX) for the cards. Blank posts nothing anywhere and
+      skips creating the callback function entirely. Set with ApprovalMode=drafts, this
+      is shadow mode: every draft, escalation and gate block appears as a card (with the
+      short reason for the latter two), buttons absent, Gmail Drafts unchanged.
+  ChatAudience:
+    Type: String
+    Default: ""
+    Description: >
+      GCP project NUMBER of the Chat app — the audience the callback verifies Google's
+      bearer token against. Blank makes the callback reject every request (fail closed),
+      so a half-configured deploy is inert rather than open.
+  ApprovalExpiryDays:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 30
+    Description: >
+      Days an approval card may sit unclicked before the sweep marks it expired and the
+      card says a human must reply from the group mailbox. Chat-flow sibling of the
+      gate-block retry cap: expired mail sits unread and nothing retries it.
   DocumentsEmail:
     Type: String
     Default: freightpay@circledelivers.com
@@ -221,6 +271,9 @@ Parameters:
     Description: Subscribed to the alarm topic. Blank creates the topic with no subscriber.
 
 Conditions:
+  # The callback exists only when a space is configured — a default deploy carries no
+  # public URL at all, which is what "not live" means at the infrastructure level.
+  HasChatSpace: !Not [!Equals [!Ref ChatSpace, ""]]
   HasRoster: !Not [!Equals [!Ref RosterBucket, ""]]
   # Both must be set: the bucket alone cannot be fetched from, and a key with no bucket has
   # nowhere to come from. Keeps the grant absent rather than malformed when only one is given.
@@ -291,14 +344,30 @@ Resources:
                   Action: s3:GetObject
                   Resource: !Sub "arn:aws:s3:::${RosterBucket}/${RosterKey}"
                 - !Ref AWS::NoValue
-              # The gate-block retry ledger — the worker's own bookkeeping, so this is the
-              # one prefix it may WRITE. Scoped to state/* so it can never touch the
-              # operator-owned rosters above.
+              # The gate-block retry ledger and the pending chat approvals — the worker's
+              # own bookkeeping, so this is the one prefix it may WRITE. Scoped to state/*
+              # so it can never touch the operator-owned rosters above. Delete exists for
+              # the approval sweep's pruning of terminal entries, nothing else.
               - !If
                 - HasRoster
                 - Effect: Allow
-                  Action: [s3:GetObject, s3:PutObject]
+                  Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
                   Resource: !Sub "arn:aws:s3:::${RosterBucket}/state/*"
+                - !Ref AWS::NoValue
+              # Listing is a bucket-level action, so it is granted separately and pinned
+              # to the state prefix — the worker can enumerate its own bookkeeping and
+              # nothing else in the bucket. state/*, not state/approvals/*: without list
+              # permission S3 masks a missing object as AccessDenied instead of NoSuchKey,
+              # so the ledgers at state/ (gate blocks, chat posts) logged a permissions
+              # warning on every run until their first write. Observed live 2026-08-19.
+              - !If
+                - HasRoster
+                - Effect: Allow
+                  Action: s3:ListBucket
+                  Resource: !Sub "arn:aws:s3:::${RosterBucket}"
+                  Condition:
+                    StringLike:
+                      s3:prefix: "state/*"
                 - !Ref AWS::NoValue
               # Scoped to the one key, like the roster above — not the bucket. Both objects
               # are authorization data; read-only, and nothing else in that bucket is ours.
@@ -394,8 +463,14 @@ Resources:
 
           PAYBOT_REPLY_SIGNATURE: !Ref ReplySignature
           PAYBOT_REPLY_CC: !Ref ReplyCc
+          PAYBOT_REPLY_TO: !Ref ReplyTo
           PAYBOT_DOCUMENTS_EMAIL: !Ref DocumentsEmail
           PAYBOT_PORTAL_URL: !Ref PortalUrl
+
+          PAYBOT_APPROVAL_MODE: !Ref ApprovalMode
+          PAYBOT_REVIEWERS: !Ref Reviewers
+          PAYBOT_CHAT_SPACE: !Ref ChatSpace
+          PAYBOT_APPROVAL_EXPIRY_DAYS: !Ref ApprovalExpiryDays
 
   Schedule:
     Type: AWS::Events::Rule
@@ -415,6 +490,103 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt Schedule.Arn
+
+  # -------------------------------------------------------------------------
+  # Chat-approval callback (docs/CHAT_APPROVAL_PLAN.md §3) — created only when a
+  # ChatSpace is configured. Its own role on purpose: sending capability lives in
+  # exactly one deployable, which is what the Stage-2 split was for. No Bedrock, no
+  # rosters, no Transport Pro — the Google SA secret and the approvals state, that's it.
+  # -------------------------------------------------------------------------
+  CallbackRole:
+    Type: AWS::IAM::Role
+    Condition: HasChatSpace
+    Properties:
+      RoleName: !Sub "paybot-chat-callback-${StackEnv}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: paybot-chat-callback
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GoogleServiceAccountSecret
+              # Narrower than the worker: the approvals prefix only, never the ledgers
+              # or the rosters. Delete is the claim-release path on a failed send.
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "arn:aws:s3:::${RosterBucket}/state/approvals/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${RosterBucket}"
+                Condition:
+                  StringLike:
+                    s3:prefix: "state/approvals/*"
+
+  CallbackLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasChatSpace
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/paybot-chat-callback-${StackEnv}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  CallbackFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasChatSpace
+    DependsOn: CallbackLogGroup
+    Properties:
+      FunctionName: !Sub "paybot-chat-callback-${StackEnv}"
+      Description: >
+        Google Chat button clicks: verify the token, claim the entry, send AS THE
+        CLICKER. The one function in this system that sends email.
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Handler: payment_bot.chat_callback.handler
+      Role: !GetAtt CallbackRole.Arn
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+      # Chat allows 30 s for a synchronous reply; cold start + one Gmail send fits with
+      # room. 512 MB because the callback imports no model stack.
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          TZ: !Ref Timezone
+          PAYBOT_ENV: !Ref StackEnv
+          PAYBOT_LOG_LEVEL: INFO
+          PAYBOT_SECRET_GOOGLE_SA: !Ref GoogleServiceAccountSecret
+          PAYBOT_ROSTER_BUCKET: !Ref RosterBucket
+          PAYBOT_REVIEWERS: !Ref Reviewers
+          PAYBOT_CHAT_AUDIENCE: !Ref ChatAudience
+          PAYBOT_REPLY_TO: !Ref ReplyTo
+
+  # Function URL, not API Gateway: free, and the CHAT_APPROVAL_PLAN.md §8 cost case
+  # depends on it. AuthType NONE is required — Google Chat cannot sign SigV4 — so the
+  # bearer-token verification inside the handler IS the perimeter, and with no
+  # ChatAudience configured the handler rejects everything (fail closed).
+  CallbackUrl:
+    Type: AWS::Lambda::Url
+    Condition: HasChatSpace
+    Properties:
+      TargetFunctionArn: !GetAtt CallbackFunction.Arn
+      AuthType: NONE
+
+  CallbackUrlPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasChatSpace
+    Properties:
+      FunctionName: !GetAtt CallbackFunction.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
 
   # -------------------------------------------------------------------------
   # Observability (§3.5). The JSON log lines are already machine-parseable, so
@@ -596,6 +768,12 @@ Resources:
       AlarmActions: [!Ref AlarmTopic]
 
 Outputs:
+  ChatCallbackUrl:
+    Condition: HasChatSpace
+    Description: >
+      Paste into the Chat app's "HTTP endpoint URL" in the GCP console
+      (Chat API → Configuration). Until that manual step, nothing calls it.
+    Value: !GetAtt CallbackUrl.FunctionUrl
   FunctionName:
     Value: !Ref WorkerFunction
   LogGroup:

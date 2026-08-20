@@ -90,6 +90,7 @@ class GmailApiClient:
         timeout: float = 30.0,
         group_address: str = "",
         group_members: tuple[str, ...] = (),
+        reply_to: str = "",
     ) -> None:
         self._tokens = token_source
         self._user = user or token_source.subject
@@ -98,6 +99,9 @@ class GmailApiClient:
         self._mark_read = mark_read
         self._transport: HttpTransport = transport or UrllibTransport()
         self._timeout = timeout
+        #: Reply-To on every draft this client writes — the group address, so a plain
+        #: Reply returns to the monitored mailbox whoever's name the reply carries.
+        self._reply_to = reply_to.strip()
         #: Members of the monitored group whose addresses are NOT on our own domain. The
         #: domain rule already covers colleagues; this exists for a member who sits outside
         #: it. Lowercased once here so `_is_ours` is a plain set lookup.
@@ -309,6 +313,7 @@ class GmailApiClient:
             from_address=self._user,
             cc=cc,
             subject=subject,
+            reply_to=self._reply_to,
         )
         payload: dict[str, Any] = {
             "message": {"raw": base64.urlsafe_b64encode(mime.as_bytes()).decode("ascii")}
@@ -559,4 +564,5 @@ def build_gmail_api_client(
         # The group whose From-rewritten mail must not read as "ours" (DMARC senders).
         group_address=resolved.mailbox,
         group_members=resolved.gmail_group_members,
+        reply_to=resolved.reply_to,
     )

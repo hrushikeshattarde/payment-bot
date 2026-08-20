@@ -130,6 +130,41 @@ identifiers stay in the gitignored `deploy/params.prod.json`.
 - [ ] After one clean week: delete the task, then **rotate** the Transport Pro password
       and the Google key, retiring the plaintext `.env` copies on the workstation.
 
+## Phase 9 — Chat approval (optional; docs/CHAT_APPROVAL_PLAN.md §10)
+
+Every switch ships OFF — skip this phase entirely and nothing chat-related exists in
+the stack. Do the steps in this order; each is independently deployable and the one
+before it is its rollback.
+
+- [ ] **Google side (once):** create the Chat space with the three reviewers; in the
+      GCP project of the service-account key (`gsheets-python-350615`): enable the
+      **Google Chat API**, configure the app (name, avatar, "Receive 1:1 messages" off,
+      "Join spaces" on), and add the app to the space. Note the **project number** —
+      it is the `ChatAudience`.
+- [ ] **Shadow cards:** set `ChatSpace` (spaces/XXXX from the space URL), keep
+      `ApprovalMode: "drafts"`; redeploy with `-SkipBuild`. Cards for every draft,
+      escalation and gate block appear (no buttons); Gmail Drafts unchanged. Watch a
+      few days: formatting, dedup (no reposted escalations), card volume.
+- [ ] **Callback wiring:** the stack output `ChatCallbackUrl` exists once `ChatSpace`
+      is set — paste it into the Chat app's *HTTP endpoint URL*, and set
+      `ChatAudience` to the project number. Until both halves are done the callback
+      rejects everything (fail closed).
+- [ ] **Roster of one:** `Reviewers: "[\"<operator>@circledelivers.com\"]"`,
+      `ApprovalMode: "chat"`, `ReplyTo: "paystatus@circledelivers.com"`; redeploy.
+      Approve one real card: the send leaves **from the operator's address**, Cc/
+      Reply-To to the group, threads at the carrier's end, the card updates in place,
+      a second click reports who already handled it.
+- [ ] **Precondition for three reviewers: the workstation task is parked** (Phase 8) —
+      it writes reading-mailbox drafts nobody is watching in chat mode.
+- [ ] **All three:** extend `Reviewers`, walk the reviewers through one card each —
+      they are lending their names to sends. Watch `approval_sent` / `approval_expired`
+      lines for a week.
+- [ ] **Rollback at any point:** `ApprovalMode: "drafts"` → redeploy. Pending entries
+      expire on their own; cards stay as history; drafts resume in the reading mailbox.
+- [ ] **Reviewer joins/leaves:** edit `Reviewers` → redeploy with `-SkipBuild`. A
+      leaver's pending cards are claimable by the others already (any reviewer can act
+      on any card); nothing to migrate.
+
 ---
 
 ## Routine operations

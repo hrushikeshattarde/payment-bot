@@ -78,3 +78,6 @@ docs/ESCALATIONS.md
 # Settlements exports (factor remit emails) — internal data, repo is public.
 data-*.csv
 logs/
+# `aws lambda invoke ... response.json` output from the smoke-test step — run summaries
+# carry outcome counts only, but they are debris, not source.
+response.json

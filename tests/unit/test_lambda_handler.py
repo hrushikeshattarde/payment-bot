@@ -284,7 +284,7 @@ def test_the_handler_summarises_outcomes_and_honours_a_limit(
 
     calls: dict[str, Any] = {}
 
-    def fake_process_inbox(settings: Any, *, limit: int | None = None, clients: Any = None, block_ledger: Any = None):
+    def fake_process_inbox(settings: Any, *, limit: int | None = None, **kwargs: Any):
         calls["limit"] = limit
         return [
             PipelineResult(Outcome.AWAITING_REVIEW, "drafted", "c1"),
@@ -293,7 +293,7 @@ def test_the_handler_summarises_outcomes_and_honours_a_limit(
         ]
 
     monkeypatch.setattr(lambda_handler, "process_inbox", fake_process_inbox)
-    monkeypatch.setattr(lambda_handler, "build_clients", lambda settings: None)
+    monkeypatch.setattr(lambda_handler, "build_clients", lambda settings, **kwargs: None)
     monkeypatch.setattr(lambda_handler, "_SETTINGS", get_settings())
 
     summary = lambda_handler.handler({"limit": 1}, None)
@@ -313,12 +313,12 @@ def test_the_handler_falls_back_to_the_configured_fetch_limit(
 
     calls: dict[str, Any] = {}
 
-    def fake_process_inbox(settings: Any, *, limit: int | None = None, clients: Any = None, block_ledger: Any = None):
+    def fake_process_inbox(settings: Any, *, limit: int | None = None, **kwargs: Any):
         calls["limit"] = limit
         return []
 
     monkeypatch.setattr(lambda_handler, "process_inbox", fake_process_inbox)
-    monkeypatch.setattr(lambda_handler, "build_clients", lambda settings: None)
+    monkeypatch.setattr(lambda_handler, "build_clients", lambda settings, **kwargs: None)
     settings = get_settings()
     monkeypatch.setattr(lambda_handler, "_SETTINGS", settings)
 

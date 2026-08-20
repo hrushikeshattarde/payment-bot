@@ -56,6 +56,13 @@ GMAIL_DRAFT_SCOPES: tuple[str, ...] = (SCOPE_GMAIL_READONLY, SCOPE_GMAIL_COMPOSE
 #: Read-only: genuinely incapable of sending or drafting. Use when you only want intake.
 GMAIL_READONLY_SCOPES: tuple[str, ...] = (SCOPE_GMAIL_READONLY,)
 
+#: Post and update messages in Google Chat spaces the app has been added to. This is
+#: **app auth**, not delegation: the service account acts as the Chat app itself, no
+#: ``sub`` claim, no Admin-console grant — the Chat API just has to be enabled in the
+#: key's project and the app configured/installed in the space.
+SCOPE_CHAT_BOT = "https://www.googleapis.com/auth/chat.bot"
+CHAT_APP_SCOPES: tuple[str, ...] = (SCOPE_CHAT_BOT,)
+
 _TOKEN_LIFETIME_SECONDS = 3600
 #: Refresh a little early so a long run never presents an expired token.
 _EXPIRY_SKEW_SECONDS = 120
@@ -121,6 +128,11 @@ class ServiceAccountTokenSource:
         transport: Injectable HTTP seam.
         timeout: Per-request timeout.
         clock: Injectable time source, so token-expiry logic is testable.
+        app_auth: Act as the service account itself — no ``sub`` claim, no delegation.
+            The only sanctioned use is the Chat API (:data:`CHAT_APP_SCOPES`), where the
+            account IS the identity. Mutually exclusive with ``subject``: a call that
+            supplies both has confused two auth models and must fail loudly rather than
+            silently pick one.
     """
 
     def __init__(
@@ -132,8 +144,11 @@ class ServiceAccountTokenSource:
         transport: HttpTransport | None = None,
         timeout: float = 30.0,
         clock: Any = time.time,
+        app_auth: bool = False,
     ) -> None:
-        if not subject:
+        if app_auth and subject:
+            raise ClientError("app_auth acts as the service account itself; drop the subject")
+        if not subject and not app_auth:
             raise ClientError("an impersonation subject is required for domain-wide delegation")
         if not scopes:
             raise ClientError("at least one scope is required")
@@ -229,9 +244,11 @@ class ServiceAccountTokenSource:
             "aud": self._token_uri,
             "iat": issued_at,
             "exp": issued_at + _TOKEN_LIFETIME_SECONDS,
-            # `sub` is what turns this into domain-wide delegation: act as this user.
-            "sub": self._subject,
         }
+        if self._subject:
+            # `sub` is what turns this into domain-wide delegation: act as this user.
+            # Absent (app auth), the token is the service account's own identity.
+            payload["sub"] = self._subject
         try:
             # google-auth ships no type information, hence the narrow ignores.
             signer = RSASigner.from_service_account_info(self._info)  # type: ignore[no-untyped-call]

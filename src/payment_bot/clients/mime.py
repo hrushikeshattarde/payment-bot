@@ -307,11 +307,14 @@ def build_reply(
     from_address: str,
     cc: tuple[str, ...] = (),
     subject: str | None = None,
+    reply_to: str = "",
 ) -> MimeMessage:
     """Build the reply message that becomes a draft.
 
     ``In-Reply-To`` / ``References`` are set so Gmail threads the draft under the carrier's
-    original message instead of starting a new conversation.
+    original message instead of starting a new conversation. ``reply_to`` points a plain
+    Reply back at the group mailbox when the From is an individual (chat-approval sends,
+    CHAT_APPROVAL_PLAN.md §1); blank omits the header.
     """
 
     mime = MimeMessage()
@@ -319,6 +322,8 @@ def build_reply(
     mime["To"] = source.from_email
     if cc:
         mime["Cc"] = ", ".join(cc)
+    if reply_to:
+        mime["Reply-To"] = reply_to
     mime["Subject"] = subject or reply_subject(source.subject)
     mime["Date"] = formatdate(localtime=True)
     if source.message_id:

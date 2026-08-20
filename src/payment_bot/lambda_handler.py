@@ -30,6 +30,7 @@ import os
 from collections.abc import MutableMapping
 from typing import Any
 
+from payment_bot.approvals import ChatPostLedger, S3ApprovalStore
 from payment_bot.block_ledger import BlockLedger
 from payment_bot.clients import (
     CargoTelClient,
@@ -39,6 +40,11 @@ from payment_bot.clients import (
     build_cargotel_client,
     build_gmail_api_client,
     build_transport_pro_client,
+)
+from payment_bot.clients.google_chat import (
+    GoogleChatClient,
+    approval_card,
+    build_google_chat_client,
 )
 from payment_bot.config import Settings, get_settings
 from payment_bot.local_runner import _Clients, process_inbox
@@ -59,6 +65,11 @@ CONTACTS_PATH = "/tmp/carrier_contacts.json"
 #: Deliberately under ``state/`` so a human browsing the bucket can tell operator-owned
 #: config from bot-owned bookkeeping at a glance.
 BLOCK_LEDGER_KEY = "state/gate_block_ledger.json"
+
+#: Which chat cards have been posted, per kind+message id — the escalation/block cards
+#: have no pending entry to dedup on and re-run every poll by design. Same bucket, same
+#: ``state/*`` reasoning as the block ledger above.
+CHAT_POST_LEDGER_KEY = "state/chat_post_ledger.json"
 
 #: Secret ARN/name in the environment → the ``PAYBOT_*`` variable its value becomes.
 #:
@@ -221,6 +232,44 @@ def save_block_ledger(ledger: BlockLedger, bucket: str | None) -> None:
         _log.warning("block_ledger_save_failed", extra={"error": str(exc)})
 
 
+def load_chat_post_ledger(env: dict[str, str] | None = None) -> tuple[ChatPostLedger, str | None]:
+    """Read the chat-post dedup ledger; same degrade-to-empty contract as the block ledger.
+
+    Losing it costs a duplicate card in the space, which a human sees and ignores;
+    failing the run over it would stop every draft.
+    """
+
+    environ = os.environ if env is None else env
+    bucket = environ.get("PAYBOT_ROSTER_BUCKET", "").strip()
+    if not bucket:
+        return ChatPostLedger(), None
+    client = _boto3().client("s3")
+    try:
+        raw = client.get_object(Bucket=bucket, Key=CHAT_POST_LEDGER_KEY)["Body"].read()
+        return ChatPostLedger.from_json(raw.decode("utf-8")), bucket
+    except client.exceptions.NoSuchKey:
+        return ChatPostLedger(), bucket
+    except Exception as exc:
+        _log.warning("chat_post_ledger_load_failed", extra={"error": str(exc)})
+        return ChatPostLedger(), bucket
+
+
+def save_chat_post_ledger(ledger: ChatPostLedger, bucket: str | None) -> None:
+    """Write the chat-post ledger back when anything changed. Logged, never raised."""
+
+    if not bucket or not ledger.dirty:
+        return
+    try:
+        _boto3().client("s3").put_object(
+            Bucket=bucket,
+            Key=CHAT_POST_LEDGER_KEY,
+            Body=ledger.to_json().encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:
+        _log.warning("chat_post_ledger_save_failed", extra={"error": str(exc)})
+
+
 def bootstrap() -> Settings:
     """Cold-start work: logging, secrets, roster — then a settings object built on top."""
 
@@ -248,16 +297,33 @@ def bootstrap() -> Settings:
     return settings
 
 
-def build_clients(settings: Settings) -> _Clients:
-    """The deployed client set: Bedrock for the model, no Slack until Stage 2.
+def build_clients(
+    settings: Settings, chat_post_ledger: ChatPostLedger | None = None
+) -> _Clients:
+    """The deployed client set: Bedrock for the model; Google Chat when a space is set.
 
     ``tp_factory`` and ``cargotel_factory`` are per-email by contract — each client caches
     for its lifetime, so one per email is what keeps a single email's reads to one
     consistent snapshot. Reusing one across a batch would let a load change underneath a
     run that had already quoted it.
+
+    The chat client is *interactive* (buttons on cards) only in ``approval_mode=chat``;
+    a space with ``approval_mode=drafts`` is shadow mode — cards for visibility, Gmail
+    Drafts unchanged (CHAT_APPROVAL_PLAN.md §10 step 2).
     """
 
     slack: SlackClient = NullSlackClient()
+    if settings.chat_space.strip():
+        try:
+            slack = build_google_chat_client(
+                settings,
+                interactive=settings.chat_approval_on,
+                post_ledger=chat_post_ledger,
+            )
+        except Exception as exc:
+            # A misconfigured chat client must not stop the mail run: drafts still land
+            # in Gmail via the runner's fallback, and this line is the signal to fix it.
+            _log.warning("chat_client_unavailable", extra={"error": str(exc)})
 
     def cargotel_factory() -> CargoTelClient | None:
         if not (settings.cargotel_replies and settings.cargotel_configured):
@@ -271,6 +337,54 @@ def build_clients(settings: Settings) -> _Clients:
         llm=build_bedrock_client(settings),
         cargotel_factory=cargotel_factory,
     )
+
+
+def _sweep_approvals(
+    store: S3ApprovalStore, slack: SlackClient, settings: Settings
+) -> None:
+    """Expire cards nobody clicked; runs inside the invocation, never its own schedule.
+
+    An expired entry is the chat flow's ``gate_block_retries_exhausted``: the mail sits
+    unread, nothing will retry it, and the updated card says a human must act
+    (CHAT_APPROVAL_PLAN.md §5). Failure here is logged and swallowed — the sweep is
+    bookkeeping and the mail run's results already stand.
+    """
+
+    try:
+        expired = store.sweep(expiry_days=settings.approval_expiry_days)
+    except Exception as exc:
+        _log.warning("approval_sweep_failed", extra={"error": str(exc)})
+        return
+    if not expired:
+        return
+    chat = slack if isinstance(slack, GoogleChatClient) else None
+    for entry in expired:
+        _log.warning(
+            "approval_expired",
+            extra={
+                "correlation_id": entry.message_id,
+                "entry_id": entry.entry_id,
+                "age_days": settings.approval_expiry_days,
+            },
+        )
+        if chat is not None and entry.chat_message:
+            chat.update_status(
+                entry.chat_message,
+                approval_card(
+                    entry_id=entry.entry_id,
+                    from_email=entry.to,
+                    load_ids=entry.load_ids,
+                    to=entry.to,
+                    cc=entry.cc,
+                    reply_to=entry.reply_to,
+                    subject=entry.subject,
+                    body=entry.body,
+                    status=(
+                        f"EXPIRED — no action for {settings.approval_expiry_days} days. "
+                        "The mail sits unread; a human must reply from the group mailbox."
+                    ),
+                ),
+            )
 
 
 #: Resolved once per container. A cold-start failure must surface as an invocation error —
@@ -306,17 +420,37 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
         limit = settings.gmail_fetch_limit
 
     ledger, ledger_bucket = load_block_ledger()
+    chat_ledger, chat_ledger_bucket = (
+        load_chat_post_ledger() if settings.chat_space.strip() else (ChatPostLedger(), None)
+    )
+    clients = build_clients(settings, chat_post_ledger=chat_ledger)
+
+    # Chat approval needs somewhere for pending entries to live; without the bucket the
+    # mode cannot be honoured, so it degrades loudly to Gmail drafts rather than posting
+    # buttons whose clicks would find nothing to send.
+    approval_store: S3ApprovalStore | None = None
+    if settings.chat_approval_on:
+        bucket = os.environ.get("PAYBOT_ROSTER_BUCKET", "").strip()
+        if bucket:
+            approval_store = S3ApprovalStore(bucket)
+        else:
+            _log.warning("chat_approval_without_bucket_falling_back_to_drafts")
+
     try:
         results: list[PipelineResult] = process_inbox(
             settings,
             limit=limit,
-            clients=build_clients(settings),
+            clients=clients,
             block_ledger=ledger,
+            approval_store=approval_store,
         )
+        if approval_store is not None:
+            _sweep_approvals(approval_store, clients.slack, settings)
     finally:
         # Saved even when the run raises or is cut off mid-batch: blocks recorded before
         # the interruption must count, or a timeout-looping run never spends its budget.
         save_block_ledger(ledger, ledger_bucket)
+        save_chat_post_ledger(chat_ledger, chat_ledger_bucket)
 
     counts: dict[str, int] = {}
     for result in results:

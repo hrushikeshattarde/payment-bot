@@ -16,7 +16,7 @@ import pytest
 
 from payment_bot import chat_callback
 from payment_bot.approvals import InMemoryApprovalStore, PendingApproval, entry_id_for
-from payment_bot.chat_callback import _act, _clicked, handler
+from payment_bot.chat_callback import _act, _normalise_event, handler
 from payment_bot.config import Settings
 
 REVIEWERS = ("priya@circledelivers.com", "sam@circledelivers.com")
@@ -198,16 +198,69 @@ def test_missing_entry_is_a_message_not_a_crash() -> None:
 
 
 # --- event parsing ---------------------------------------------------------------------
-def test_clicked_reads_both_chat_event_shapes() -> None:
-    modern = {
+def test_normalise_reads_all_three_event_shapes() -> None:
+    """Legacy events in both button styles, and the add-ons schema that has no `type`
+    at all — the shape the first live click actually arrived in."""
+
+    legacy_common = {
+        "type": "CARD_CLICKED",
+        "user": {"email": "P@X.com"},
         "common": {"invokedFunction": "approve", "parameters": {"entry": "e1"}},
     }
-    classic = {
+    legacy_action = {
+        "type": "CARD_CLICKED",
+        "user": {"email": "p@x.com"},
         "action": {"actionMethodName": "reject", "parameters": [{"key": "entry", "value": "e2"}]},
     }
-    assert _clicked(modern) == ("approve", "e1")
-    assert _clicked(classic) == ("reject", "e2")
-    assert _clicked({}) == ("", "")
+    addons_click = {
+        "chat": {"user": {"email": "Priya@circledelivers.com"}, "buttonClickedPayload": {}},
+        "commonEventObject": {
+            "invokedFunction": "move_to_drafts",
+            "parameters": {"entry": "e3"},
+        },
+    }
+    addons_message = {
+        "chat": {"user": {"email": "p@x.com"}, "messagePayload": {}},
+        "commonEventObject": {},
+    }
+
+    assert _normalise_event(legacy_common) == ("CARD_CLICKED", "p@x.com", "approve", "e1", False)
+    assert _normalise_event(legacy_action) == ("CARD_CLICKED", "p@x.com", "reject", "e2", False)
+    assert _normalise_event(addons_click) == (
+        "CARD_CLICKED",
+        "priya@circledelivers.com",
+        "move_to_drafts",
+        "e3",
+        True,
+    )
+    assert _normalise_event(addons_message)[0] == "MESSAGE"
+    assert _normalise_event({}) == ("", "", "", "", False)
+
+
+def test_addons_events_get_addons_shaped_responses() -> None:
+    """Add-ons-delivered events ignore the legacy reply shape — Chat renders its
+    generic failure banner instead — so the response schema must match the event's."""
+
+    store, entry = _store_with_entry()
+    response = _act(
+        _settings(), store, entry.entry_id, "approve", "priya@circledelivers.com",
+        gmail_factory=lambda clicker: FakeGmail(clicker), addons=True,
+    )
+    body = json.loads(response["body"])
+    update = body["hostAppDataAction"]["chatDataAction"]["updateMessageAction"]
+    assert "Sent by priya@circledelivers.com" in json.dumps(update["message"]["cardsV2"])
+    assert "actionResponse" not in body
+
+    # A plain-text answer (claim already taken) wraps as a created message.
+    store.claim(entry.entry_id, {"by": "x"})  # no-op: already resolved, but exercise text path
+    text_response = _act(
+        _settings(), InMemoryApprovalStore(), "missing", "approve",
+        "priya@circledelivers.com",
+        gmail_factory=lambda clicker: FakeGmail(clicker), addons=True,
+    )
+    text_body = json.loads(text_response["body"])
+    created = text_body["hostAppDataAction"]["chatDataAction"]["createMessageAction"]
+    assert "entry is gone" in created["message"]["text"]
 
 
 # --- the handler's perimeter -------------------------------------------------------------
@@ -255,6 +308,27 @@ def test_handler_denies_clickers_off_the_roster(wired: None) -> None:
     )
     assert response["statusCode"] == 200
     assert "not on the reviewer roster" in response["body"]
+
+
+def test_handler_denies_off_roster_clicks_in_the_addons_schema_too(wired: None) -> None:
+    response = handler(
+        _event(
+            {
+                "chat": {
+                    "user": {"email": "intruder@circledelivers.com"},
+                    "buttonClickedPayload": {},
+                },
+                "commonEventObject": {
+                    "invokedFunction": "approve",
+                    "parameters": {"entry": "e1"},
+                },
+            }
+        )
+    )
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])
+    created = body["hostAppDataAction"]["chatDataAction"]["createMessageAction"]
+    assert "not on the reviewer roster" in created["message"]["text"]
 
 
 def test_handler_answers_non_click_events_politely(wired: None) -> None:

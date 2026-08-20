@@ -394,38 +394,49 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
     except ValueError:
         return _http(400, {"text": "unreadable event"})
 
-    kind = str(chat_event.get("type") or "")
+    kind, clicker, action, entry_id, addons = _normalise_event(chat_event)
+    # The shape log exists because the first live click cost a debugging session: the
+    # event arrived in the add-ons schema (no `type`, payload under `chat.*`) and the
+    # handler silently answered "nothing to act on". Never guess the schema again.
+    _log.info(
+        "chat_event_received",
+        extra={
+            "schema": "addons" if addons else "legacy",
+            "kind": kind or "(none)",
+            "action": action or "(none)",
+            "event": _sanitised(chat_event),
+        },
+    )
+
     if kind != "CARD_CLICKED":
-        # ADDED_TO_SPACE / MESSAGE / REMOVED_FROM_SPACE — nothing to act on; answer
+        # Added-to-space / plain messages / removals — nothing to act on; answer
         # politely so adding the app to the space shows something sane.
-        return _http(
-            200,
-            {"text": "Payment bot: approval cards are posted here by the worker; "
-             "the buttons on each card are the interface."},
+        return _respond_text(
+            "Payment bot: approval cards are posted here by the worker; "
+            "the buttons on each card are the interface.",
+            addons,
         )
 
-    clicker = str(((chat_event.get("user") or {}).get("email")) or "").strip().lower()
-    action, entry_id = _clicked(chat_event)
     if not action or not entry_id:
-        return _http(200, {"text": "That button carried no action — repost the card."})
+        return _respond_text("That button carried no action — repost the card.", addons)
 
     roster = {r.strip().lower() for r in settings.reviewers if r.strip()}
     if clicker not in roster:
         _log.warning(
             "approval_denied_not_reviewer", extra={"clicker": clicker, "entry_id": entry_id}
         )
-        return _http(
-            200,
-            {"text": f"Sorry — {clicker or 'this account'} is not on the reviewer roster, "
-             "so it cannot act on approvals."},
+        return _respond_text(
+            f"Sorry — {clicker or 'this account'} is not on the reviewer roster, "
+            "so it cannot act on approvals.",
+            addons,
         )
 
     bucket = os.environ.get("PAYBOT_ROSTER_BUCKET", "").strip()
     if not bucket:
-        return _http(200, {"text": "Misconfigured: no state bucket. Nothing was done."})
+        return _respond_text("Misconfigured: no state bucket. Nothing was done.", addons)
     store = S3ApprovalStore(bucket)
 
-    return _act(settings, store, entry_id, action, clicker)
+    return _act(settings, store, entry_id, action, clicker, addons=addons)
 
 
 def _act(
@@ -436,6 +447,7 @@ def _act(
     clicker: str,
     *,
     gmail_factory: Any = None,
+    addons: bool = False,
 ) -> dict[str, Any]:
     """Claim the entry and perform one action. Split from :func:`handler` so tests can
     drive it with an in-memory store and a fake Gmail without forging HTTP events."""
@@ -445,24 +457,29 @@ def _act(
         status = str(existing.get("status") or "done")
         by = str(existing.get("by") or "someone")
         return _update_card_response(
-            store, entry_id, f"Already {status} by {by} — nothing further to do."
+            store, entry_id, f"Already {status} by {by} — nothing further to do.",
+            addons=addons,
         )
 
     raw = store.pending(entry_id)
     if raw is None:
-        return _http(200, {"text": "This card's entry is gone (expired and pruned, or never "
-                           "stored). The mail needs a human reply from the group mailbox."})
+        return _respond_text(
+            "This card's entry is gone (expired and pruned, or never stored). "
+            "The mail needs a human reply from the group mailbox.",
+            addons,
+        )
 
     now = _now_iso()
     if not store.claim(entry_id, {"by": clicker, "action": action, "at": now}):
-        return _http(200, {"text": "Someone is already handling this one — check the card."})
+        return _respond_text("Someone is already handling this one — check the card.", addons)
 
     try:
         if action == ACTION_REJECT:
             store.put_result(entry_id, {"status": "rejected", "by": clicker, "at": now})
             _log.info("approval_rejected", extra={"entry_id": entry_id, "by": clicker})
             return _update_card_response(
-                store, entry_id, f"Rejected by {clicker} — needs a human reply.", entry=raw
+                store, entry_id, f"Rejected by {clicker} — needs a human reply.",
+                entry=raw, addons=addons,
             )
 
         factory = gmail_factory or _default_gmail_factory(settings)
@@ -482,6 +499,7 @@ def _act(
                 entry_id,
                 f"With {clicker} in Gmail Drafts — edit there and send from Gmail.",
                 entry=raw,
+                addons=addons,
             )
 
         if action == ACTION_APPROVE:
@@ -495,11 +513,12 @@ def _act(
                 extra={"entry_id": entry_id, "by": clicker, "gmail_id": sent_id},
             )
             return _update_card_response(
-                store, entry_id, f"Sent by {clicker} · {now} · from {clicker}", entry=raw
+                store, entry_id, f"Sent by {clicker} · {now} · from {clicker}",
+                entry=raw, addons=addons,
             )
 
         store.release_claim(entry_id)
-        return _http(200, {"text": f"Unknown action {action!r} — nothing was done."})
+        return _respond_text(f"Unknown action {action!r} — nothing was done.", addons)
     except Exception as exc:
         # Release so a later click can retry: a claim without a result would otherwise
         # wedge the entry shut behind a transient Gmail failure.
@@ -508,8 +527,9 @@ def _act(
             "approval_send_failed",
             extra={"entry_id": entry_id, "by": clicker, "action": action, "error": str(exc)},
         )
-        return _http(200, {"text": f"That failed ({str(exc)[:200]}) — the card is still "
-                           "live, try again."})
+        return _respond_text(
+            f"That failed ({str(exc)[:200]}) — the card is still live, try again.", addons
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -523,14 +543,40 @@ def _default_gmail_factory(settings: Settings) -> Any:
     return lambda clicker: ClickerGmail(info, clicker, timeout=settings.google_timeout_seconds)
 
 
-def _clicked(chat_event: dict[str, Any]) -> tuple[str, str]:
-    """(action, entry_id) from a CARD_CLICKED event, tolerant of both event shapes.
+def _normalise_event(chat_event: dict[str, Any]) -> tuple[str, str, str, str, bool]:
+    """(kind, clicker_email, action, entry_id, addons) across BOTH event schemas.
 
-    Chat apps receive the function under ``common.invokedFunction`` with a parameters
-    map, or under ``action.actionMethodName`` with a key/value list, depending on how
-    the card was built and the app configured. Read both; trust neither for anything
-    beyond an id and a verb.
+    Google Chat delivers two shapes depending on how the app is provisioned. The
+    legacy shape carries a top-level ``type`` and the click under ``common`` /
+    ``action``. Apps configured through the current console land on the **add-ons
+    infrastructure** (the ``gcp-sa-gsuiteaddons`` service agent in the config page is
+    the tell) and deliver a top-level ``chat`` object with per-kind payload keys and
+    the invoked function under ``commonEventObject`` — with no ``type`` at all, which
+    is how the first live click slipped through as "nothing to act on". Read both;
+    trust neither for anything beyond a verb, an id, and the verified user's address.
     """
+
+    if isinstance(chat_event.get("chat"), dict):
+        chat = chat_event["chat"]
+        if "buttonClickedPayload" in chat:
+            kind = "CARD_CLICKED"
+        elif "messagePayload" in chat or "appCommandPayload" in chat:
+            kind = "MESSAGE"
+        elif "addedToSpacePayload" in chat:
+            kind = "ADDED_TO_SPACE"
+        else:
+            kind = ""
+        user = chat.get("user") if isinstance(chat.get("user"), dict) else {}
+        clicker = str(user.get("email") or "").strip().lower()
+        common = chat_event.get("commonEventObject") or {}
+        action = str(common.get("invokedFunction") or "")
+        parameters = common.get("parameters")
+        entry = str(parameters.get("entry") or "") if isinstance(parameters, dict) else ""
+        return kind, clicker, action, entry, True
+
+    kind = str(chat_event.get("type") or "")
+    user = chat_event.get("user") if isinstance(chat_event.get("user"), dict) else {}
+    clicker = str(user.get("email") or "").strip().lower()
 
     common = chat_event.get("common") or {}
     action_obj = chat_event.get("action") or {}
@@ -540,7 +586,6 @@ def _clicked(chat_event: dict[str, Any]) -> tuple[str, str]:
         or action_obj.get("function")
         or ""
     )
-
     entry = ""
     parameters = common.get("parameters")
     if isinstance(parameters, dict):
@@ -550,7 +595,53 @@ def _clicked(chat_event: dict[str, Any]) -> tuple[str, str]:
             if isinstance(item, dict) and str(item.get("key")) == "entry":
                 entry = str(item.get("value") or "")
                 break
-    return action, entry
+    return kind, clicker, action, entry, False
+
+
+def _sanitised(chat_event: dict[str, Any]) -> str:
+    """The event for the shape log: authorization material dropped, size capped.
+
+    The event is the user's own data landing in their own log group, but tokens must
+    never be written anywhere — ``authorizationEventObject`` carries them in the
+    add-ons schema, and anything token-like is stripped defensively.
+    """
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                k: "(redacted)"
+                if "token" in k.lower() or "authorization" in k.lower()
+                else scrub(v)
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [scrub(v) for v in value]
+        return value
+
+    try:
+        return json.dumps(scrub(chat_event), sort_keys=True)[:2000]
+    except (TypeError, ValueError):  # pragma: no cover - json-parsed input is dumpable
+        return "(unserialisable)"
+
+
+def _respond_text(text: str, addons: bool) -> dict[str, Any]:
+    """A new message into the space, in whichever response schema the event demands.
+
+    Add-ons-delivered events ignore the legacy ``{"text": …}`` reply outright — the
+    space renders Google's generic failure banner instead — so the response schema
+    must always match the event schema.
+    """
+
+    if addons:
+        return _http(
+            200,
+            {
+                "hostAppDataAction": {
+                    "chatDataAction": {"createMessageAction": {"message": {"text": text}}}
+                }
+            },
+        )
+    return _http(200, {"text": text})
 
 
 def _update_card_response(
@@ -558,12 +649,14 @@ def _update_card_response(
     entry_id: str,
     status: str,
     entry: PendingApproval | None = None,
+    *,
+    addons: bool = False,
 ) -> dict[str, Any]:
-    """Synchronous UPDATE_MESSAGE: the clicked card becomes its own terminal record."""
+    """Rewrite the clicked card in place: it becomes its own terminal record."""
 
     entry = entry or store.pending(entry_id)
     if entry is None:
-        return _http(200, {"text": status})
+        return _respond_text(status, addons)
     card = approval_card(
         entry_id=entry.entry_id,
         from_email=entry.to,
@@ -576,6 +669,17 @@ def _update_card_response(
         status=status,
         message_id=entry.message_id,
     )
+    if addons:
+        return _http(
+            200,
+            {
+                "hostAppDataAction": {
+                    "chatDataAction": {
+                        "updateMessageAction": {"message": {"cardsV2": [card]}}
+                    }
+                }
+            },
+        )
     return _http(
         200,
         {"actionResponse": {"type": "UPDATE_MESSAGE"}, "cardsV2": [card]},

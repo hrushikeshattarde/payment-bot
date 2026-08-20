@@ -197,7 +197,100 @@ def _load_ids_in(text: str) -> list[str]:
             continue
         found.append(match.group())
     return found
-_MONEY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?")
+
+
+#: Money, in the three shapes a sender writes it.
+#:
+#: Was ``$``-anchored, and an invoice table is exactly where that fails: Porter Billing's
+#: collections mail prints ``2,800.00`` under an Amount column with no currency symbol
+#: anywhere near it, so the one figure the email was about was invisible here while the
+#: ``$300`` in the referral banner underneath the signature was not. The reply told a
+#: collections rep their $300 disagreed with our $2,800 and asked them to clarify.
+#:
+#: The three shapes are :data:`payment_bot.grounding._MONEY_RE`'s, which is what the
+#: pre-send gate extracts from the DRAFT. The two ran on different definitions of money for
+#: no reason anyone chose, and intake was the narrower — the side where being narrow means
+#: missing the sender's actual number.
+#:
+#: The bare two-decimal branch is the one that needs guarding, and carries the one deviation
+#: from the gate's copy: ``07.14.2026`` contains ``07.14``. It is rejected by refusing a
+#: fraction with digits continuing past it, and by refusing to start one directly after a
+#: digit or a date separator. A leading ``-`` counts as a separator, so ``-11.25`` is not
+#: read as a stated amount; a deduction is something our own tools produce, not something a
+#: carrier asserts, and the gate stays the stricter of the two by catching it anyway.
+_MONEY_RE = re.compile(
+    r"\$\s?\d[\d,]*(?:\.\d+)?"  # $-prefixed: $300, $9,300, $1,300.00
+    r"|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b"  # thousands-separated: 2,800.00
+    r"|(?<![\d.,/-])\d+\.\d{2}(?!\.?\d)"  # bare fraction: 150.00, but not 07.14.2026
+)
+
+#: What a number has to be CALLED for the sender to have stated it as an amount.
+#:
+#: Money shape is not an assertion about our rate. Widening :data:`_MONEY_RE` widens what a
+#: signature block can contribute, and the case that started this was already a footer: a
+#: promotional banner reading "EARN $300 For Every Funded Referral" became "the amount the
+#: sender stated" because it was the only thing in the message shaped like money.
+#:
+#: Deliberately excludes ``freight`` and ``bill``. Both are real amount labels — "Freight
+#: Bill $2,800" — and both are also in the factor's own name three lines below the banner
+#: ("Porter Freight Funding", "Porter Billing Service"), which is the neighbourhood this
+#: guard exists to distrust. An amount that only a company name vouches for is not stated.
+_AMOUNT_LABEL_RE = re.compile(
+    r"\b(?:rate|amount|amt|total|balance|bal|due|owed|outstanding|payment|pay|paid"
+    r"|remit|remittance|invoice|charge|linehaul|gross|net|sum|cost|price|quote|quoted)\b",
+    re.IGNORECASE,
+)
+
+#: A line that is advertising rather than correspondence.
+#:
+#: :data:`_AMOUNT_LABEL_RE` is not enough on its own, because marketing copy uses payment
+#: words on purpose: "EARN $300 For Every Funded Referral" survives it the moment the banner
+#: says "invoice" or "get paid faster" anywhere in the same 24 characters. The label guard
+#: asks whether a number is called an amount; this asks whether the sentence around it is
+#: addressed to us at all.
+#:
+#: Applied to the line even when a load id sits on it. A promotional line carrying a load id
+#: is not a shape that occurs, and if it ever did, the reading to distrust is the one that
+#: takes a banner figure as the sender's position on our rate.
+#:
+#: Kept to markers with no operational meaning in payment mail. ``discount`` and ``% off``
+#: were candidates and are deliberately absent — a quick-pay discount is a real deduction a
+#: carrier may legitimately be quoting at us. ``refer`` is likewise narrowed to ``referral``
+#: and ``refer a ...``, since "please refer to the attached invoice" is ordinary prose.
+_PROMOTIONAL_RE = re.compile(
+    r"\b(?:earn|referral|unsubscribe|promo(?:tion|tional|\s*code)?|click\s+here"
+    r"|sign\s+up|follow\s+us|free\s+(?:trial|quote|consultation)"
+    r"|refer\s+a\s+(?:friend|carrier|client|customer)"
+    r"|terms\s+(?:and|&)\s+conditions\s+apply)\b",
+    re.IGNORECASE,
+)
+
+
+def _stated_amounts_in(line: str, has_load_id: bool) -> list[Decimal]:
+    """Money on ``line`` the sender is asserting, rather than merely printing.
+
+    A load id on the line is evidence enough on its own — a table row naming a load is about
+    that load's money, whatever its columns are headed. Failing that the number has to be
+    labelled within the same proximity window :func:`_load_ids_in` uses, before or after.
+
+    Nothing here binds an amount to a load; that is the caller's job. This only decides
+    whether the sender said it.
+    """
+
+    if _PROMOTIONAL_RE.search(line):
+        return []
+
+    out: list[Decimal] = []
+    for match in _MONEY_RE.finditer(line):
+        if not has_load_id:
+            before = line[max(0, match.start() - 24) : match.start()]
+            after = line[match.end() : match.end() + 24]
+            if not (_AMOUNT_LABEL_RE.search(before) or _AMOUNT_LABEL_RE.search(after)):
+                continue
+        out.append(_money(match.group()))
+    return out
+
+
 _INVOICE_RE = re.compile(r"invoice\s*(?:no\.?|number|#)?\s*:?\s*(\d{3,})", re.IGNORECASE)
 
 
@@ -841,16 +934,34 @@ class ExtractIdentifiers(Tool):
 
         stated_rates: list[StatedRate] = []
         for line in text.splitlines():
-            amounts = [_money(m) for m in _MONEY_RE.findall(line)]
-            if not amounts:
+            if not _MONEY_RE.search(line):
                 continue
             # Deduped: an invoice table routinely prints the same number under both an
             # "Invoice No" and a "Load No" column, and counting one id twice left the amount
             # bound to nothing. Two *different* ids on a line stays ambiguous — that is the
             # case this guard is for. Only helps a row that arrives on ONE line, i.e. from a
-            # text part; an HTML table puts each cell on its own line, so its amounts bind to
-            # no load and would need row-aware parsing to fix.
+            # text part; an HTML table puts each cell on its own line, which is the case the
+            # label guard below decides instead.
             line_ids = _dedupe(_load_ids_in(line))
+            # An HTML table's amount cell has neither a load id nor a header beside it, so it
+            # is dropped here rather than surviving as an unattributed rate. That is the
+            # intended trade: the skill's fallback ("the sender quoted no amount, state ours")
+            # answers the Porter case correctly, and an amount attached to nothing was only
+            # ever useful to a reply willing to argue with it.
+            amounts = _stated_amounts_in(line, bool(line_ids))
+            if not amounts:
+                continue
+            if not line_ids and len(load_ids) > 1:
+                # An amount on a line naming no load, in an email naming several. It belongs
+                # to one of them and nothing says which, so it is neither a rate the sender
+                # stated about a load nor something a reply can quote without picking a load
+                # on its behalf. A line that DOES carry ids stays — which of them is
+                # ambiguous, and the skill renders that honestly as "unattributed".
+                _log.info(
+                    "unattributed_amount_dropped",
+                    extra={"amounts": [str(a) for a in amounts], "load_count": len(load_ids)},
+                )
+                continue
             load_ref = line_ids[0] if len(line_ids) == 1 else None
             stated_rates.extend(StatedRate(load_id=load_ref, amount=a) for a in amounts)
 
@@ -878,10 +989,13 @@ class ExtractIdentifiers(Tool):
 
         column_hints = _dedupe(m.strip() for m in _COLUMN_HINT_RE.findall(text))
 
-        # Ground the sender's own stated amounts so the reply may quote them back
-        # (attributed to the sender) without tripping the pre-send gate.
+        # Record the sender's own stated amounts so the reply may quote them back without
+        # tripping the pre-send gate. `record_sender_amount`, not `record_amount`: these were
+        # read off the sender's email and no tool has confirmed any of them. Recording them
+        # as grounded facts is what let a figure lifted from a signature block be written
+        # into a reply as the rate on file — the gate had no way to know it was theirs.
         for rate in stated_rates:
-            ctx.ledger.record_amount(rate.amount, self.name, load_id=rate.load_id)
+            ctx.ledger.record_sender_amount(rate.amount, self.name, load_id=rate.load_id)
 
         return ExtractIdentifiersOutput(
             load_ids=load_ids,

@@ -12,6 +12,11 @@ The extraction is deliberately conservative and format-driven:
   amounts are caught while incidental counts in prose ("2 earning lines") are ignored.
 * **Dates** are recognised as ISO (``YYYY-MM-DD``) or ``Month DD, YYYY``.
 
+One class of amount is quotable without a tool having produced it: a figure the **sender**
+wrote. A rate dispute cannot be answered without printing their number beside ours. Those
+live in :attr:`GroundingLedger.sender_stated_amounts`, separate from the tool-produced set,
+so the gate can permit the quote and still tell the two apart.
+
 A weekday *name* is not a groundable token — nothing in a tool result is a weekday word to
 compare against — so :func:`find_weekday_mismatches` checks it arithmetically instead, from
 the date it is printed beside. Neither is the *tense* a date is written in: "payment is
@@ -294,11 +299,26 @@ def find_tense_mismatches(text: str, today: date) -> list[TenseMismatch]:
 
 
 # --- ledger -----------------------------------------------------------------
+#: Every ``kind`` a :class:`GroundedFact` carries. All but ``sender_amount`` come from a
+#: tool; that one is the sender's own figure, retained for the audit trail and for the
+#: gate's attribution check, and asserted by nobody but them.
+FACT_KINDS = (
+    "amount",
+    "sender_amount",
+    "date",
+    "scheduled_pay_date",
+    "status",
+    "method",
+    "check_ref",
+    "carrier",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class GroundedFact:
-    """One fact a tool asserted, retained for audit and the gate's grounding check."""
+    """One fact recorded during a run, retained for audit and for the gate's checks."""
 
-    kind: str  # amount | date | scheduled_pay_date | status | method | check_ref | carrier
+    kind: str  # one of FACT_KINDS
     value: str
     source_tool: str
     load_id: str | None = None
@@ -311,6 +331,19 @@ class GroundingLedger:
     facts: list[GroundedFact] = field(default_factory=list)
     grounded_amounts: set[Decimal] = field(default_factory=set)
     grounded_dates: set[date] = field(default_factory=set)
+    #: Amounts the SENDER wrote, held apart from the ones a tool produced.
+    #:
+    #: Both are quotable — a rate dispute has to print their figure beside ours — but they
+    #: are not the same kind of fact, and for a long time this ledger could not tell them
+    #: apart. Intake dropped the sender's amounts straight into
+    #: :attr:`grounded_amounts`, so "did a tool produce this number?" quietly became "did
+    #: this number appear anywhere?", and a figure scraped off the sender's own signature
+    #: could be written into a reply as our rate with the gate raising nothing.
+    #:
+    #: Keeping the sets separate is what lets the gate report which is which, and what
+    #: lets it refuse a draft that quotes their number while stating none of ours.
+    #: Magnitudes, for the same reason :meth:`record_amount` stores magnitudes.
+    sender_stated_amounts: set[Decimal] = field(default_factory=set)
 
     def record_amount(self, amount: Decimal, source_tool: str, load_id: str | None = None) -> None:
         """Record a tool-produced amount, keyed by magnitude.
@@ -325,6 +358,21 @@ class GroundingLedger:
 
         self.grounded_amounts.add(abs(amount))
         self.facts.append(GroundedFact("amount", str(amount), source_tool, load_id))
+
+    def record_sender_amount(
+        self, amount: Decimal, source_tool: str, load_id: str | None = None
+    ) -> None:
+        """Record an amount the SENDER stated, so the reply may quote it back at them.
+
+        Not a grounded fact and deliberately not stored as one. Nothing has been verified
+        by recording this — only that the sender wrote the number down, which is the whole
+        of the claim a reply may make about it ("the $2,850 you quoted"). The gate keeps
+        such an amount out of the ungrounded pile so a genuine rate dispute can be
+        answered, and separately refuses to let it stand alone as though it were ours.
+        """
+
+        self.sender_stated_amounts.add(abs(amount))
+        self.facts.append(GroundedFact("sender_amount", str(amount), source_tool, load_id))
 
     def record_date(
         self,

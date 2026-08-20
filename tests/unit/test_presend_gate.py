@@ -652,3 +652,83 @@ def test_reporting_noa_facts_is_not_a_request(
     result = PreSendGate().evaluate(draft=_draft(body=body), email=sample_email, ctx=grounded_ctx)
     assert result.allowed, result.reasons
     assert _checks(result)["noa_request"] is True
+
+
+# ---------------------------------------------------------------------------
+# The sender's own figures. Quotable, because a rate dispute has to print theirs
+# beside ours — but never on their own, and never as though a tool produced them.
+# ---------------------------------------------------------------------------
+def _detail(result: object, name: str) -> str:
+    return next(c.detail for c in result.checks if c.name == name)  # type: ignore[attr-defined]
+
+
+@pytest.mark.unit
+def test_a_sender_stated_amount_does_not_read_as_ungrounded(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """A figure the sender wrote is not a figure nobody can account for."""
+
+    grounded_ctx.ledger.record_sender_amount(
+        Decimal("2850"), "extract_identifiers", load_id="2462934"
+    )
+    body = _GOOD_BODY + " This differs from the $2,850 in your message."
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=sample_email, ctx=grounded_ctx)
+
+    assert _checks(result)["grounding"] is True, result.reasons
+    assert "quoted from the sender" in _detail(result, "grounding")
+    assert "2850" in _detail(result, "grounding")
+
+
+@pytest.mark.unit
+def test_a_sender_amount_beside_our_own_is_allowed(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The rate dispute this permission exists for."""
+
+    grounded_ctx.ledger.record_sender_amount(
+        Decimal("2850"), "extract_identifiers", load_id="2462934"
+    )
+    body = _GOOD_BODY + " This differs from the $2,850 in your message."
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=sample_email, ctx=grounded_ctx)
+
+    assert result.allowed, result.reasons
+    assert _checks(result)["sender_amount_attribution"] is True
+
+
+@pytest.mark.unit
+def test_a_sender_amount_standing_alone_is_blocked(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The shape the split exists to catch.
+
+    Before the ledger separated provenance this grounded cleanly: the number was in
+    ``grounded_amounts`` because intake had put it there, and nothing recorded that intake
+    had only read it off the sender's own email.
+    """
+
+    grounded_ctx.ledger.record_sender_amount(
+        Decimal("300"), "extract_identifiers", load_id="2462934"
+    )
+    body = "Load 2462934: the carrier rate on file is $300."
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=sample_email, ctx=grounded_ctx)
+
+    assert not result.allowed
+    assert _checks(result)["sender_amount_attribution"] is False
+    assert _checks(result)["grounding"] is True  # which is why a separate check is needed
+    assert any("only the sender asserted" in r for r in result.reasons)
+
+
+@pytest.mark.unit
+def test_an_amount_both_sides_state_is_not_sender_only(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The agreeing case, which is most of them, never reaches the failing branch."""
+
+    grounded_ctx.ledger.record_sender_amount(
+        Decimal("4650"), "extract_identifiers", load_id="2462934"
+    )
+    result = PreSendGate().evaluate(draft=_draft(), email=sample_email, ctx=grounded_ctx)
+
+    assert result.allowed, result.reasons
+    assert _checks(result)["sender_amount_attribution"] is True
+    assert "quoted from the sender" not in _detail(result, "grounding")

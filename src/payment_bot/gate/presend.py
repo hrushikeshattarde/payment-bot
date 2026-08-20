@@ -400,6 +400,7 @@ class PreSendGate:
             self._check_sensitive_change(email, ctx),
             self._check_placeholders(draft),
             self._check_grounding(draft, ctx),
+            self._check_sender_amount_attribution(draft, ctx),
             self._check_weekday_consistency(draft),
             self._check_tense_consistency(draft, ctx),
             self._check_cargotel_payment_claim(draft),
@@ -771,7 +772,11 @@ class PreSendGate:
     def _check_grounding(self, draft: SubmitDraftOutput, ctx: ToolContext) -> GateCheck:
         # Magnitudes on both sides — the ledger stores them that way, see record_amount.
         stated_money = {abs(amount) for amount in extract_money_tokens(draft.reply_body)}
-        ungrounded_money = stated_money - ctx.ledger.grounded_amounts
+        # The sender's own figures are quotable but not grounded, and the difference is
+        # _check_sender_amount_attribution's business, not this check's. Here they only
+        # need to not be reported as unaccounted for.
+        quotable = ctx.ledger.grounded_amounts | ctx.ledger.sender_stated_amounts
+        ungrounded_money = stated_money - quotable
         ungrounded_dates = extract_date_tokens(draft.reply_body) - ctx.ledger.grounded_dates
         problems: list[str] = []
         if ungrounded_money:
@@ -784,8 +789,62 @@ class PreSendGate:
                 passed=False,
                 detail=f"draft contains ungrounded values: {'; '.join(problems)}",
             )
+        quoted_back = sorted(
+            str(m) for m in (stated_money & ctx.ledger.sender_stated_amounts)
+            if m not in ctx.ledger.grounded_amounts
+        )
+        detail = "every amount and date in the draft is grounded"
+        if quoted_back:
+            detail = f"{detail} (quoted from the sender, not from a tool: {quoted_back})"
+        return GateCheck(name="grounding", passed=True, detail=detail)
+
+    def _check_sender_amount_attribution(
+        self, draft: SubmitDraftOutput, ctx: ToolContext
+    ) -> GateCheck:
+        """A figure only the sender asserted may not be the only figure in the reply.
+
+        Companion to grounding, and the reason the two sets are kept apart. Grounding asks
+        whether a number is accountable and now answers yes for the sender's own amounts,
+        because a rate dispute has to print theirs beside ours. Nothing in that check looks
+        at WHOSE number it is, so a draft was free to take a figure off the sender's email
+        and state it as the rate on file.
+
+        Whose it is cannot be read off the wording without guessing at English, so this
+        check does not try. It asks the structural question instead: if the reply repeats a
+        number only the sender wrote, does it also state one of ours? A reply that quotes
+        their figure and cites none of our own is either echoing them back as fact or
+        arguing with nothing, and a human should see it either way.
+
+        An amount BOTH sides state is not sender-only — the agreeing case, which is most of
+        them, never reaches the failing branch.
+        """
+
+        stated_money = {abs(amount) for amount in extract_money_tokens(draft.reply_body)}
+        sender_only = (stated_money & ctx.ledger.sender_stated_amounts) - (
+            ctx.ledger.grounded_amounts
+        )
+        if not sender_only:
+            return GateCheck(
+                name="sender_amount_attribution",
+                passed=True,
+                detail="no sender-only amount in the reply",
+            )
+        if stated_money & ctx.ledger.grounded_amounts:
+            return GateCheck(
+                name="sender_amount_attribution",
+                passed=True,
+                detail=(
+                    f"sender-only amounts {sorted(str(m) for m in sender_only)} stated "
+                    "alongside our own"
+                ),
+            )
         return GateCheck(
-            name="grounding", passed=True, detail="every amount and date in the draft is grounded"
+            name="sender_amount_attribution",
+            passed=False,
+            detail=(
+                f"draft states amounts {sorted(str(m) for m in sender_only)} that only the "
+                "sender asserted, and no amount from a tool alongside them"
+            ),
         )
 
     def _check_weekday_consistency(self, draft: SubmitDraftOutput) -> GateCheck:

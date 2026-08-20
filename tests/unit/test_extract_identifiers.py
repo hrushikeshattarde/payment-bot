@@ -753,3 +753,173 @@ def test_a_declared_length_still_clears_the_unlabelled_noise_around_a_named_load
     )
 
     assert out.load_ids == ["2481841"]
+
+
+# ---------------------------------------------------------------------------
+# An invoice table writes money without a currency symbol, and a signature
+# block writes a currency symbol without meaning money.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_a_table_amount_with_no_currency_symbol_is_read(ctx: ToolContext) -> None:
+    """Porter Billing's collections table prints ``2,800.00`` under Amount, no ``$``.
+
+    The ``$``-anchored scanner could not see it, so the only figure the email was about
+    never became a stated rate.
+    """
+
+    out = _run(ctx, body="102711 | JBHS TRUCKING INC | 2412641 | 2,800.00 | 93 | 2,800.00")
+
+    assert [str(r.amount) for r in out.stated_rates] == ["2800.00", "2800.00"]
+
+
+@pytest.mark.unit
+def test_a_labelled_amount_needs_no_load_id_beside_it(ctx: ToolContext) -> None:
+    out = _run(ctx, body="Balance due: 2,800.00")
+
+    assert [str(r.amount) for r in out.stated_rates] == ["2800.00"]
+    assert out.stated_rates[0].load_id is None
+
+
+@pytest.mark.unit
+def test_a_promotional_banner_is_not_a_stated_amount(ctx: ToolContext) -> None:
+    """The bug this guard exists for.
+
+    "EARN $300 For Every Funded Referral" sits under the factor's signature on every mail
+    they send. It was the only ``$``-prefixed number in a $2,800 enquiry, so it became "the
+    amount the sender stated" and the reply asked a collections rep to clarify a figure they
+    had never written.
+    """
+
+    out = _run(
+        ctx,
+        body=(
+            "Please provide payment status on Id # 2412641.\n"
+            "Porter Freight Funding 15 Years\n"
+            "EARN $300 For Every Funded Referral\n"
+            "SUBMIT A REFERRAL\n"
+        ),
+    )
+
+    assert out.load_ids == ["2412641"]
+    assert out.stated_rates == []
+
+
+@pytest.mark.unit
+def test_the_banner_and_the_table_in_one_email(ctx: ToolContext) -> None:
+    """Both halves of the live Porter mail: the real amount survives, the banner does not."""
+
+    out = _run(
+        ctx,
+        body=(
+            "Please provide payment status on Id # 2412641. This is over 90 days due.\n"
+            "Invoice 102711 | 2412641 | Amount 2,800.00 | Balance 2,800.00\n"
+            "EARN $300 For Every Funded Referral\n"
+        ),
+    )
+
+    assert Decimal("300") not in {r.amount for r in out.stated_rates}
+    assert {r.amount for r in out.stated_rates} == {Decimal("2800.00")}
+
+
+@pytest.mark.unit
+def test_an_unlabelled_amount_alone_on_a_line_is_dropped(ctx: ToolContext) -> None:
+    """An HTML table puts each cell on its own line, so the amount cell has no neighbours.
+
+    Previously this survived as an unattributed rate with nothing vouching for it, which is
+    the shape the banner arrived in. The rate skill's own fallback covers the loss: with no
+    stated amount it tells the agent to state ours rather than compare.
+    """
+
+    out = _run(ctx, body="Load 2412641\n2,800.00\n93\n")
+
+    assert out.load_ids == ["2412641"]
+    assert out.stated_rates == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Invoice dated 07.14.2026 for load 2412641",
+        "Load 2412641 delivered 07.14.2026",
+    ],
+)
+def test_a_dotted_date_is_not_money(ctx: ToolContext, line: str) -> None:
+    """``07.14.2026`` contains ``07.14``, which the widened bare-fraction branch would take."""
+
+    out = _run(ctx, body=line)
+
+    assert out.stated_rates == []
+
+
+@pytest.mark.unit
+def test_what_intake_refuses_is_not_quotable_either(ctx: ToolContext) -> None:
+    """The narrowing has to hold on both sides.
+
+    What intake declines to call a stated amount must not reach the ledger, or the pre-send
+    gate goes on letting the number through.
+    """
+
+    out = _run(ctx, body="Load 2412641 rate 2,800.00\nEARN $300 For Every Funded Referral\n")
+
+    assert [str(r.amount) for r in out.stated_rates] == ["2800.00"]
+    assert Decimal("300") not in ctx.ledger.sender_stated_amounts
+    assert Decimal("300") not in ctx.ledger.grounded_amounts
+
+
+@pytest.mark.unit
+def test_a_senders_amount_is_recorded_as_theirs_not_as_a_fact(ctx: ToolContext) -> None:
+    """Intake reads numbers off an email. It confirms none of them.
+
+    Recording them as grounded facts is what let a figure lifted from the sender's own
+    message be written into a reply as the rate on file.
+    """
+
+    _run(ctx, body="Load 2412641 rate 2,800.00")
+
+    assert ctx.ledger.sender_stated_amounts == {Decimal("2800.00")}
+    assert ctx.ledger.grounded_amounts == set()
+    assert [f.kind for f in ctx.ledger.facts] == ["sender_amount"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "line",
+    [
+        "EARN $300 For Every Funded Referral — get paid on your invoice faster",
+        "Refer a carrier and earn $500 — terms and conditions apply",
+        "Unsubscribe from payment reminders — $0 to opt out",
+    ],
+)
+def test_marketing_copy_using_payment_words_is_still_not_a_stated_amount(
+    ctx: ToolContext, line: str
+) -> None:
+    """The label guard alone lets a banner through the moment its copy says "invoice"."""
+
+    out = _run(ctx, body=f"Payment status on load 2412641 please.\n{line}\n")
+
+    assert out.load_ids == ["2412641"]
+    assert out.stated_rates == []
+
+
+@pytest.mark.unit
+def test_an_amount_naming_no_load_is_dropped_when_the_email_names_several(
+    ctx: ToolContext,
+) -> None:
+    """It belongs to one of them and nothing says which."""
+
+    out = _run(ctx, body="Loads 2412641 and 2499505.\nTotal balance due 5,300.00\n")
+
+    assert out.load_ids == ["2412641", "2499505"]
+    assert out.stated_rates == []
+    assert ctx.ledger.sender_stated_amounts == set()
+
+
+@pytest.mark.unit
+def test_the_same_amount_is_kept_when_the_email_names_one_load(ctx: ToolContext) -> None:
+    """One load makes an unbound amount unambiguous, which is the ordinary rate dispute."""
+
+    out = _run(ctx, body="Load 2412641.\nWe show the rate as 2,850.00\n")
+
+    assert [str(r.amount) for r in out.stated_rates] == ["2850.00"]
+    assert out.stated_rates[0].load_id is None

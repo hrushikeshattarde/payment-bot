@@ -1047,3 +1047,97 @@ def test_an_announced_change_still_allows_a_plain_status_answer(
     result = PreSendGate().evaluate(draft=_draft(body=body), email=announced, ctx=grounded_ctx)
 
     assert _checks(result)["change_acknowledgment"] is True, result.reasons
+
+
+@pytest.mark.unit
+def test_the_intake_tells_the_model_to_withhold_the_pay_to_when_asked_to_confirm_it(
+    sample_email: InboundEmail,
+) -> None:
+    """The two pay-to rules must be armed by the same detector, or they contradict.
+
+    Skill 1.12.0 told the model to name the pay-to whenever the sender asks where money
+    went. Live on load 2458412, RTS asked us to "confirm all payments will be made to RTS"
+    and the reply closed with "payment will be directed to True Nation Inc c/o RTS Financial
+    Service, Inc" — seventeen gate checks passed and change_acknowledgment blocked the
+    eighteenth. Nothing went out, and nothing was answered either.
+
+    Who a payment WENT to is a fact the carrier is owed; who it WILL go to is a remit
+    instruction §7 forbids agreeing to. The intake now says which kind of email this is,
+    read from the gate's own detector, so the instruction and the check that enforces it
+    cannot disagree about the same message.
+    """
+
+    from payment_bot.agent.skills import _remit_confirmation_line, build_payment_status_intake
+    from payment_bot.gate.presend import asks_to_confirm_payment_direction
+
+    asked = sample_email.model_copy(
+        update={
+            "body": (
+                "Accounts Payable, Please provide payment status on the invoices below and "
+                "confirm all payments will be made to RTS Financial Service, Inc."
+            )
+        }
+    )
+    plain = sample_email.model_copy(
+        update={"body": "Could you please provide the payment status for load 2462934?"}
+    )
+
+    assert asks_to_confirm_payment_direction(asked) is True
+    assert asks_to_confirm_payment_direction(plain) is False
+
+    # Silent on ordinary mail — the pay-to stays sayable, which is the 1.12.0 fix.
+    assert _remit_confirmation_line(False) == []
+
+    intake = build_payment_status_intake(
+        asked,
+        ["2462934"],
+        {"2462934": "transport_pro"},
+        remit_confirmation_asked=asks_to_confirm_payment_direction(asked),
+    )
+    assert "asked us to CONFIRM where payments will be sent" in intake
+    assert "Do NOT name the pay-to" in intake
+
+    quiet = build_payment_status_intake(
+        plain,
+        ["2462934"],
+        {"2462934": "transport_pro"},
+        remit_confirmation_asked=asks_to_confirm_payment_direction(plain),
+    )
+    assert "asked us to CONFIRM" not in quiet
+
+
+@pytest.mark.unit
+def test_the_sentence_that_blocked_load_2458412_is_still_blocked(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The instruction is the fix; the gate stays the control. Belt and braces, both tested."""
+
+    asked = sample_email.model_copy(
+        update={
+            "body": (
+                "Please provide payment status on the invoices below and confirm all "
+                "payments will be made to RTS Financial Service, Inc."
+            )
+        }
+    )
+    named_the_payee = (
+        "Load 2462934 is delivered and not yet billed, so no pay date is assigned. Once it "
+        "is billed, payment will be directed to True Nation Inc c/o RTS Financial Service, "
+        "Inc per the Notice of Assignment on file."
+    )
+
+    result = PreSendGate().evaluate(
+        draft=_draft(body=named_the_payee), email=asked, ctx=grounded_ctx
+    )
+
+    assert not result.allowed
+    assert _checks(result)["change_acknowledgment"] is False
+
+    # The reply the new intake asks for: the same status answer, no payee anywhere.
+    silent = (
+        "Load 2462934 is delivered and not yet billed, so no pay date is assigned yet. "
+        "We will update you once it is billed."
+    )
+    assert _checks(
+        PreSendGate().evaluate(draft=_draft(body=silent), email=asked, ctx=grounded_ctx)
+    )["change_acknowledgment"] is True

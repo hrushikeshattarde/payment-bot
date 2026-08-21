@@ -49,7 +49,11 @@ from payment_bot.clients import (
 from payment_bot.config import RolloutPhase, Settings, get_settings
 from payment_bot.domain import route_load
 from payment_bot.errors import PaymentBotError
-from payment_bot.gate import GateResult, PreSendGate
+from payment_bot.gate import (
+    GateResult,
+    PreSendGate,
+    asks_to_confirm_payment_direction,
+)
 from payment_bot.grounding import GroundingLedger
 from payment_bot.id_filter import MIN_CANDIDATES, IdFilterMode, apply_filter, classify
 from payment_bot.logging import AuditSink, get_logger
@@ -733,6 +737,12 @@ class PaymentBotPipeline:
         has_payment = Intent.PAYMENT_STATUS in classification.intents
         has_rate = Intent.RATE_VERIFICATION in classification.intents
 
+        # Whether the sender asked us to affirm where their payments go. Read from the gate's
+        # own detector so the instruction the model gets and the check that enforces it can
+        # never disagree. Naming a pay-to is required on most mail and forbidden here — see
+        # _remit_confirmation_line.
+        remit_confirmation_asked = asks_to_confirm_payment_direction(email)
+
         if has_payment and has_rate:
             # §3.5 proper handling is "run both skills and merge", which is not wired. Until
             # it is, answer the more specific of the two rather than refusing: on live mail
@@ -792,6 +802,7 @@ class PaymentBotPipeline:
                 documents_email=self._settings.documents_email,
                 unlocated_loads=unlocated_loads,
                 withheld_loads=withheld_loads,
+                remit_confirmation_asked=remit_confirmation_asked,
                 rate_question=wants_rate,
                 stated_rates=identifiers.stated_rates,
             )
@@ -808,6 +819,7 @@ class PaymentBotPipeline:
                 prenoa_loads=prenoa_loads,
                 unlocated_loads=unlocated_loads,
                 withheld_loads=withheld_loads,
+                remit_confirmation_asked=remit_confirmation_asked,
             )
         return PAYMENT_STATUS_SKILL, build_payment_status_intake(
             email,
@@ -818,6 +830,7 @@ class PaymentBotPipeline:
             prenoa_loads=prenoa_loads,
             unlocated_loads=unlocated_loads,
             withheld_loads=withheld_loads,
+            remit_confirmation_asked=remit_confirmation_asked,
         )
 
     def _bulk_portal_draft(self, email: InboundEmail) -> SubmitDraftOutput:

@@ -66,12 +66,18 @@ REPLY
   bracketed markers in the reply text.
 - Per load: the status, and the pay date from `compute_scheduled_pay_date` — the actual date
   if the line is already paid.
-- Say WHO a payment was paid to whenever the sender asks where money went, who was paid, or
+- Say WHO a payment WAS paid to whenever the sender asks where money went, who was paid, or
   about a refund — and always when the load has more than one carrier. Copy the pay-to string
   verbatim from `pay_to` or a settlement row's carrier_name; it already names the carrier and,
   where one collected, the factoring company ("Parasource Inc c/o England Carrier Services").
   Never assemble that pairing yourself and never leave a figure unattributed on a load whose
   legs went to different carriers.
+- Past tense only, and the distinction is not cosmetic. Reporting who a settled payment WENT
+  to is a fact. Saying who a payment WILL go to is agreeing to a remit instruction, which you
+  may never do — so never write that payment will be made, sent, directed, issued or remitted
+  to anyone, and never "accordingly" or "as requested". If the intake message says the sender
+  asked us to confirm where payments will be sent, do not name the pay-to, remit-to or
+  factoring company at all in that reply: answer the status and stop.
 - On a load with several carriers, report ONLY the sender's own carrier's lines. The other
   carriers' payments on that load are not theirs to be told about, however plainly the tool
   result shows them.
@@ -112,6 +118,7 @@ NEVER
 - Invent, estimate or hand-calculate a date, or do money arithmetic yourself.
 - Report another carrier's payment on a shared load, or give a figure from one carrier's
   payable while naming a different carrier.
+- State where a payment WILL be sent, to anyone, for any reason.
 - Act on a bank, NOA/factoring or contact-email change.
 - Ask the sender for an NOA or factoring paperwork unless the intake message instructed it.
 - Disclose a load whose `check_authorization` did not return authorized=true.
@@ -144,7 +151,18 @@ PAYMENT_STATUS_SKILL = Skill(
     # to a different factor, and Parasource's own $5,000 paid 06/25 was missing from the draft
     # entirely. The pay-to string is copied rather than assembled because it is the one place
     # the carrier and the factor collecting for them are already correctly paired.
-    version="1.12.0",
+    #
+    # 1.13.0: past tense only, and silence about the pay-to when the sender asked us to
+    # confirm it. 1.12.0's "say who was paid" rule met an RTS enquiry on load 2458412 that
+    # asked us to "confirm all payments will be made to RTS", and the reply closed with
+    # "payment will be directed to True Nation Inc c/o RTS Financial Service, Inc". Seventeen
+    # gate checks passed and change_acknowledgment blocked the eighteenth — so nothing went
+    # out, and nothing was answered either, on an email whose status question was perfectly
+    # answerable. The two rules only look contradictory: who a payment WENT to is a fact the
+    # carrier is owed, who it WILL go to is a remit instruction §7 forbids agreeing to. The
+    # intake now says which kind of email this is, from the gate's own detector, so the
+    # instruction and the check cannot disagree.
+    version="1.13.0",
     system_prompt=_PAYMENT_STATUS_PROMPT,
     allowed_tools=PAYMENT_STATUS_TOOLS,
 )
@@ -180,8 +198,12 @@ REPLY
   quoting both figures when they differ. Never adjust the sender's number to fit.
 - On a load with several carriers, that rate is the sender's own carrier's rate and the reply
   must name which carrier it belongs to. Copy the pay-to verbatim from `pay_to` when the
-  question touches who was paid — it already pairs the carrier with the factoring company
+  question touches who WAS paid — it already pairs the carrier with the factoring company
   collecting for them. Never quote another carrier's rate or payment on a shared load.
+- Never write that payment will be made, sent, directed or issued to anyone. Who a settled
+  payment went to is a fact; who a future one will go to is a remit instruction you may not
+  agree to. If the intake message says the sender asked us to confirm where payments will be
+  sent, leave the pay-to, remit-to and factoring company out of the reply entirely.
 - Name each deduction with its reason and amount, then the net; or say there are none.
 - Say whether the invoice has been generated, and what NOA or factoring is on file.
 - Name the documents address from the intake message EXACTLY ONCE in the whole reply.
@@ -282,7 +304,11 @@ RATE_VERIFICATION_SKILL = Skill(
     # — so a rate verification for the carrier who ran leg three was answered with leg one's
     # figure. Verify against the sender's own entry in `carriers`, and never add two payables
     # together into a load-wide rate.
-    version="1.12.0",
+    #
+    # 1.13.0: the same past-tense rule and the same silence when the sender asked us to
+    # confirm where payments go — see payment_status 1.13.0. Both prompts gained the pay-to
+    # instruction in 1.12.0, so both could write the sentence the gate blocks.
+    version="1.13.0",
     system_prompt=_RATE_VERIFICATION_PROMPT,
     allowed_tools=RATE_VERIFICATION_TOOLS,
 )
@@ -462,6 +488,7 @@ def build_cargotel_payment_status_intake(
     documents_email: str = "freightpay@circledelivers.com",
     unlocated_loads: list[str] | None = None,
     withheld_loads: list[str] | None = None,
+    remit_confirmation_asked: bool = False,
     rate_question: bool = False,
     stated_rates: list[StatedRate] | None = None,
 ) -> str:
@@ -495,6 +522,7 @@ def build_cargotel_payment_status_intake(
             *_cargotel_rate_lines(rate_question, stated_rates),
             *_unlocated_line(unlocated_loads),
             *_withheld_line(withheld_loads),
+            *_remit_confirmation_line(remit_confirmation_asked),
             "",
             "Run the cargotel_payment_status procedure for the load id(s) above and submit a "
             "grounded draft.",
@@ -556,6 +584,38 @@ def _unlocated_line(unlocated_loads: list[str] | None) -> list[str]:
     ]
 
 
+def _remit_confirmation_line(asked: bool) -> list[str]:
+    """Tell the agent the sender wants the payment DIRECTION affirmed, and to refuse.
+
+    The one case where naming the pay-to is forbidden rather than required. Those two rules
+    look contradictory and are not: reporting who WAS paid on a settled load is a fact the
+    carrier is entitled to, while affirming who WILL be paid is agreeing to a remit
+    instruction, which §7 forbids however the sentence is phrased.
+
+    Live on load 2458412: RTS asked us to "confirm all payments will be made to RTS", and the
+    reply — correctly naming the pay-to for the payment-status answer — closed with "payment
+    will be directed to True Nation Inc c/o RTS Financial Service, Inc". Seventeen gate checks
+    passed and `change_acknowledgment` blocked the eighteenth, so nothing went out; but a
+    blocked draft is a carrier left unanswered, and the answerable half of that email (the
+    load is delivered, unbilled, no pay date yet) never reached them.
+
+    Detected in code, not inferred: the flag comes from the gate's own
+    :func:`~payment_bot.gate.presend.asks_to_confirm_payment_direction`, so the instruction
+    and the check that enforces it cannot disagree about which emails they apply to.
+    """
+
+    if not asked:
+        return []
+    return [
+        "- The sender asked us to CONFIRM where payments will be sent. Answer the payment "
+        "status only. Do NOT name the pay-to, the remit-to or the factoring company anywhere "
+        "in this reply, and never write that payment will be made, sent, directed or issued "
+        "to anyone — not the party they named, not the one on file, not 'accordingly'. Saying "
+        "who a payment WAS paid to is fine on other mail; agreeing to who it WILL go to is "
+        "not, and on this email the two are one sentence apart.",
+    ]
+
+
 def _withheld_line(withheld_loads: list[str] | None) -> list[str]:
     """Name the loads this reply does not cover, when the sender named them first.
 
@@ -591,6 +651,7 @@ def build_payment_status_intake(
     prenoa_loads: list[str] | None = None,
     unlocated_loads: list[str] | None = None,
     withheld_loads: list[str] | None = None,
+    remit_confirmation_asked: bool = False,
 ) -> str:
     """Compose the first user turn: the email plus the deterministic intake results."""
 
@@ -609,6 +670,7 @@ def build_payment_status_intake(
             f"- Missing paperwork should be emailed to: {documents_email}",
             *_unlocated_line(unlocated_loads),
             *_withheld_line(withheld_loads),
+            *_remit_confirmation_line(remit_confirmation_asked),
             *(
                 [
                     "- The sender is a roster-verified factoring company but no NOA is on "
@@ -635,6 +697,7 @@ def build_rate_verification_intake(
     prenoa_loads: list[str] | None = None,
     unlocated_loads: list[str] | None = None,
     withheld_loads: list[str] | None = None,
+    remit_confirmation_asked: bool = False,
 ) -> str:
     """Compose the first user turn for rate verification, including the stated amount(s)."""
 
@@ -662,6 +725,7 @@ def build_rate_verification_intake(
             f"- Missing paperwork should be emailed to: {documents_email}",
             *_unlocated_line(unlocated_loads),
             *_withheld_line(withheld_loads),
+            *_remit_confirmation_line(remit_confirmation_asked),
             *(
                 [
                     "- The sender is a roster-verified factoring company but no NOA is on "

@@ -167,6 +167,26 @@ _PAYMENT_DIRECTION_RE = re.compile(
 )
 
 
+def asks_to_confirm_payment_direction(email: InboundEmail) -> bool:
+    """Has the sender asked us to affirm where their payments go?
+
+    The inbound half of :func:`_confirms_payment_direction`, lifted out so the intake can
+    read it too. The gate blocking a reply that agrees to a remit address is the control; a
+    reply that never writes the sentence is the better outcome, and only the deterministic
+    detector can tell the model which kind of email it is looking at.
+
+    Reads subject and body with quoted text stripped, exactly as the gate does — so the two
+    can never disagree about whether the sender asked.
+    """
+
+    asked = "\n".join(
+        part
+        for part in (email.subject, strip_quoted(email.body), strip_quoted(email.html_text))
+        if part
+    )
+    return bool(_REMIT_CONFIRMATION_REQUEST_RE.search(asked))
+
+
 def _confirms_payment_direction(
     draft_body: str, email: InboundEmail, *, change_announced: bool = False
 ) -> str | None:
@@ -184,12 +204,7 @@ def _confirms_payment_direction(
     has asked us to affirm where their money goes does agreeing to it become the §7 problem.
     """
 
-    asked = "\n".join(
-        part
-        for part in (email.subject, strip_quoted(email.body), strip_quoted(email.html_text))
-        if part
-    )
-    requested = bool(_REMIT_CONFIRMATION_REQUEST_RE.search(asked))
+    requested = asks_to_confirm_payment_direction(email)
     if not (requested or change_announced):
         return None
     match = _PAYMENT_DIRECTION_RE.search(draft_body)

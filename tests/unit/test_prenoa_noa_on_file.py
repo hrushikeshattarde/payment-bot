@@ -44,9 +44,9 @@ class _Tp:
 
     def __init__(self, *, noa_on_file: bool, factoring_company: str | None = None) -> None:
         self._ctx = AuthorizationContext(
-            carrier_company=CARRIER,
+            carrier_companies=(CARRIER,),
             authorized_emails=("mapleridgelivestock@gmail.com", "cordellb623@gmail.com"),
-            factoring_company=factoring_company,
+            payable_parties=((CARRIER, factoring_company),),
             noa_on_file=noa_on_file,
         )
 

@@ -176,10 +176,13 @@ and **external third-party APIs** (consumed over HTTPS with their own credential
 > [`clients/transport_pro_http.py`](../src/payment_bot/clients/transport_pro_http.py) —
 > build it with `build_transport_pro_client()` from `PAYBOT_TP_*` config, one client per
 > email. `payment_information` is the primary read: it returns the full §4.3.0 payload, so
-> a single call serves both skills. Three facts have **no endpoint** in the Public API and
-> are derived from that payload rather than invented — settlement entries (from settled
-> earning lines), NOA/factoring (from `remit_to` + factoring documents), and authorized
-> parties (carrier company + dispatch contact emails). The remaining §9 open item for TP is
+> a single call serves both skills. It returns **one entry per carrier with a payable on the
+> load** — several on a load re-dispatched or split across legs — read via
+> `get_load_payables`; `get_load` is the first entry only. Three facts have **no endpoint**
+> in the Public API and are derived from that payload rather than invented — settlement
+> entries (from settled earning lines on every payable, each carrying its own pay-to),
+> NOA/factoring (from each `remit_to` + factoring documents), and authorized parties (every
+> payable's carrier and factor, plus dispatch carriers and contact emails). The remaining §9 open item for TP is
 > confirming the **base URL** and whether `payment_information` is keyed by the
 > carrier-facing load number or the internal record id (the client keys by the number from
 > the email and never trusts the echoed id). Carrier-name lookup is still not built.

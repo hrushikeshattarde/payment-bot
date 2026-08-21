@@ -42,9 +42,9 @@ class _Tp:
         if self._raises:
             raise ClientError(f"load {load_id} unreadable")
         return AuthorizationContext(
-            carrier_company="American Logistics Prime Line Inc",
+            carrier_companies=("American Logistics Prime Line Inc",),
             authorized_emails=("dispatch@alpl.example",),
-            factoring_company=self._factor,
+            payable_parties=(("American Logistics Prime Line Inc", self._factor),),
         )
 
 

@@ -271,7 +271,7 @@ pipeline = PaymentBotPipeline(
 
 | Read | Endpoint |
 |---|---|
-| Load status, earnings, deductions, pay dates, remit-to | `GET /voiceai/load/{load_number}/payment_information` |
+| Per-carrier payables: status, earnings, deductions, pay dates, remit-to | `GET /voiceai/load/{load_number}/payment_information` |
 | Dispatch rows (carrier + status) | `GET /dispatch/search?loadId={load_number}` |
 | Indexed documents | `GET /files/search?recordType=loads&recordId={internal id}` |
 | Auth | `POST /auth` — HTTP Basic → `access_token`/`refresh_token`, then Bearer |
@@ -283,17 +283,28 @@ and `rate_verification` (gross = Σ earnings, each deduction with its reason, ne
 Build a **client per email** — it caches each load for its lifetime so every tool in one
 run sees the same consistent snapshot.
 
-Three behaviours worth knowing:
+Four behaviours worth knowing:
 
+* **`payment_information` returns one entry per CARRIER, not one per load.** A load
+  dispatched once returns a single entry and the distinction never shows. A load
+  re-dispatched after a cancellation, or split across legs, returns several — each with its
+  own `account_information` (carrier *and* `remit_to`), its own earnings, its own deductions.
+  Read them with `get_load_payables`; `get_load` returns the first and is right only where
+  one carrier is all the caller can act on. Load 2436437 has three: FOX CARRIERS ($905,
+  remitted to eCapital), Alina Transport ($150, remitted to RTS Financial Service) and
+  Parasource ($5,230, remitted to England Carrier Services). The client used to read
+  `results[0]`, so Parasource was denied their own load and their $5,000 was never read.
 * **The load id you pass is not the one the API echoes.** `/voiceai/load/…` takes the
   carrier-facing 7-digit number but returns Transport Pro's internal record id
   (`/voiceai/load/2333606` → `load_id: 1303298`). The client keeps the number the carrier
   asked about for the reply and uses the internal id only as the file-search `recordId`.
 * **Three facts have no endpoint** and are derived, never invented: settlement entries
-  (from settled earning lines), NOA/factoring (from `remit_to` plus factoring documents,
-  with the evidence reported), and authorized parties (carrier company plus dispatch
-  contact emails). Anything unavailable stays empty, so an unknown sender falls through to
-  DENY and the gate blocks.
+  (from settled earning lines across every payable, each stamped with that payable's pay-to
+  — `Parasource Inc c/o England Carrier Services`), NOA/factoring (from each `remit_to`
+  plus factoring documents, with the evidence reported), and authorized parties (every
+  payable's carrier and factor, every dispatch row's carrier, plus dispatch contact emails).
+  Anything unavailable stays empty, so an unknown sender falls through to DENY and the gate
+  blocks.
 * **No carrier rate exists on a dispatch row**, so `carrier_cross_check` corroborates the
   carrier name only; the authoritative rate always comes from `compute_carrier_rate` over
   the `payment_information` earnings.

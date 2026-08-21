@@ -1042,6 +1042,18 @@ class PaymentBotPipeline:
             authorized_loads.append(load_id)
             if auth.pre_noa:
                 prenoa_loads.append(load_id)
+            # Narrow what the tools may read on this load to the carrier the sender actually
+            # matched, when the match named one. This is the enforcement half of the
+            # multi-carrier fix: authorization decided the sender may be answered ABOUT the
+            # load, and this decides WHICH of its carriers' money that covers. Parasource
+            # asking about 2436437 gets Parasource's $5,000, not the $905 FOX CARRIERS was
+            # paid for another leg of the same load. Empty means no restriction — see
+            # ToolContext.disclosable_carriers.
+            if auth.matched_carriers:
+                ctx.disclosable_carriers[load_id] = auth.matched_carriers
+            else:
+                # A second pass after the roster widened must not inherit a stale narrowing.
+                ctx.disclosable_carriers.pop(load_id, None)
         return unauthorized, authorized_loads, prenoa_loads, unresolved_loads, cancelled_loads
 
     def _auto_add_factoring_domains(
@@ -1093,12 +1105,20 @@ class PaymentBotPipeline:
                     continue
             except PaymentBotError:
                 continue
-            candidate = build_candidate(
-                sender_email=email.from_email,
-                factor_on_file=auth.factoring_company or "",
-                load_ids=(load_id,),
-                settings=self._settings,
-            )
+            # One candidate per factor OF RECORD on the load. A re-dispatched load is
+            # factored per leg — 2436437 carries eCapital, RTS and England Carrier Services —
+            # and reading only the first meant the roster could never be widened for the
+            # others, however plainly the sender's domain named them.
+            candidates = [
+                build_candidate(
+                    sender_email=email.from_email,
+                    factor_on_file=factor_on_file,
+                    load_ids=(load_id,),
+                    settings=self._settings,
+                )
+                for factor_on_file in (auth.factoring_companies or ("",))
+            ]
+            candidate = next((c for c in candidates if c is not None), None)
             if candidate is None:
                 continue  # no factor on file: nothing to attach the domain to
             if candidate.free_mail:
@@ -1222,11 +1242,12 @@ class PaymentBotPipeline:
                     )
                     continue
                 on_file.update(auth.authorized_emails)
-                if not auth.factoring_company:
-                    continue
-                factors.setdefault(auth.factoring_company, []).append(load_id)
-                if auth.carrier_company:
-                    carriers.add(auth.carrier_company)
+                carriers.update(auth.carrier_companies)
+                # Every factor of record on the load, not just the first payable's: the block
+                # exists to tell a reviewer which rostered domains we already hold against the
+                # names on this load, and a load factored per leg has several.
+                for factor_on_file in auth.factoring_companies:
+                    factors.setdefault(factor_on_file, []).append(load_id)
 
             blocks: list[str] = []
             for factor, loads in factors.items():

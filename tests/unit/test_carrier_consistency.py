@@ -43,7 +43,7 @@ class _TwoCarrierTp:
     def get_authorization_context(self, load_id: str):  # type: ignore[no-untyped-def]
         base = self._inner.get_authorization_context("2462934")
         if load_id == "1669695":
-            return base.model_copy(update={"carrier_company": self._second_carrier})
+            return base.model_copy(update={"carrier_companies": (self._second_carrier,)})
         return base
 
 
@@ -134,7 +134,10 @@ class _FactoredToOneCompanyTp:
             else "Forever13 Azorie Reynolds Trucking Llc"
         )
         return base.model_copy(
-            update={"carrier_company": carrier, "factoring_company": "Engaged Financial"}
+            update={
+                "carrier_companies": (carrier,),
+                "payable_parties": ((carrier, "Engaged Financial"),),
+            }
         )
 
 

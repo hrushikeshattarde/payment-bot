@@ -39,9 +39,9 @@ def _factored_tp(factoring_company: str = "England Carrier Services") -> MockTra
             settlement=fixture.settlement,
             files=fixture.files,
             authorization=AuthorizationContext(
-                carrier_company="Idea Expedited, Inc",
+                carrier_companies=("Idea Expedited, Inc",),
                 authorized_emails=(),
-                factoring_company=factoring_company,
+                payable_parties=(("Idea Expedited, Inc", factoring_company),),
                 factoring_emails=("ar@englandcarrier.com",),
             ),
         )
@@ -221,7 +221,7 @@ def _carrier_ctx(contacts: dict[str, tuple[str, ...]]) -> ToolContext:
             files=fixture.files,
             noa_factoring=fixture.noa_factoring,
             authorization=AuthorizationContext(
-                carrier_company=CARRIER, authorized_emails=()
+                carrier_companies=(CARRIER,), authorized_emails=()
             ),
         )
     )
@@ -334,7 +334,7 @@ def test_a_free_mail_domain_in_the_roster_authorises_nobody() -> None:
     earth that factor, on every load factored to them, silently and forever.
     """
 
-    from payment_bot.tools.shared import _is_configured_factor_domain
+    from payment_bot.tools.shared import _configured_factor_domain
 
     ctx = ToolContext(
         tp=sample_transport_pro_client(),
@@ -346,14 +346,14 @@ def test_a_free_mail_domain_in_the_roster_authorises_nobody() -> None:
     )
 
     for sender in ("anyone@gmail.com", "attacker@gmail.com", "real.factor@gmail.com"):
-        assert _is_configured_factor_domain("Acme Factoring", sender, ctx) is False, sender
+        assert _configured_factor_domain(["Acme Factoring"], sender, ctx) is None, sender
 
 
 @pytest.mark.unit
 def test_the_guard_does_not_disturb_a_legitimate_roster_entry() -> None:
     """The corporate case is the common one and must be untouched."""
 
-    from payment_bot.tools.shared import _is_configured_factor_domain
+    from payment_bot.tools.shared import _configured_factor_domain
 
     ctx = ToolContext(
         tp=sample_transport_pro_client(),
@@ -368,8 +368,8 @@ def test_the_guard_does_not_disturb_a_legitimate_roster_entry() -> None:
         ),
     )
 
-    assert _is_configured_factor_domain("RTS Financial Service, Inc", "ar@rtsfinancial.com", ctx)
-    assert not _is_configured_factor_domain("RTS Financial Service, Inc", "ar@gmail.com", ctx)
+    assert _configured_factor_domain(["RTS Financial Service, Inc"], "ar@rtsfinancial.com", ctx)
+    assert not _configured_factor_domain(["RTS Financial Service, Inc"], "ar@gmail.com", ctx)
 
 
 @pytest.mark.unit
@@ -406,7 +406,7 @@ def test_a_free_mail_address_in_the_roster_authorises_that_mailbox() -> None:
     mailbox. Both forms live in the same list, so an entry says what it grants by its shape.
     """
 
-    from payment_bot.tools.shared import _is_configured_factor_domain
+    from payment_bot.tools.shared import _configured_factor_domain
 
     ctx = ToolContext(
         tp=sample_transport_pro_client(),
@@ -417,17 +417,17 @@ def test_a_free_mail_address_in_the_roster_authorises_that_mailbox() -> None:
         ),
     )
 
-    assert _is_configured_factor_domain("Acme Factoring", "billing@gmail.com", ctx) is True
+    assert _configured_factor_domain(["Acme Factoring"], "billing@gmail.com", ctx) is not None
     # And nothing else at that provider, which is the entire point.
     for other in ("someone.else@gmail.com", "billing@gmail.com.evil.net", "billing@yahoo.com"):
-        assert _is_configured_factor_domain("Acme Factoring", other, ctx) is False, other
+        assert _configured_factor_domain(["Acme Factoring"], other, ctx) is None, other
 
 
 @pytest.mark.unit
 def test_an_address_entry_still_answers_only_for_its_own_factor() -> None:
     """The per-load factor comparison is unchanged by the address form."""
 
-    from payment_bot.tools.shared import _is_configured_factor_domain
+    from payment_bot.tools.shared import _configured_factor_domain
 
     ctx = ToolContext(
         tp=sample_transport_pro_client(),
@@ -438,15 +438,15 @@ def test_an_address_entry_still_answers_only_for_its_own_factor() -> None:
         ),
     )
 
-    assert _is_configured_factor_domain("Acme Factoring", "billing@gmail.com", ctx) is True
-    assert _is_configured_factor_domain("RTS Financial", "billing@gmail.com", ctx) is False
+    assert _configured_factor_domain(["Acme Factoring"], "billing@gmail.com", ctx) is not None
+    assert _configured_factor_domain(["RTS Financial"], "billing@gmail.com", ctx) is None
 
 
 @pytest.mark.unit
 def test_a_corporate_domain_entry_is_unchanged_by_the_address_form() -> None:
     """The ordinary case is the common one: a factor writes from ar@, billing@, noa@."""
 
-    from payment_bot.tools.shared import _is_configured_factor_domain
+    from payment_bot.tools.shared import _configured_factor_domain
 
     ctx = ToolContext(
         tp=sample_transport_pro_client(),
@@ -459,8 +459,8 @@ def test_a_corporate_domain_entry_is_unchanged_by_the_address_form() -> None:
     )
 
     for sender in ("ar@rtsfinancial.com", "billing@rtsfinancial.com", "x@ryanrts.com"):
-        assert _is_configured_factor_domain("RTS Financial Service, Inc", sender, ctx), sender
-    assert not _is_configured_factor_domain("RTS Financial Service, Inc", "x@other.com", ctx)
+        assert _configured_factor_domain(["RTS Financial Service, Inc"], sender, ctx), sender
+    assert not _configured_factor_domain(["RTS Financial Service, Inc"], "x@other.com", ctx)
 
 
 @pytest.mark.unit

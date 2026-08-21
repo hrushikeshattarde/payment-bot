@@ -841,6 +841,14 @@ class PreSendGate:
         unreachable Transport Pro must not turn every draft into a block. Comparison is on a
         casefolded name, because the API returns inconsistent capitalisation for the same
         company ("Rad Logistics One Llc" vs "RAD LOGISTICS ONE LLC").
+
+        **A load can belong to several carriers**, so the test is whether the disclosed loads
+        SHARE one, not whether each reports the same single name. A load re-dispatched across
+        legs has a payable per carrier (see ``TransportProLoad``); on such a load the old
+        one-name comparison read whichever carrier came first in the array, so two loads the
+        same carrier genuinely ran could be reported as a mix — and two loads with nothing in
+        common could pass if their first entries happened to agree. Intersecting the sets is
+        exactly the old behaviour wherever every load has one carrier, which is nearly always.
         """
 
         for load_id in draft.load_ids:
@@ -863,18 +871,22 @@ class PreSendGate:
                     detail="factoring sender; one factor legitimately spans several carriers",
                 )
 
-        by_carrier: dict[str, list[str]] = {}
+        per_load: list[tuple[str, frozenset[str]]] = []
         for load_id in draft.load_ids:
             try:
-                carrier = (self._carrier_for(load_id, ctx) or "").strip()
+                carriers = self._carriers_for(load_id, ctx)
             except (ClientError, ToolError):
                 continue
-            if carrier:
-                by_carrier.setdefault(carrier.casefold(), []).append(load_id)
+            if carriers:
+                per_load.append((load_id, carriers))
 
-        if len(by_carrier) > 1:
+        shared: frozenset[str] = frozenset()
+        for index, (_, carriers) in enumerate(per_load):
+            shared = carriers if index == 0 else shared & carriers
+
+        if per_load and not shared:
             spread = "; ".join(
-                f"{loads} = {carrier!r}" for carrier, loads in sorted(by_carrier.items())
+                f"{load_id} = {sorted(carriers)!r}" for load_id, carriers in per_load
             )
             return GateCheck(
                 name="carrier_consistency",
@@ -886,13 +898,13 @@ class PreSendGate:
             passed=True,
             detail=(
                 "all disclosed loads belong to one carrier"
-                if by_carrier
+                if per_load
                 else "no carrier to compare"
             ),
         )
 
-    def _carrier_for(self, load_id: str, ctx: ToolContext) -> str | None:
-        """The carrier a disclosed load belongs to, asking whichever system owns it.
+    def _carriers_for(self, load_id: str, ctx: ToolContext) -> frozenset[str]:
+        """Every carrier a disclosed load belongs to, casefolded, asking the system that owns it.
 
         Routed by id length rather than always asking Transport Pro. Asking TP about a
         6-digit id does not fail usefully — it raises, the caller's ``except`` skips the
@@ -906,8 +918,12 @@ class PreSendGate:
                 raise ToolError(
                     f"load {load_id} is a 6-digit load but no CargoTel client is wired"
                 )
-            return ctx.cargotel.get_authorization_context(load_id).carrier_company
-        return ctx.tp.get_authorization_context(load_id).carrier_company
+            auth = ctx.cargotel.get_authorization_context(load_id)
+        else:
+            auth = ctx.tp.get_authorization_context(load_id)
+        return frozenset(
+            name.strip().casefold() for name in auth.carrier_companies if name.strip()
+        )
 
     def _check_grounding(self, draft: SubmitDraftOutput, ctx: ToolContext) -> GateCheck:
         # Magnitudes on both sides — the ledger stores them that way, see record_amount.

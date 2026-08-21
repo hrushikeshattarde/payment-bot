@@ -97,16 +97,25 @@ def build_authorization_context(
     holds no address for it, so a factor writing in cannot be matched here. That is the same
     gap the Transport Pro path has, and it has the same answer — a curated domain roster —
     rather than being papered over by matching on the factor's name.
+
+    The party fields are tuples because Transport Pro's loads need them to be (a load there
+    has one payable per carrier). CargoTel is genuinely one carrier per load, so these are
+    tuples of one — the shape is shared, the data is not being stretched to fit it.
     """
 
     if carrier is None:
-        return AuthorizationContext(carrier_company=load.carrier_name)
+        return AuthorizationContext(
+            carrier_companies=(load.carrier_name,) if load.carrier_name else ()
+        )
+    name = carrier.name or load.carrier_name
     return AuthorizationContext(
-        carrier_company=carrier.name or load.carrier_name,
+        carrier_companies=(name,) if name else (),
         authorized_emails=carrier.emails,
+        # One carrier per load here, so every contact is trivially attributable to it.
+        carrier_contacts=tuple((name, e.lower()) for e in carrier.emails) if name else (),
         # The trimmed factor, NOT the raw "<factor> C/O <carrier>" string — see
         # `CargoTelCarrier.factoring_company`. Passing the raw value lets the carrier's own
         # words match an unrelated factor in the roster, which is a live hole on this data.
-        factoring_company=carrier.factoring_company,
+        payable_parties=((name, carrier.factoring_company),) if name else (),
         factoring_emails=(),
     )

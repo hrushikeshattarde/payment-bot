@@ -218,4 +218,6 @@ def test_the_prompt_tells_the_model_a_superseded_cancellation_is_not_a_hold() ->
     assert "NOT a hold reason when `cancel_confirmation_superseded` is true" in prompt
     assert "`has_cancel_confirmation` is load-level" in prompt
     assert "their leg ran" in prompt
-    assert RATE_VERIFICATION_SKILL.version == "1.11.0"
+    # 1.12.0 added the multi-carrier rules; the superseded-cancellation rule above is
+    # unchanged and still has to be in the prompt.
+    assert RATE_VERIFICATION_SKILL.version == "1.12.0"

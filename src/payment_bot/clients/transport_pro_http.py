@@ -11,6 +11,7 @@ Endpoint selection
 Protocol method               Transport Pro endpoint
 ============================  ===============================================================
 ``get_load``                  ``GET /voiceai/load/{load_number}/payment_information``
+``get_load_payables``         ``GET /voiceai/load/{load_number}/payment_information``
 ``get_dispatch_history``      ``GET /dispatch/search?loadId={load_number}``
 ``get_file_history``          ``GET /files/search?recordType=loads&recordId={internal_id}``
 ``get_settlement_entries``    *(no endpoint)* — derived from settled earning lines
@@ -27,8 +28,13 @@ call therefore serves ``payment_status`` (per-line pay dates via the Mon/Thu rul
 
 Three live-API details this client absorbs so the rest of the codebase never sees them:
 
-1. **The payload is array-wrapped.** ``payment_information`` returns ``[ { …load… } ]``,
-   not a bare object. An empty array means the load was CANCELLED →
+1. **The payload is an array of PAYABLES, one per carrier** — not a one-element wrapper
+   around "the load". ``payment_information`` returns ``[ {…carrier A…}, {…carrier B…} ]``
+   for a load re-dispatched or split across legs, each entry with its own
+   ``account_information``, ``remit_to``, ``earnings`` and ``deductions``. This client read
+   ``results[0]``, so on a multi-carrier load the other carriers, their payments and their
+   factors did not exist as far as the bot was concerned — see :meth:`get_load_payables`.
+   An empty array means the load was CANCELLED →
    :class:`~payment_bot.errors.LoadCancelledError`, same as the 400 that path returns.
 2. **The echoed ``load_id`` is not the id you asked for.** The ``/voiceai/load/…`` paths
    take the carrier-facing load number but return Transport Pro's internal record id
@@ -134,7 +140,7 @@ class TransportProHttpClient:
         self._timeout = timeout
         self._cache_loads = cache_loads
         self._tokens = _Tokens()
-        self._load_cache: dict[str, TransportProLoad] = {}
+        self._payables_cache: dict[str, list[TransportProLoad]] = {}
         self._dispatch_cache: dict[str, list[dict[str, Any]]] = {}
 
     # -- auth ----------------------------------------------------------------
@@ -235,12 +241,37 @@ class TransportProHttpClient:
 
     # -- TransportProClient --------------------------------------------------
     def get_load(self, load_id: str) -> TransportProLoad:
-        """Fetch the §4.3.0 payload via ``/voiceai/load/{n}/payment_information``."""
+        """The FIRST payable on the load, via ``/voiceai/load/{n}/payment_information``.
+
+        Kept for the callers that legitimately act on one carrier at a time. Anything that
+        has to be right about WHO — authorization, settlement, the reply itself — reads
+        :meth:`get_load_payables` instead.
+        """
+
+        return self.get_load_payables(load_id)[0]
+
+    def get_load_payables(self, load_id: str) -> list[TransportProLoad]:
+        """Every carrier's payable on the load, in the order the API returns them.
+
+        ``payment_information`` returns an array with **one entry per carrier that has a
+        payable on the load** — not, as this client assumed, a one-element wrapper around
+        "the load". A load dispatched once returns one entry and the difference never shows.
+        A load re-dispatched or split across legs returns several, each with its own
+        ``account_information`` (carrier *and* ``remit_to``), earnings, deductions and
+        waypoints.
+
+        Live on 2436437, three entries: FOX CARRIERS ($905 → eCapital Freight Factoring),
+        Alina Transport ($150 TONU → RTS Financial Service), Parasource Inc ($5,000 line haul
+        paid 06/25 plus a $230 lumper on 08/12 → England Carrier Services). Taking
+        ``results[0]`` made the bot's whole picture of that load FOX CARRIERS' $905:
+        Parasource's name was unknown to authorization, so they were DENIED asking about their
+        own load, and their $5,000 was not merely left out of the reply — it had never been read.
+        """
 
         key = load_id.strip()
-        cached = self._load_cache.get(key)
+        cached = self._payables_cache.get(key)
         if cached is not None:
-            return cached
+            return list(cached)
 
         # Both "no payable record" signals mean the same thing and are translated here rather
         # than in `_get`: 400/404 is generic at that level, but on THIS path it is Transport
@@ -263,7 +294,28 @@ class TransportProHttpClient:
                 "(empty result) — the load was cancelled"
             )
 
-        record = dict(rows[0])
+        payables = [self._payable(row, key, load_id) for row in rows]
+        if len(payables) > 1:
+            # Worth a log line of its own: it decides which carrier a reply is even about,
+            # and until now it was the silent difference between a complete answer and a
+            # confidently wrong one.
+            _log.info(
+                "transport_pro_load_has_several_payables",
+                extra={
+                    "load_id": key,
+                    "count": len(payables),
+                    "carriers": [p.carrier_company for p in payables],
+                },
+            )
+
+        if self._cache_loads:
+            self._payables_cache[key] = list(payables)
+        return payables
+
+    def _payable(self, row: dict[str, Any], key: str, load_id: str) -> TransportProLoad:
+        """Parse one ``payment_information`` entry into a payable, in app calendar space."""
+
+        record = dict(row)
         # Preserve the id the carrier asked about; the echoed load_id is TP's internal one.
         record["load_number"] = key
         try:
@@ -279,7 +331,7 @@ class TransportProHttpClient:
         # boundary, so every consumer — the grounding ledger, the Mon/Thu rule, the drafts —
         # speaks the application's calendar. The mock client is untouched: sample data is
         # authored in app-space already.
-        load = load.model_copy(
+        return load.model_copy(
             update={
                 "earnings": [
                     e.model_copy(
@@ -292,10 +344,6 @@ class TransportProHttpClient:
                 ]
             }
         )
-
-        if self._cache_loads:
-            self._load_cache[key] = load
-        return load
 
     def get_dispatch_history(self, load_id: str) -> list[DispatchRow]:
         """Dispatch rows via ``/dispatch/search?loadId=``.
@@ -329,32 +377,42 @@ class TransportProHttpClient:
         return out
 
     def get_settlement_entries(self, load_id: str) -> list[SettlementEntry]:
-        """Settlement rows derived from settled earning lines.
+        """Settlement rows derived from settled earning lines, across EVERY payable.
 
         Transport Pro has no settlement-entries endpoint in the Public API. An earning
         line that carries a ``settlement_id`` or an ``actual_payment_date`` *is* a
         settlement record, so we surface exactly those and nothing more. An unsettled load
         yields ``[]``, which is what ``tp_get_settlement_entries`` reports as "not settled".
+
+        Walks all payables, not just the first, and stamps each row with that payable's own
+        pay-to — ``"Parasource Inc c/o England Carrier Services"``, the string the Settlement
+        Entries screen shows. Both halves of the usual enquiry are then answerable from the
+        row itself: which carrier the money was for, and who collected it.
+
+        This is the whole of what was missing on 2436437. The $5,000 line haul paid 06/25 and
+        the $230 lumper on 08/12 belong to Parasource's payable — the third in the array — so
+        a reply built off ``results[0]`` could only ever report FOX CARRIERS' $905 and had no
+        way to know the other two rows existed.
         """
 
-        load = self.get_load(load_id)
-        carrier = load.account_information.company_name if load.account_information else None
         entries: list[SettlementEntry] = []
-        for earning in load.earnings:
-            if earning.settlement_id is None and earning.actual_payment_date is None:
-                continue
-            entries.append(
-                SettlementEntry(
-                    amount=earning.amount,
-                    carrier_name=carrier,
-                    settle_date=None,  # not exposed separately by the API
-                    pay_date=earning.actual_payment_date,
-                    payment_method=earning.payment_method,
-                    check_or_ref=earning.check_number,
-                    line_type="settlement",
-                    description=earning.title,
+        for payable in self.get_load_payables(load_id):
+            pay_to = payable.pay_to
+            for earning in payable.earnings:
+                if earning.settlement_id is None and earning.actual_payment_date is None:
+                    continue
+                entries.append(
+                    SettlementEntry(
+                        amount=earning.amount,
+                        carrier_name=pay_to,
+                        settle_date=None,  # not exposed separately by the API
+                        pay_date=earning.actual_payment_date,
+                        payment_method=earning.payment_method,
+                        check_or_ref=earning.check_number,
+                        line_type="settlement",
+                        description=earning.title,
+                    )
                 )
-            )
         return entries
 
     def get_file_history(self, load_id: str) -> list[FileDocument]:
@@ -417,10 +475,13 @@ class TransportProHttpClient:
           ``Factoring Agreement/Releases``).
         """
 
-        load = self.get_load(load_id)
-        remit = load.account_information.remit_to if load.account_information else None
-        is_factoring = bool(remit and remit.is_factoring)
-        factoring_company = remit.company_name if (remit and is_factoring) else None
+        payables = self.get_load_payables(load_id)
+        # Every payable's remit-to, in order and de-duplicated: a re-dispatched load is
+        # factored per leg, and naming only the first leg's factor is how a carrier gets told
+        # about a factoring arrangement that is not theirs.
+        factors = list(dict.fromkeys(p.factoring_company for p in payables if p.factoring_company))
+        is_factoring = bool(factors)
+        factoring_company = "; ".join(factors) if factors else None
 
         factoring_docs = [
             doc.file_type
@@ -428,11 +489,17 @@ class TransportProHttpClient:
             if any(marker in doc.file_type.casefold() for marker in _FACTORING_DOC_TYPES)
         ]
 
+        document_evidence = (
+            f"factoring document(s) on file: {', '.join(sorted(set(factoring_docs)))}"
+            if factoring_docs
+            else None
+        )
         evidence: list[str] = []
         if is_factoring:
-            evidence.append(f"remit-to is {factoring_company or 'a third party'} (not self)")
-        if factoring_docs:
-            evidence.append(f"factoring document(s) on file: {', '.join(sorted(set(factoring_docs)))}")
+            noun = "remit-to is" if len(factors) == 1 else "remit-to per carrier is"
+            evidence.append(f"{noun} {factoring_company or 'a third party'} (not self)")
+        if document_evidence:
+            evidence.append(document_evidence)
 
         return NoaFactoring(
             noa_on_file=bool(is_factoring or factoring_docs),
@@ -442,39 +509,75 @@ class TransportProHttpClient:
                 if evidence
                 else "Remit-to self; no factoring document on file for this load."
             ),
+            by_carrier=tuple(
+                (p.carrier_company, p.factoring_company)
+                for p in payables
+                if p.carrier_company
+            ),
+            document_evidence=document_evidence,
         )
 
     def get_authorization_context(self, load_id: str) -> AuthorizationContext:
-        """Who may receive disclosure, assembled from the load and its dispatch contacts.
+        """Who may receive disclosure, assembled from every payable and the dispatch contacts.
 
         The API exposes no authorized-parties resource. What it does give us:
 
-        * the carrier company on the load (``account_information.company_name``) — enough
-          for ``check_authorization``'s sender-domain match;
+        * a carrier company per payable (``account_information.company_name``) and a carrier
+          per dispatch row — enough for ``check_authorization``'s sender-domain match;
+        * a factor of record per payable (``remit_to``), each eligible for FACTORING on the
+          usual terms;
         * carrier-side contact emails on the dispatch record, used as the explicit
-          allow-list.
+          allow-list — paired with the carrier each belongs to, so a sender recognised by
+          their address or domain can be narrowed to their own leg.
+
+        **Carriers come from all three sources, and that is the point.** This used to read one
+        string — ``results[0]``'s ``company_name`` — and every other carrier on the load was
+        therefore a stranger to authorization. Load 2436437 has three payables and five
+        dispatch rows; the one string was FOX CARRIERS, so Parasource asking about their own
+        $5,000 from ``parasourceinc.com`` matched nothing and was denied, and the denial then
+        dropped the load from the answer set, which is why the payment was missing from the
+        draft rather than merely unattributed.
+
+        Dispatch rows are read whatever their status, cancelled included. Two reasons: their
+        contact addresses are already on this load's allow-list (the loop below has always
+        taken every row), so refusing the carrier's *name* while accepting its *mailbox* would
+        be incoherent; and a carrier whose leg was cancelled has a real question about that
+        leg. What they may then be TOLD is a separate matter, kept separate — see
+        ``CheckAuthorizationOutput.matched_carriers`` and ``ToolContext.disclosable_carriers``.
 
         Anything we cannot establish is left empty, so an unrecognised sender falls through
         to DENY and the gate blocks the send.
         """
 
-        load = self.get_load(load_id)
-        remit = load.account_information.remit_to if load.account_information else None
-        is_factoring = bool(remit and remit.is_factoring)
+        payables = self.get_load_payables(load_id)
+
+        carriers: list[str] = [p.carrier_company for p in payables if p.carrier_company]
+        parties: tuple[tuple[str, str | None], ...] = tuple(
+            (p.carrier_company, p.factoring_company) for p in payables if p.carrier_company
+        )
 
         emails: list[str] = []
+        contacts: list[tuple[str, str]] = []
         for row in self._dispatch_rows(load_id):
             assigned = row.get("assignedTo") or {}
             if not isinstance(assigned, dict):
                 continue
             carrier = assigned.get("carrier")
             sources: list[Any] = [assigned.get("contacts")]
+            dispatched_to: str | None = None
             if isinstance(carrier, dict):
                 sources.extend([carrier.get("emailContacts"), carrier.get("contacts")])
+                dispatched_to = _text(carrier.get("companyName"))
+                if dispatched_to:
+                    carriers.append(dispatched_to)
             for source in sources:
-                emails.extend(_emails_from(source))
-
-        factoring_company = remit.company_name if (remit and is_factoring) else None
+                found = _emails_from(source)
+                emails.extend(found)
+                # Keep which carrier each address belongs to. Both live on the same dispatch
+                # row, and flattening them was why a sender authorized by their own domain
+                # could still be answered about another carrier's leg.
+                if dispatched_to:
+                    contacts.extend((dispatched_to, e.lower()) for e in found)
 
         # Whether an NOA is INDEXED, which `remit_to.company_name` does not answer: that field
         # is keyed in by hand and is routinely empty on loads whose NOA is on file. Reuses
@@ -489,11 +592,13 @@ class TransportProHttpClient:
             noa_on_file = False
 
         return AuthorizationContext(
-            carrier_company=(
-                load.account_information.company_name if load.account_information else None
-            ),
+            # De-duplicated case-insensitively but spelling preserved: the same carrier is
+            # "FOX CARRIERS" on one screen and "Fox Carriers" on another, and a reason line
+            # that lists it twice reads like two companies.
+            carrier_companies=_dedupe_names(carriers),
             authorized_emails=tuple(dict.fromkeys(e.lower() for e in emails)),
-            factoring_company=factoring_company,
+            carrier_contacts=tuple(dict.fromkeys(contacts)),
+            payable_parties=parties,
             # Factoring contact emails are not exposed; a factoring sender therefore
             # matches only by company-domain, and FACTORING is gated by policy anyway.
             factoring_emails=(),
@@ -516,6 +621,17 @@ class TransportProHttpClient:
 # ---------------------------------------------------------------------------
 # Parsing helpers — lenient by design: a missing field must never crash a run.
 # ---------------------------------------------------------------------------
+def _dedupe_names(names: list[str]) -> tuple[str, ...]:
+    """Company names in first-seen order, one entry per name, matched case-insensitively."""
+
+    seen: dict[str, str] = {}
+    for name in names:
+        cleaned = name.strip()
+        if cleaned:
+            seen.setdefault(cleaned.casefold(), cleaned)
+    return tuple(seen.values())
+
+
 def _text(value: object) -> str | None:
     if value is None or isinstance(value, bool):
         return None

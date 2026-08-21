@@ -198,12 +198,12 @@ def main(argv: list[str]) -> int:
         import types
 
         from payment_bot.config import Settings
-        from payment_bot.tools.shared import _is_configured_factor_domain
+        from payment_bot.tools.shared import _configured_factor_domain
 
         settings = Settings()
         ctx = types.SimpleNamespace(settings=settings)
         for name in _collateral(key, names) or [key]:
-            ok = _is_configured_factor_domain(name, args.sender, ctx)
+            ok = _configured_factor_domain([name], args.sender, ctx) is not None
             print(f"  {'AUTHORISED' if ok else 'still DENIED'}: {args.sender} on {name!r}")
     return 0
 

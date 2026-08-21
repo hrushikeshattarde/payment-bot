@@ -131,9 +131,9 @@ def build_load_2462934_fixture() -> LoadFixture:
             details="Remit-to self; no NOA or factoring company on file.",
         ),
         authorization=AuthorizationContext(
-            carrier_company="Idea Expedited, Inc",
+            carrier_companies=("Idea Expedited, Inc",),
             authorized_emails=(SAMPLE_SENDER_EMAIL,),
-            factoring_company=None,
+            payable_parties=(("Idea Expedited, Inc", None),),
             factoring_emails=(),
         ),
     )

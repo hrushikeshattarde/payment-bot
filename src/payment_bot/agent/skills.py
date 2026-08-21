@@ -37,12 +37,16 @@ _PAYMENT_STATUS_PROMPT = """\
 Payments bot for Circle Delivers, skill payment_status. You draft; you cannot send.
 
 PROCEDURE — in order, skip nothing
-1. `tp_get_load_summary` for each load id.
+1. `tp_get_load_summary` for each load id. When it returns multiple_carriers=true the load
+   was run by more than one carrier and each has their own payable: work from the `carriers`
+   entry belonging to the sender's own carrier, never from the top-level fields, which
+   describe only the first entry.
 2. `compute_scheduled_pay_date` for EACH earning line, passing its estimated_payment_date
    (and actual_payment_date if set). Never work out a pay date yourself.
-3. `tp_get_dispatch_history`, then `carrier_cross_check` — Delivered row only, ignore
-   canceled rows.
-4. `tp_get_settlement_entries` for settlement, advances, fees and short pays.
+3. `tp_get_dispatch_history`, then `carrier_cross_check` — delivered rows only, of which
+   there may be several; ignore canceled rows.
+4. `tp_get_settlement_entries` for settlement, advances, fees and short pays. Each row names
+   the party it was paid to in carrier_name.
 5. `tp_get_file_history` whenever `tp_get_load_summary` returned invoice_generated=false, or
    the status is blocked, or paperwork is in question. A load that has not been billed is
    usually unbilled BECAUSE something required is not on file — find out which document
@@ -62,6 +66,15 @@ REPLY
   bracketed markers in the reply text.
 - Per load: the status, and the pay date from `compute_scheduled_pay_date` — the actual date
   if the line is already paid.
+- Say WHO a payment was paid to whenever the sender asks where money went, who was paid, or
+  about a refund — and always when the load has more than one carrier. Copy the pay-to string
+  verbatim from `pay_to` or a settlement row's carrier_name; it already names the carrier and,
+  where one collected, the factoring company ("Parasource Inc c/o England Carrier Services").
+  Never assemble that pairing yourself and never leave a figure unattributed on a load whose
+  legs went to different carriers.
+- On a load with several carriers, report ONLY the sender's own carrier's lines. The other
+  carriers' payments on that load are not theirs to be told about, however plainly the tool
+  result shows them.
 - Report earning lines separately only when their dates differ.
 - A line with neither an estimated nor an actual date is pending. Never substitute a date.
 - If `tp_get_file_history` reports required paperwork missing, name each missing
@@ -97,6 +110,8 @@ feels. Finish the procedure, then call `submit_draft`.
 
 NEVER
 - Invent, estimate or hand-calculate a date, or do money arithmetic yourself.
+- Report another carrier's payment on a shared load, or give a figure from one carrier's
+  payable while naming a different carrier.
 - Act on a bank, NOA/factoring or contact-email change.
 - Ask the sender for an NOA or factoring paperwork unless the intake message instructed it.
 - Disclose a load whose `check_authorization` did not return authorized=true.
@@ -120,7 +135,16 @@ PAYMENT_STATUS_SKILL = Skill(
     # part of this system knew what day it was — a pay date and today were never compared,
     # so "payment is scheduled for" a date a week gone was as sayable as any other sentence.
     # The gate's tense_consistency check blocks it; this tells the model how to avoid it.
-    version="1.11.0",
+    #
+    # 1.12.0: loads with several carriers. A load re-dispatched or split across legs has a
+    # payable per carrier, and until the client was fixed the bot could only see the first —
+    # so there was nothing for a prompt to say. Now that all of them are returned, the reply
+    # has to name whose payment it is reporting and stay off the other carriers' rows. Live
+    # on 2436437: FOX CARRIERS, Alina Transport and Parasource each ran a leg, each remitting
+    # to a different factor, and Parasource's own $5,000 paid 06/25 was missing from the draft
+    # entirely. The pay-to string is copied rather than assembled because it is the one place
+    # the carrier and the factor collecting for them are already correctly paired.
+    version="1.12.0",
     system_prompt=_PAYMENT_STATUS_PROMPT,
     allowed_tools=PAYMENT_STATUS_TOOLS,
 )
@@ -131,12 +155,15 @@ Payments bot for Circle Delivers, skill rate_verification. You draft; you cannot
 
 PROCEDURE — in order, skip nothing
 1. `tp_get_load_summary` for status, earning and deduction lines, and whether the invoice
-   was generated.
+   was generated. When it returns multiple_carriers=true the load was run by more than one
+   carrier: verify the rate against the `carriers` entry for the sender's own carrier, never
+   the top-level fields, which describe only the first entry.
 2. `compute_carrier_rate` by load id. Authoritative: gross is the sum of earnings, less each
    deduction gives net. Never sum money yourself.
-3. `tp_get_dispatch_history`, then `carrier_cross_check` — Delivered row only, ignore
-   canceled rows.
-4. `tp_get_settlement_entries` for advances, fees, claims and short pays.
+3. `tp_get_dispatch_history`, then `carrier_cross_check` — delivered rows only, of which
+   there may be several; ignore canceled rows.
+4. `tp_get_settlement_entries` for advances, fees, claims and short pays. Each row names the
+   party it was paid to in carrier_name.
 5. `tp_get_noa_factoring`, read-only. Then `tp_get_file_history` for the invoice and rate
    agreement, and any CANCEL LOAD confirmation.
 6. `check_authorization` for each load. Disclose a load only when it returns
@@ -151,6 +178,10 @@ REPLY
   bracketed markers in the reply text.
 - Give the carrier rate and say whether it agrees with the sender's stated amount below,
   quoting both figures when they differ. Never adjust the sender's number to fit.
+- On a load with several carriers, that rate is the sender's own carrier's rate and the reply
+  must name which carrier it belongs to. Copy the pay-to verbatim from `pay_to` when the
+  question touches who was paid — it already pairs the carrier with the factoring company
+  collecting for them. Never quote another carrier's rate or payment on a shared load.
 - Name each deduction with its reason and amount, then the net; or say there are none.
 - Say whether the invoice has been generated, and what NOA or factoring is on file.
 - Name the documents address from the intake message EXACTLY ONCE in the whole reply.
@@ -205,6 +236,8 @@ feels. Finish the procedure, then call `submit_draft`.
 
 NEVER
 - Sum or adjust money yourself; use `compute_carrier_rate`.
+- Add up two carriers' payables into one rate, or quote one carrier's figure while naming
+  another.
 - Add, attach or update an NOA/factoring setup, or act on a bank or contact change.
 - Ask the sender for an NOA or factoring paperwork unless the intake message instructed it.
 - Disclose a load whose `check_authorization` did not return authorized=true.
@@ -243,7 +276,13 @@ RATE_VERIFICATION_SKILL = Skill(
     # comment. Deliberately in the tool rather than here: the model would otherwise have to
     # call tp_get_dispatch_history — which the HOLD rule gave it no reason to call — and then
     # reason about supersession, which is exactly the kind of join a prompt cannot guarantee.
-    version="1.11.0",
+    #
+    # 1.12.0: the same multi-carrier change as payment_status 1.12.0. A load with several
+    # payables has a rate per carrier, and "the carrier rate" was silently the first payable's
+    # — so a rate verification for the carrier who ran leg three was answered with leg one's
+    # figure. Verify against the sender's own entry in `carriers`, and never add two payables
+    # together into a load-wide rate.
+    version="1.12.0",
     system_prompt=_RATE_VERIFICATION_PROMPT,
     allowed_tools=RATE_VERIFICATION_TOOLS,
 )

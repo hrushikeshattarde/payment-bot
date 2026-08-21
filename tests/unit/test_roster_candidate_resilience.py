@@ -47,9 +47,9 @@ class _Tp:
                 f"Transport Pro GET /voiceai/load/{load_id}/payment_information failed (HTTP 400)"
             )
         return AuthorizationContext(
-            carrier_company="Blue Hawk Trucking Inc",
+            carrier_companies=("Blue Hawk Trucking Inc",),
             authorized_emails=("dispatch@bluehawk.example",),
-            factoring_company="Aladdin Financial, Inc.",
+            payable_parties=(("Blue Hawk Trucking Inc", "Aladdin Financial, Inc."),),
         )
 
 

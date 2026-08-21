@@ -86,9 +86,9 @@ def _carrier_for(load_id: str, tp: Any, cgt: Any) -> str | None:
     system = route_load(load_id).system
     try:
         if system is System.QUICKBOOKS:
-            return None if cgt is None else cgt.get_authorization_context(load_id).carrier_company
+            return None if cgt is None else cgt.get_authorization_context(load_id).carrier_label
         if system is System.TRANSPORT_PRO:
-            return tp.get_authorization_context(load_id).carrier_company
+            return tp.get_authorization_context(load_id).carrier_label
     except Exception:
         # A load that will not resolve tells us nothing about who may write about it. It is
         # not an error to report: phantom ids reach this mailbox constantly.

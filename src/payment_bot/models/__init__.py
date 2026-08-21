@@ -31,6 +31,7 @@ from payment_bot.models.transport_pro import (
     TransportProLoad,
     Waypoint,
     WaypointDate,
+    split_care_of,
 )
 
 __all__ = [
@@ -57,4 +58,5 @@ __all__ = [
     "TransportProLoad",
     "Waypoint",
     "WaypointDate",
+    "split_care_of",
 ]

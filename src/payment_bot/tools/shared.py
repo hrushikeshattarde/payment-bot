@@ -8,7 +8,7 @@ to :mod:`payment_bot.domain` so there is exactly one implementation of each rule
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated
@@ -669,12 +669,12 @@ def carrier_name_matches_sender(carrier_company: str, sender_email: str) -> str 
     return None
 
 
-def _is_configured_carrier_contact(
-    carrier_company: str | None, sender_email: str, ctx: ToolContext
-) -> bool:
-    """True when the sender is an address configured for this load's carrier.
+def _configured_carrier_contact(
+    carrier_companies: Sequence[str], sender_email: str, ctx: ToolContext
+) -> str | None:
+    """The carrier on this load the sender is a configured contact for, or ``None``.
 
-    The carrier-side counterpart of :func:`_is_configured_factor_domain`, and narrower in
+    The carrier-side counterpart of :func:`_configured_factor_domain`, and narrower in
     both directions on purpose.
 
     Matching is on the **whole address**, never the domain, because carriers are routinely
@@ -683,46 +683,56 @@ def _is_configured_carrier_contact(
     :func:`_factor_names_match` allows: a loose match would let one carrier's configured
     address answer for another's loads, which is precisely what this must never do.
 
+    Takes every carrier on the load and returns **which one** matched, because on a load with
+    several the answer decides what the reply may cover, not just whether there is one.
+
     Reached only after the back office's own contact list has been consulted and missed, so
     it adds addresses and can never remove one.
     """
 
     sender = sender_email.strip().lower()
-    if not (carrier_company and sender):
-        return False
-    wanted = _normalize_company_name(carrier_company)
-    if not wanted:
-        return False
-    for name, addresses in ctx.settings.carrier_contacts.items():
-        if _normalize_company_name(name) != wanted:
+    if not sender:
+        return None
+    for carrier_company in carrier_companies:
+        wanted = _normalize_company_name(carrier_company or "")
+        if not wanted:
             continue
-        if sender in {str(a).strip().lower() for a in addresses}:
-            return True
-    return False
+        for name, addresses in ctx.settings.carrier_contacts.items():
+            if _normalize_company_name(name) != wanted:
+                continue
+            if sender in {str(a).strip().lower() for a in addresses}:
+                return carrier_company
+    return None
 
 
-def _is_configured_factor_domain(
-    factoring_company: str, sender_email: str, ctx: ToolContext
-) -> bool:
-    """True when the sender's domain is configured for this load's factoring company.
+def _configured_factor_domain(
+    factoring_companies: Sequence[str], sender_email: str, ctx: ToolContext
+) -> str | None:
+    """The factor of record on this load whose configured domain the sender is at, or ``None``.
 
     Matched on the whole domain, never a substring, and the configured factor name must
-    match the company recorded on the load (see :func:`_factor_names_match`) — so an
-    entry for "rts financial" answers for "RTS Financial Service, Inc" but not for an
-    unrelated factor.
+    match a company recorded on the load (see :func:`_factor_names_match`) — so an entry
+    for "rts financial" answers for "RTS Financial Service, Inc" but not for an unrelated
+    factor.
+
+    Every factor of record on the load is eligible, not just the first payable's. A load
+    re-dispatched across carriers is factored per leg: 2436437 remits FOX CARRIERS' leg to
+    eCapital, Alina's to RTS and Parasource's to England Carrier Services. Returning WHICH
+    factor matched is what lets the caller narrow the answer to that factor's own leg.
     """
 
     sender = sender_email.strip().lower()
     domain = _sender_domain(sender)
     if not (sender and domain):
-        return False
+        return None
 
-    for configured_name, entries in ctx.settings.factoring_domains.items():
-        if not _factor_names_match(configured_name, factoring_company):
-            continue
-        if any(_roster_entry_matches(entry, sender, domain) for entry in entries):
-            return True
-    return False
+    for factoring_company in factoring_companies:
+        for configured_name, entries in ctx.settings.factoring_domains.items():
+            if not _factor_names_match(configured_name, factoring_company):
+                continue
+            if any(_roster_entry_matches(entry, sender, domain) for entry in entries):
+                return factoring_company
+    return None
 
 
 def _roster_entry_matches(entry: object, sender: str, domain: str) -> bool:
@@ -1604,6 +1614,26 @@ class CheckAuthorizationOutput(BaseModel):
     #: and billing paperwork be emailed to the documents address.
     pre_noa: bool = False
     matched_party: str | None = None
+    #: Which carriers on this load the sender may be told about. **Empty means all of them.**
+    #:
+    #: A load can have a payable per carrier (see ``TransportProLoad``), and being a party to
+    #: the load is not being a party to every leg of it. Parasource asking about 2436437 is
+    #: asking about their own $5,000 — FOX CARRIERS' $905 on the same load is somebody else's
+    #: settlement, and there is no reading of "authorized" that includes it.
+    #:
+    #: Set whenever the match can be attributed: a contact address or its domain (the
+    #: dispatch row records which carrier each address belongs to), a configured carrier
+    #: contact, a sender domain matching a carrier's name, or a factor of record answered
+    #: about the leg it collects for.
+    #:
+    #: Left empty only when nothing on the load attributes the sender to a carrier — a
+    #: dispatch row carrying contacts but no carrier block. Then the whole load is returned
+    #: rather than a guessed leg, because withholding an answer the sender is entitled to is
+    #: the worse error of the two.
+    #:
+    #: The pipeline turns this into ``ToolContext.disclosable_carriers``, which is what
+    #: actually filters the tools.
+    matched_carriers: tuple[str, ...] = ()
     reason: str
 
 
@@ -1641,17 +1671,26 @@ class CheckAuthorization(Tool):
         domain = sender.split("@")[-1].replace(".", "")
 
         if sender in {e.lower() for e in auth.authorized_emails}:
+            # Attributed to the carrier whose contact list holds this address. On a
+            # single-carrier load that is the only carrier and nothing changes; on a relay it
+            # is the difference between answering the sender's own leg and answering the first
+            # one in the array. Live on 2469115: dispatch@zmile.io is on a four-carrier load,
+            # and the unnarrowed answer was Aralo Express's $2,580 remitted to RTS Financial.
+            own = auth.carriers_for_contact(sender)
             return CheckAuthorizationOutput(
                 decision=AuthDecision.ALLOW,
                 authorized=True,
-                matched_party=auth.carrier_company,
+                matched_party=own[0] if len(own) == 1 else auth.carrier_label,
+                matched_carriers=own,
                 reason="sender is an explicitly authorized contact for this load",
             )
-        if _is_configured_carrier_contact(auth.carrier_company, sender, ctx):
+        configured_carrier = _configured_carrier_contact(auth.carrier_companies, sender, ctx)
+        if configured_carrier:
             return CheckAuthorizationOutput(
                 decision=AuthDecision.ALLOW,
                 authorized=True,
-                matched_party=auth.carrier_company,
+                matched_party=configured_carrier,
+                matched_carriers=(configured_carrier,),
                 reason=(
                     "sender is a configured contact for this load's carrier "
                     "(PAYBOT_CARRIER_CONTACTS, not the back office record)"
@@ -1661,7 +1700,7 @@ class CheckAuthorization(Tool):
             return CheckAuthorizationOutput(
                 decision=AuthDecision.FACTORING,
                 authorized=ctx.settings.allow_factoring,
-                matched_party=auth.factoring_company,
+                matched_party=auth.factor_label,
                 reason="sender is the factoring company on file",
             )
 
@@ -1675,10 +1714,15 @@ class CheckAuthorization(Tool):
         if sender_domain and sender_domain not in _FREE_MAIL_DOMAINS:
             contact_domains = {_sender_domain(e) for e in auth.authorized_emails}
             if sender_domain in contact_domains:
+                # Narrowed the same way, and this is the branch that most needed it: writing
+                # from payroll@ when dispatch@ is the address on file is the ordinary case,
+                # and it is how Zmile reached load 2469115.
+                own = auth.carriers_at_domain(sender_domain)
                 return CheckAuthorizationOutput(
                     decision=AuthDecision.ALLOW,
                     authorized=True,
-                    matched_party=auth.carrier_company,
+                    matched_party=own[0] if len(own) == 1 else auth.carrier_label,
+                    matched_carriers=own,
                     reason="sender's domain matches an authorized contact's domain on this load",
                 )
 
@@ -1687,13 +1731,20 @@ class CheckAuthorization(Tool):
         # is configured for *that* factor — so RTS cannot be answered about an OTR-factored
         # load. This is the only path that yields FACTORING, because it is the only one that
         # is safe to switch on via `allow_factoring`.
-        if auth.factoring_company and _is_configured_factor_domain(
-            auth.factoring_company, sender, ctx
-        ):
+        #
+        # Every factor of record on the load is eligible, one per payable. That is not a
+        # widening of the rule, it is the rule finally reaching the whole load: on 2436437,
+        # England Carrier Services holds Parasource's assignment and was being measured
+        # against eCapital's roster entry, because eCapital happened to be first in the array.
+        # The answer is then narrowed to the leg that factor collects for, so a load carrying
+        # three factors still never tells one about another's carrier.
+        matched_factor = _configured_factor_domain(auth.factoring_companies, sender, ctx)
+        if matched_factor:
             return CheckAuthorizationOutput(
                 decision=AuthDecision.FACTORING,
                 authorized=ctx.settings.allow_factoring,
-                matched_party=auth.factoring_company,
+                matched_party=matched_factor,
+                matched_carriers=auth.carriers_factored_to(matched_factor),
                 reason="sender domain is configured for the factoring company on this load",
             )
 
@@ -1705,7 +1756,7 @@ class CheckAuthorization(Tool):
         # above owns that case), so one factor is still never told about another's load.
         if (
             ctx.settings.factoring_prenoa_replies
-            and not auth.factoring_company
+            and not auth.factoring_companies
             and sender_domain
         ):
             # No free-mail guard here: _roster_entry_matches applies it per entry, so a
@@ -1744,14 +1795,20 @@ class CheckAuthorization(Tool):
                     ),
                 )
 
-        carrier_toks = company_tokens(auth.carrier_company)
-        if any(tok in domain for tok in carrier_toks):
-            return CheckAuthorizationOutput(
-                decision=AuthDecision.ALLOW,
-                authorized=True,
-                matched_party=auth.carrier_company,
-                reason="sender domain matches the carrier company on the load",
-            )
+        # Iterated over every carrier on the load, and reporting WHICH one matched. This is
+        # the branch that answers Betty at parasourceinc.com: "parasource" is a distinctive
+        # token of "Parasource Inc", one of 2436437's three payables. While this read a single
+        # string it read FOX CARRIERS, so the token set never contained her carrier's name and
+        # a carrier asking about her own load was told she was not a party to it.
+        for carrier_company in auth.carrier_companies:
+            if any(tok in domain for tok in company_tokens(carrier_company)):
+                return CheckAuthorizationOutput(
+                    decision=AuthDecision.ALLOW,
+                    authorized=True,
+                    matched_party=carrier_company,
+                    matched_carriers=(carrier_company,),
+                    reason="sender domain matches the carrier company on the load",
+                )
 
         # Name-only resemblance to the factor is NOT authorization. It used to return
         # FACTORING, which meant any domain containing "finance" would have been disclosed to
@@ -1762,20 +1819,21 @@ class CheckAuthorization(Tool):
         # acronym cannot be satisfied by "com" or "net". Both routes only ever change the
         # WORDING of a denial — this branch returns DENY either way — so a hint that fires
         # too eagerly costs a reviewer one wasted glance, never a disclosure.
-        factor_toks = company_tokens(auth.factoring_company)
-        acronym = company_acronym(auth.factoring_company)
-        if (factor_toks and any(tok in domain for tok in factor_toks)) or (
-            acronym and acronym in _domain_without_tld(sender)
-        ):
-            return CheckAuthorizationOutput(
-                decision=AuthDecision.DENY,
-                matched_party=None,
-                reason=(
-                    f"sender resembles the factoring company on file "
-                    f"({auth.factoring_company!r}) but its domain is not configured; add it "
-                    "to PAYBOT_FACTORING_DOMAINS if it is genuine"
-                ),
-            )
+        for factoring_company in auth.factoring_companies:
+            factor_toks = company_tokens(factoring_company)
+            acronym = company_acronym(factoring_company)
+            if (factor_toks and any(tok in domain for tok in factor_toks)) or (
+                acronym and acronym in _domain_without_tld(sender)
+            ):
+                return CheckAuthorizationOutput(
+                    decision=AuthDecision.DENY,
+                    matched_party=None,
+                    reason=(
+                        f"sender resembles a factoring company on file "
+                        f"({factoring_company!r}) but its domain is not configured; add it "
+                        "to PAYBOT_FACTORING_DOMAINS if it is genuine"
+                    ),
+                )
 
         # Last resort before refusing: does the sender's own address name this carrier?
         #
@@ -1785,8 +1843,10 @@ class CheckAuthorization(Tool):
         # mailboxes at one carrier, neither on file. See carrier_name_matches_sender for what
         # this is and is not worth. Shadow by default so the agreement can be measured on real
         # mail before it authorises anything, the way LlmIdFilter was introduced.
-        named = carrier_name_matches_sender(auth.carrier_company or "", params.sender_email)
-        if named:
+        for carrier_company in auth.carrier_companies:
+            named = carrier_name_matches_sender(carrier_company, params.sender_email)
+            if not named:
+                continue
             mode = ctx.settings.carrier_name_match
             _log.warning(
                 "carrier_name_match",
@@ -1794,7 +1854,7 @@ class CheckAuthorization(Tool):
                     "mode": mode,
                     "load_id": params.load_id,
                     "sender": params.sender_email,
-                    "carrier": auth.carrier_company,
+                    "carrier": carrier_company,
                     "evidence": named,
                 },
             )
@@ -1802,9 +1862,11 @@ class CheckAuthorization(Tool):
                 return CheckAuthorizationOutput(
                     decision=AuthDecision.ALLOW,
                     authorized=True,
-                    matched_party=auth.carrier_company,
+                    matched_party=carrier_company,
+                    matched_carriers=(carrier_company,),
                     reason=f"carrier name match ({named})",
                 )
+            break
 
         return CheckAuthorizationOutput(
             decision=AuthDecision.DENY,
@@ -1862,19 +1924,26 @@ class CheckAuthorization(Tool):
         sender_domain = _sender_domain(sender)
         contacts = {e.lower() for e in auth.authorized_emails}
 
+        # A CargoTel load is one carrier's, so `carrier_label` and `factor_label` are single
+        # names here rather than lists. The tuple-shaped context is Transport Pro's need — see
+        # AuthorizationContext — and this path simply reads it without pretending otherwise.
         if sender in contacts:
+            own = auth.carriers_for_contact(sender)
             return CheckAuthorizationOutput(
                 decision=AuthDecision.ALLOW,
                 authorized=True,
-                matched_party=auth.carrier_company,
+                matched_party=own[0] if len(own) == 1 else auth.carrier_label,
+                matched_carriers=own,
                 reason="sender is a contact on this carrier's record",
             )
 
-        if _is_configured_carrier_contact(auth.carrier_company, sender, ctx):
+        configured_carrier = _configured_carrier_contact(auth.carrier_companies, sender, ctx)
+        if configured_carrier:
             return CheckAuthorizationOutput(
                 decision=AuthDecision.ALLOW,
                 authorized=True,
-                matched_party=auth.carrier_company,
+                matched_party=configured_carrier,
+                matched_carriers=(configured_carrier,),
                 reason=(
                     "sender is a configured contact for this load's carrier "
                     "(PAYBOT_CARRIER_CONTACTS, not the back office record)"
@@ -1886,22 +1955,24 @@ class CheckAuthorization(Tool):
             and sender_domain not in _FREE_MAIL_DOMAINS
             and sender_domain in {_sender_domain(e) for e in contacts}
         ):
+            own = auth.carriers_at_domain(sender_domain)
             return CheckAuthorizationOutput(
                 decision=AuthDecision.ALLOW,
                 authorized=True,
-                matched_party=auth.carrier_company,
+                matched_party=own[0] if len(own) == 1 else auth.carrier_label,
+                matched_carriers=own,
                 reason="sender's domain matches a contact on this carrier's record",
             )
 
         # The factor of record. Most carriers on this tenant are factored, so this is the
         # common case for payment enquiries rather than an edge one.
-        if auth.factoring_company and _is_configured_factor_domain(
-            auth.factoring_company, sender, ctx
-        ):
+        matched_factor = _configured_factor_domain(auth.factoring_companies, sender, ctx)
+        if matched_factor:
             return CheckAuthorizationOutput(
                 decision=AuthDecision.FACTORING,
                 authorized=ctx.settings.allow_factoring,
-                matched_party=auth.factoring_company,
+                matched_party=matched_factor,
+                matched_carriers=auth.carriers_factored_to(matched_factor),
                 reason="sender domain is configured for the factoring company on this load",
             )
 
@@ -1910,17 +1981,17 @@ class CheckAuthorization(Tool):
                 decision=AuthDecision.DENY,
                 matched_party=None,
                 reason=(
-                    f"the carrier record for {auth.carrier_company or 'this load'} lists no "
+                    f"the carrier record for {auth.carrier_label or 'this load'} lists no "
                     "contact address, so the sender cannot be verified; add one in CargoTel"
                 ),
             )
-        if auth.factoring_company:
+        if auth.factoring_companies:
             return CheckAuthorizationOutput(
                 decision=AuthDecision.DENY,
                 matched_party=None,
                 reason=(
                     f"sender is neither a contact on the carrier's record nor a configured "
-                    f"domain for the factor on file ({auth.factoring_company!r}); add it to "
+                    f"domain for the factor on file ({auth.factor_label!r}); add it to "
                     "PAYBOT_FACTORING_DOMAINS if it is genuine"
                 ),
             )
@@ -1941,23 +2012,48 @@ class CarrierCrossCheckInput(BaseModel):
 
 class CarrierCrossCheckOutput(BaseModel):
     ok: bool
+    #: The first delivered carrier. Read :attr:`delivered_carriers` on a load that has
+    #: several — this one is not "the" carrier there, only the first row.
     delivered_carrier: str | None = None
+    #: Every carrier with a delivered, non-canceled dispatch row. More than one is ordinary
+    #: on a load split across legs or re-dispatched after a fall-off.
+    delivered_carriers: list[str] = Field(default_factory=list)
     settlement_carrier: str | None = None
+    #: The pay-to on each settlement row, exactly as the screen writes it — e.g.
+    #: ``"Parasource Inc c/o England Carrier Services"``. Quote this when the question is who
+    #: was paid: it names the carrier and whoever collected for them in one string.
+    settlement_payees: list[str] = Field(default_factory=list)
     payout_amount: Decimal | None = None
     issues: list[str]
 
 
 class CarrierCrossCheck(Tool):
-    """Cross-check delivered carrier vs settlement carrier; ignore canceled rows (§4.2)."""
+    """Cross-check delivered carriers against settlement payees; ignore canceled rows (§4.2)."""
 
     name = "carrier_cross_check"
     description = (
-        "Corroborate the paying carrier across dispatch (Delivered row only) and "
-        "settlement. Flags mismatches, empty settlement, and ignored canceled rows."
+        "Corroborate the paying carrier across dispatch (delivered rows only) and "
+        "settlement. Reports every delivered carrier and every settlement pay-to, and flags "
+        "mismatches, empty settlement, ignored canceled rows, and loads with several carriers."
     )
     input_model = CarrierCrossCheckInput
 
     def run(self, params: BaseModel, ctx: ToolContext) -> CarrierCrossCheckOutput:
+        """Corroborate who hauled the load against who was paid for it.
+
+        **A load can have more than one delivered row**, and this used to take the first and
+        call it "the" delivered carrier. Live on 2436437: FOX CARRIERS, Parasource and Alina
+        Transport each delivered a leg, with Hazemo and Victory Transit canceled in between.
+        The first-row reading produced two wrong answers at once — it named FOX CARRIERS as
+        the carrier for a load three carriers ran, and then reported ``mismatch`` because the
+        settlement pay-to it was compared against belonged to a different leg.
+
+        Comparison is on the carrier half of a pay-to, so ``"Parasource Inc c/o England
+        Carrier Services"`` corroborates Parasource's dispatch row instead of contradicting
+        it. A mismatch now means what it says: not one settlement row names a carrier that
+        delivered.
+        """
+
         assert isinstance(params, CarrierCrossCheckInput)
         if params.system is not System.TRANSPORT_PRO:
             raise ToolError("carrier_cross_check is Transport Pro only in this slice")
@@ -1966,36 +2062,48 @@ class CarrierCrossCheck(Tool):
         settlement = ctx.tp.get_settlement_entries(params.load_id)
         issues: list[str] = []
 
-        delivered = next((r for r in dispatch if r.is_delivered and not r.is_canceled), None)
+        delivered_rows = [r for r in dispatch if r.is_delivered and not r.is_canceled]
         if any(r.is_canceled for r in dispatch):
             issues.append("canceled_row_ignored")
 
-        delivered_carrier = delivered.carrier_name if delivered else None
-        payout = delivered.freight_bill if delivered else None
+        delivered_carriers = _dedupe(r.carrier_name for r in delivered_rows if r.carrier_name)
+        delivered_carrier = delivered_carriers[0] if delivered_carriers else None
+        # The freight bill of the first delivered row, and only meaningful when that row is
+        # the whole story. The live API exposes no carrier rate on a dispatch row at all
+        # (always None), so this is fixture-only in practice.
+        payout = delivered_rows[0].freight_bill if delivered_rows else None
 
-        settlement_carrier = next((e.carrier_name for e in settlement if e.carrier_name), None)
+        settlement_payees = _dedupe(e.carrier_name for e in settlement if e.carrier_name)
+        settlement_carrier = settlement_payees[0] if settlement_payees else None
         if not settlement:
             issues.append("settlement_empty")
 
-        mismatch = bool(
-            delivered_carrier
-            and settlement_carrier
-            and delivered_carrier.strip().casefold() != settlement_carrier.strip().casefold()
-        )
+        # One carrier in common is corroboration. Requiring the FIRST rows to agree was the
+        # bug: on a load with several legs they routinely name different carriers, both right.
+        paid = {name.casefold() for e in settlement if (name := e.paid_carrier)}
+        hauled = {name.strip().casefold() for name in delivered_carriers}
+        mismatch = bool(paid and hauled and not (paid & hauled))
         if mismatch:
             issues.append("mismatch")
+        if len(delivered_carriers) > 1 or len(settlement_payees) > 1:
+            # Not a fault — a fact the reply has to reflect. A load with several carriers has
+            # a settlement per carrier, and an answer that does not say WHICH one it is about
+            # is wrong however well-grounded each figure in it is.
+            issues.append("multiple_carriers")
 
-        if delivered_carrier:
-            ctx.ledger.record_text(
-                "carrier", delivered_carrier, self.name, load_id=params.load_id
-            )
+        for name in delivered_carriers:
+            ctx.ledger.record_text("carrier", name, self.name, load_id=params.load_id)
+        for payee in settlement_payees:
+            ctx.ledger.record_text("carrier", payee, self.name, load_id=params.load_id)
         if payout is not None:
             ctx.ledger.record_amount(payout, self.name, load_id=params.load_id)
 
         return CarrierCrossCheckOutput(
             ok=not mismatch,
             delivered_carrier=delivered_carrier,
+            delivered_carriers=delivered_carriers,
             settlement_carrier=settlement_carrier,
+            settlement_payees=settlement_payees,
             payout_amount=payout,
             issues=issues,
         )

@@ -236,9 +236,9 @@ def test_factoring_blocked_by_default_but_allowed_by_policy(
         settlement=fixture.settlement,
         files=fixture.files,
         authorization=AuthorizationContext(
-            carrier_company="Idea Expedited, Inc",
+            carrier_companies=("Idea Expedited, Inc",),
             authorized_emails=(),
-            factoring_company="England Carrier Services",
+            payable_parties=(("Idea Expedited, Inc", "England Carrier Services"),),
             factoring_emails=("ar@englandcarrier.com",),
         ),
     )
@@ -322,9 +322,11 @@ def _factored_ctx(ctx: ToolContext, factoring_company: str, **settings_kw: objec
             settlement=fixture.settlement,
             files=fixture.files,
             authorization=AuthorizationContext(
-                carrier_company="Logan Transportation Services Llc",
+                carrier_companies=("Logan Transportation Services Llc",),
                 authorized_emails=(),
-                factoring_company=factoring_company,
+                payable_parties=(
+                    ("Logan Transportation Services Llc", factoring_company),
+                ),
                 factoring_emails=(),
             ),
         )
@@ -411,9 +413,9 @@ def _contact_ctx(
             settlement=fixture.settlement,
             files=fixture.files,
             authorization=AuthorizationContext(
-                carrier_company=carrier_company,
+                carrier_companies=(carrier_company,),
                 authorized_emails=authorized_emails,
-                factoring_company=None,
+                payable_parties=((carrier_company, None),),
                 factoring_emails=(),
             ),
         )

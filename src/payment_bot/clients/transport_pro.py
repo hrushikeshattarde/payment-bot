@@ -31,7 +31,18 @@ class TransportProClient(Protocol):
     """Read-only access to Transport Pro load data."""
 
     def get_load(self, load_id: str) -> TransportProLoad:
-        """Return the full load payload (§4.3.0). Raise :class:`ClientError` if absent."""
+        """Return the FIRST payable on the load (§4.3.0). Raise :class:`ClientError` if absent.
+
+        Right only where one carrier is all the caller can act on. A load may have several
+        payables — see :meth:`get_load_payables`, and :class:`TransportProLoad` for why.
+        """
+
+    def get_load_payables(self, load_id: str) -> list[TransportProLoad]:
+        """Return **every** carrier's payable on the load, in the order the API returns them.
+
+        Never empty: a load with no payable record at all raises instead, the way
+        :meth:`get_load` does, because that is Transport Pro saying the load was cancelled.
+        """
 
     def get_dispatch_history(self, load_id: str) -> list[DispatchRow]:
         """Return dispatch rows (§4.3 ``tp_get_dispatch_history``)."""
@@ -54,6 +65,10 @@ class LoadFixture:
     """The full multi-endpoint dataset for one mock load."""
 
     load: TransportProLoad
+    #: Payables for the load's OTHER carriers, when it has any. ``load`` is always the first
+    #: payable; these follow it, in order, out of ``get_load_payables``. A single-carrier
+    #: fixture leaves this empty and behaves exactly as it always has.
+    extra_payables: list[TransportProLoad] = field(default_factory=list)
     dispatch: list[DispatchRow] = field(default_factory=list)
     settlement: list[SettlementEntry] = field(default_factory=list)
     files: list[FileDocument] = field(default_factory=list)
@@ -80,6 +95,10 @@ class MockTransportProClient:
 
     def get_load(self, load_id: str) -> TransportProLoad:
         return self._get(load_id).load
+
+    def get_load_payables(self, load_id: str) -> list[TransportProLoad]:
+        fixture = self._get(load_id)
+        return [fixture.load, *fixture.extra_payables]
 
     def get_dispatch_history(self, load_id: str) -> list[DispatchRow]:
         return list(self._get(load_id).dispatch)

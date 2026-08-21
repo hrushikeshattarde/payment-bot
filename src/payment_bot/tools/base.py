@@ -58,6 +58,27 @@ class ToolContext:
     #: and the gate that judges its tense cannot disagree across a midnight boundary.
     #: Injected — tests pin it, because fixture dates are fixed and "today" is not.
     today: date = field(default_factory=date.today)
+    #: Per load id, which carriers on that load this run may read. **Absent or empty means
+    #: every carrier on it** — which is the whole truth for the single-carrier loads that are
+    #: nearly all of them.
+    #:
+    #: A load can hold a payable per carrier (see ``TransportProLoad``), and being authorized
+    #: for the load is not being authorized for every leg of it. Parasource asking about
+    #: 2436437 is asking about their own $5,000; FOX CARRIERS' $905 on the same load is
+    #: another carrier's settlement, and no reading of "authorized" reaches it.
+    #:
+    #: Set by the pipeline from ``check_authorization``'s ``matched_carriers``, and enforced in
+    #: ``tp_get_load_summary`` and ``tp_get_settlement_entries`` — which is the point of
+    #: putting it here rather than in the prompt. Out-of-scope amounts and dates never enter
+    #: the grounding ledger at all, so the pre-send gate blocks them as ungrounded even if the
+    #: model produces one from somewhere. A rule the gate can enforce beats a rule the prompt
+    #: can only ask for.
+    disclosable_carriers: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+    def carriers_in_scope(self, load_id: str) -> tuple[str, ...]:
+        """The carrier names this run may read on ``load_id``; empty means no restriction."""
+
+        return self.disclosable_carriers.get(load_id.strip(), ())
 
 
 class Tool(ABC):

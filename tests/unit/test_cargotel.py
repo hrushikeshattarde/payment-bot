@@ -582,7 +582,8 @@ def test_the_authorization_context_exposes_the_trimmed_factor() -> None:
     )
     auth = build_authorization_context(_load(), carrier)
 
-    assert auth.factoring_company == "ST JOHN"
+    assert auth.factoring_companies == ("ST JOHN",)
+    assert auth.payable_parties == (("BULLA TRANSPORTATION INC", "ST JOHN"),)
 
 
 def test_an_id_that_is_not_a_load_is_not_reported_as_an_expired_cookie() -> None:

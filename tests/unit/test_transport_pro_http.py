@@ -332,10 +332,10 @@ def test_factoring_document_alone_is_reported_with_its_evidence() -> None:
 def test_authorization_context_uses_carrier_company_and_dispatch_emails() -> None:
     auth = _client(full_transport()).get_authorization_context("2462934")
 
-    assert auth.carrier_company == "Idea Expedited, Inc"
+    assert auth.carrier_companies == ("Idea Expedited, Inc",)
     assert "billing@ideaexpedited.com" in auth.authorized_emails
     assert "dispatch@ideaexpedited.com" in auth.authorized_emails
-    assert auth.factoring_company is None
+    assert auth.factoring_companies == ()
 
 
 @pytest.mark.unit
@@ -350,7 +350,7 @@ def test_authorization_context_is_empty_when_no_contacts_are_exposed() -> None:
 
     # Nothing invented: an unknown sender then falls through to DENY and the gate blocks.
     assert auth.authorized_emails == ()
-    assert auth.carrier_company == "Idea Expedited, Inc"
+    assert auth.carrier_companies == ("Idea Expedited, Inc",)
 
 
 # --- misc -------------------------------------------------------------------

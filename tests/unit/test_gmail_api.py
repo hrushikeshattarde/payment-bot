@@ -474,9 +474,16 @@ def test_listing_window_is_wider_than_the_processing_limit() -> None:
     unread messages in already-answered threads keep matching the query forever, and ten
     of them filled the whole window while a new carrier email sat unfetched (live)."""
 
+    from payment_bot.clients.gmail_api import _LISTING_WINDOW
+
     http = FakeHttp([("/messages?", 200, {})])
     _client(http, limit=3).fetch_new()
-    assert "maxResults=100" in http.requests[0]["url"]
+
+    # Asserted against the constant, not a literal: the number moves with the intake window
+    # (it went 100 → 250 when the query widened to 4 days), and pinning the digits made this
+    # test fail for the one reason it does not care about. What it guards is the RELATION.
+    assert f"maxResults={_LISTING_WINDOW}" in http.requests[0]["url"]
+    assert _LISTING_WINDOW > 3, "the listing must never be sized to the processing limit"
 
 
 # --- draft ------------------------------------------------------------------

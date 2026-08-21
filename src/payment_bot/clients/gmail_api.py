@@ -57,7 +57,13 @@ GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1"
 #: than any per-run processing limit: with ``mark_seen`` off, unread messages in threads
 #: we already answered keep matching the intake query forever, and a listing window sized
 #: to the processing limit starves fresh mail behind them (observed live — see fetch_new).
-_LISTING_WINDOW = 100
+#:
+#: Raised from 100 when the intake window widened to 4 days. The pool this lists is every
+#: unread message in the window, answered threads included, and it only ever grows within
+#: that window because `mark_seen` is off: runs were already listing ~40 and skipping 26 of
+#: them as answered. Doubling the window doubles that pool, and starving fresh mail is the
+#: one failure this constant exists to prevent.
+_LISTING_WINDOW = 250
 
 
 class SendingDisabledError(ClientError):

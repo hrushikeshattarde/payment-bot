@@ -13,6 +13,7 @@ and stay unit-testable.
 from __future__ import annotations
 
 import json
+import re
 from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
@@ -20,6 +21,10 @@ from typing import Any
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from payment_bot.logging import get_logger
+
+_log = get_logger("config")
 
 
 class RolloutPhase(IntEnum):
@@ -234,6 +239,36 @@ class Settings(BaseSettings):
     #:
     #: Optional. Unset, escalations lose one line of context and behave exactly as before.
     factor_domain_hints_file: str = ""
+
+    @model_validator(mode="after")
+    def _warn_if_approvals_outlive_the_intake_window(self) -> Settings:
+        """A pending card must not block a thread for longer than its mail stays fetchable.
+
+        These two numbers live in different files and neither mentions the other, and when
+        they cross, mail is lost silently. A chat approval blocks its whole thread until the
+        card is actioned or the sweep expires it at ``approval_expiry_days``; the intake query
+        only reaches back ``newer_than:Nd``. With expiry 3 and a 2-day window — the live
+        configuration on 2026-08-20 — a card nobody clicks holds its thread for a day longer
+        than any message in it can still be fetched. Nothing is marked read, so there is no
+        second record that the mail was never answered: it simply stops appearing.
+
+        A warning rather than a hard failure. The pairing is a judgement about review time
+        against inbox reach, and refusing to start would turn a survivable misconfiguration
+        into an outage.
+        """
+
+        if self.approval_mode != "chat":
+            return self
+        window = re.search(r"newer_than:(\d+)d", self.gmail_query)
+        if window and int(window.group(1)) <= self.approval_expiry_days:
+            _log.warning(
+                "approval_expiry_outlives_intake_window",
+                extra={
+                    "intake_window_days": int(window.group(1)),
+                    "approval_expiry_days": self.approval_expiry_days,
+                },
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod

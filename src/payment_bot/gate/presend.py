@@ -145,7 +145,7 @@ _NOA_REQUEST_RE = re.compile(
 _REMIT_CONFIRMATION_REQUEST_RE = re.compile(
     r"\bconfirm\w*\b\W(?:\w+\W){0,8}?"
     r"(?:\b(?:payments?|funds|checks?|remittances?)\b\W(?:\w+\W){0,4}?"
-    r"\b(?:made|sent|remitted|paid|issued|directed|go|going)\b"
+    r"\b(?:made|sent|remitted|paid|issued|directed|mailed|mailing|payable|go|going)\b"
     r"|\bremit(?:tance)?\s*(?:to|address)\b)",
     re.IGNORECASE,
 )
@@ -161,7 +161,7 @@ _REMIT_CONFIRMATION_REQUEST_RE = re.compile(
 _PAYMENT_DIRECTION_RE = re.compile(
     r"\b(?:payments?|funds|remittances?|checks?)\b\W(?:\w+\W){0,4}?"
     r"\b(?:will|shall)\b\W(?:\w+\W){0,3}?"
-    r"\b(?:made|sent|remitted|paid|issued|directed|go)\b\W(?:\w+\W){0,2}?"
+    r"\b(?:made|sent|remitted|paid|issued|directed|mailed|mailing|payable|go)\b\W(?:\w+\W){0,2}?"
     r"(?:\bto\b|\baccordingly\b|\bas\s+(?:requested|instructed|directed|indicated)\b)",
     re.IGNORECASE,
 )

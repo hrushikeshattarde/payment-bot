@@ -926,3 +926,52 @@ def test_the_withheld_line_never_leaks_the_count_or_the_ids() -> None:
     assert "3" not in line
     assert "do not name" in line.lower()
     assert "not addressed here" in line.lower()
+
+
+@pytest.mark.unit
+def test_a_remit_request_phrased_as_mailing_is_caught_too(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The verb list was written against one email and missed the next one.
+
+    RTS asked us to "confirm all payments will be MADE to". NUC Express asked us to "confirm
+    all payments are MAILING to", enclosing a full ACH block. Same request, different verb,
+    and the arm added for the first did not arm for the second. The sensitive-change scan
+    stays deliberately silent on a remit footer (see _BANK_DETAIL_PHRASES), so this check is
+    the whole of the compensating control.
+    """
+
+    asked = sample_email.model_copy(
+        update={
+            "body": (
+                "We are trying to get payment status for such invoice(s). Please review the "
+                "open loads, provide payment status, and confirm all payments are mailing "
+                "to: Check: Love's Solutions LLC PO BOX 639565 Cincinnati, OH 45263"
+            )
+        }
+    )
+    agreeing = "Load 2462934 is pending. Payment will be mailed to the address on file."
+
+    result = PreSendGate().evaluate(
+        draft=_draft(body=agreeing), email=asked, ctx=grounded_ctx
+    )
+
+    assert not result.allowed
+    assert _checks(result)["change_acknowledgment"] is False
+    assert any("payment direction" in r for r in result.reasons)
+
+
+@pytest.mark.unit
+def test_a_mailing_date_is_still_not_a_mailing_direction(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Widening the verbs must not swallow the answer this inbox exists to give."""
+
+    asked = sample_email.model_copy(
+        update={"body": "Please confirm all payments are mailing to: PO BOX 639565"}
+    )
+    body = "Load 2462934 is BILLED. The check will be mailed on Thursday, August 20, 2026."
+
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=asked, ctx=grounded_ctx)
+
+    assert _checks(result)["change_acknowledgment"] is True, result.reasons

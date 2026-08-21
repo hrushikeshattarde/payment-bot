@@ -449,10 +449,27 @@ class PaymentBotPipeline:
             parts: list[str] = []
             if unauthorized:
                 parts.append(f"sender not authorized for any load: {_group_by_reason(unauthorized)}")
-            if cancelled_loads:
+            # Only an id the SENDER WROTE may be called cancelled. Transport Pro answers a
+            # cancelled load and a number that was never a load with the same 400, so folding
+            # them together told a reviewer that a DOT number off an attached rate
+            # confirmation had been cancelled. Live on LD#2550332: the attachment's header row
+            # put "MC Number" and "DOT" further than the label guard's 24 characters from the
+            # values beneath them, so 1002691 and 3210943 both survived as load candidates.
+            cancelled_written = [lid for lid in cancelled_loads if lid in written]
+            if cancelled_written:
                 parts.append(
                     f"load(s) cancelled — Transport Pro holds no payable record: "
-                    f"{', '.join(cancelled_loads)}"
+                    f"{', '.join(cancelled_written)}"
+                )
+            # Named once, for every bucket at once: which of the ids above the sender never
+            # actually wrote. The reply would not have covered them either — `_narrow_to_written`
+            # sees to that — but the escalation names them, and a reviewer reading a DENY or a
+            # cancellation deserves to know it is about a number a PDF contributed.
+            unwritten = [lid for lid in load_ids if lid not in written]
+            if unwritten:
+                parts.append(
+                    "id(s) the sender never wrote, contributed by an attachment: "
+                    f"{', '.join(unwritten)}"
                 )
             reason = "; ".join(parts) or "no load could be authorized"
             # Assemble the roster packet BEFORE escalating, so the reviewer gets the evidence

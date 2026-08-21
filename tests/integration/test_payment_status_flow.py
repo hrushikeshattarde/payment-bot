@@ -619,3 +619,49 @@ def test_the_id_filter_is_shown_the_attachment_its_candidates_came_from() -> Non
     # against and what the omission removed.
     assert "Order 1504077" in recorder.prompts[0]
     assert "PROOF OF DELIVERY" in recorder.prompts[0]
+
+
+@pytest.mark.integration
+def test_an_escalation_says_which_ids_came_from_an_attachment() -> None:
+    """Live on LD#2550332 (OTR Solutions, 2026-08-21).
+
+    A rate confirmation's header row put "MC Number" and "DOT" further than the label
+    guard's 24-character window from the values beneath them, so the carrier's MC and DOT
+    numbers both survived as load candidates. The escalation then named all three ids with
+    nothing to say which one the sender had actually asked about -- and because Transport Pro
+    answers a cancelled load and a number that was never a load with the same 400, one of
+    them was reported to a reviewer as a cancelled load.
+    """
+
+    from payment_bot.models import EmailAttachment
+
+    gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
+    pipeline = _build(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), gmail, slack, audit
+    )
+    email = sample_payment_status_email().model_copy(
+        update={
+            "message_id": "msg-ellalo-1",
+            "from_email": "nobody@unknown-carrier.example",
+            "subject": "Issue with PO# 2462934 - EL LALO TRUCKING LLC (MC-1002691)",
+            "body": "Please see the attached paperwork for LD#2462934.",
+            "attachments": [
+                EmailAttachment(
+                    filename="ratecon.pdf",
+                    mime_type="application/pdf",
+                    extracted_text=(
+                        "Carrier   MC Number   DOT\nEL LALO TRUCKING LLC\n1002691   3210943\n"
+                    ),
+                )
+            ],
+        }
+    )
+
+    result = pipeline.process_email(email)
+
+    assert result.outcome is Outcome.ESCALATED
+    detail = result.detail
+    assert "contributed by an attachment: 1002691, 3210943" in detail
+    # The one the sender wrote is not in that list, and no attachment id is called cancelled.
+    assert "attachment: 1002691, 3210943, 2462934" not in detail
+    assert "cancelled" not in detail

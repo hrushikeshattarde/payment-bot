@@ -975,3 +975,65 @@ def test_a_mailing_date_is_still_not_a_mailing_direction(
     result = PreSendGate().evaluate(draft=_draft(body=body), email=asked, ctx=grounded_ctx)
 
     assert _checks(result)["change_acknowledgment"] is True, result.reasons
+
+
+@pytest.mark.unit
+def test_agreeing_to_an_announced_remit_change_is_blocked(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """A sender who ANNOUNCES a new remit address never uses the word "confirm".
+
+    Live on a Great Plains statement: "** NEW Remit to address 10/1/25**: PO Box 850". The
+    payment-direction arm keyed off the sender ASKING us to confirm, so an announcement armed
+    nothing — and the other two arms hunt a change verb in the DRAFT, which "payment will be
+    sent to the new remit address" does not trip either. All three came back empty on a reply
+    that agreed to a redirection.
+
+    Armed now by the same hard_bank/hard_noa signal detect_sensitive_change already produces,
+    so requesting and announcing are covered by one rule. This matters wherever
+    sensitive_bank_replies is on, because then the email is answered rather than escalated
+    and this check is the whole of the control.
+    """
+
+    announced = sample_email.model_copy(
+        update={
+            "body": (
+                "Please provide payment status for load 2462934.\n\n"
+                "** NEW Remit to address 10/1/25**:\n"
+                "Great Plains Transportation Services\nPO Box 850\nMinneapolis, MN 55480"
+            )
+        }
+    )
+    agreeing = "Load 2462934 is pending. Payment will be sent to the new remit address on file."
+
+    result = PreSendGate().evaluate(
+        draft=_draft(body=agreeing), email=announced, ctx=grounded_ctx
+    )
+
+    assert _checks(result)["change_acknowledgment"] is False, result.reasons
+    assert any("payment direction" in r for r in result.reasons)
+
+
+@pytest.mark.unit
+def test_an_announced_change_still_allows_a_plain_status_answer(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Arming on the announcement must not block the answer the sender also asked for.
+
+    Great Plains asked for payment status AND announced a new PO Box. The status half is
+    answerable; only agreeing to the redirection is not.
+    """
+
+    announced = sample_email.model_copy(
+        update={
+            "body": (
+                "Please provide payment status for load 2462934.\n\n"
+                "** NEW Remit to address 10/1/25**:\nPO Box 850\nMinneapolis, MN 55480"
+            )
+        }
+    )
+    body = "Load 2462934 is BILLED. Payment is scheduled for Thursday, August 20, 2026."
+
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=announced, ctx=grounded_ctx)
+
+    assert _checks(result)["change_acknowledgment"] is True, result.reasons

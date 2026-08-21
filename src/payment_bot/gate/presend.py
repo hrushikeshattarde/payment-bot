@@ -167,7 +167,9 @@ _PAYMENT_DIRECTION_RE = re.compile(
 )
 
 
-def _confirms_payment_direction(draft_body: str, email: InboundEmail) -> str | None:
+def _confirms_payment_direction(
+    draft_body: str, email: InboundEmail, *, change_announced: bool = False
+) -> str | None:
     """The draft agreeing to where payment goes, when the sender asked it to.
 
     The third arm of :meth:`PreSendGate._check_change_acknowledgment`, and the one the other
@@ -182,13 +184,14 @@ def _confirms_payment_direction(draft_body: str, email: InboundEmail) -> str | N
     has asked us to affirm where their money goes does agreeing to it become the §7 problem.
     """
 
-    asked = "\n".join(
-        part
-        for part in (email.subject, strip_quoted(email.body), strip_quoted(email.html_text))
-        if part
-    )
-    if not _REMIT_CONFIRMATION_REQUEST_RE.search(asked):
-        return None
+    if not change_announced:
+        asked = "\n".join(
+            part
+            for part in (email.subject, strip_quoted(email.body), strip_quoted(email.html_text))
+            if part
+        )
+        if not _REMIT_CONFIRMATION_REQUEST_RE.search(asked):
+            return None
     match = _PAYMENT_DIRECTION_RE.search(draft_body)
     return " ".join(match.group(0).split()) if match else None
 
@@ -500,7 +503,9 @@ class PreSendGate:
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
             self._check_carrier_consistency(draft, email, ctx),
-            self._check_change_acknowledgment(draft, email, noa_request_expected),
+            self._check_change_acknowledgment(
+                draft, email, noa_request_expected, change_announced=self._change_announced(email, ctx)
+            ),
             self._check_noa_request(draft, noa_request_expected),
         ]
         allowed = all(c.passed for c in checks)
@@ -622,11 +627,35 @@ class PreSendGate:
             name="sensitive_change", passed=True, detail="no bank/NOA/contact change detected"
         )
 
+    def _change_announced(self, email: InboundEmail, ctx: ToolContext) -> bool:
+        """Did the inbound ANNOUNCE a payment-detail change, as opposed to asking about one?
+
+        Reuses the same scan :meth:`_check_sensitive_change` runs, for the one bit
+        :func:`_confirms_payment_direction` needs. Cheap — it is regex over the body — and
+        re-derived here rather than threaded through, so the two can never disagree.
+        """
+
+        outcome = self._detect_sensitive.run(
+            DetectSensitiveChangeInput(
+                subject=email.subject,
+                body=email.body,
+                html_text=email.html_text,
+                attachments_metadata=[
+                    AttachmentMeta(filename=a.filename, mime_type=a.mime_type)
+                    for a in email.attachments
+                ],
+            ),
+            ctx,
+        )
+        return bool(outcome.hard_bank or outcome.hard_noa)
+
     def _check_change_acknowledgment(
         self,
         draft: SubmitDraftOutput,
         email: InboundEmail,
         noa_request_expected: bool = False,
+        *,
+        change_announced: bool = False,
     ) -> GateCheck:
         """The reply must never acknowledge or act on a remittance/bank/NOA instruction.
 
@@ -648,7 +677,7 @@ class PreSendGate:
         if match:
             problems.append(f"change wording {' '.join(match.group(0).split())!r}")
         problems.extend(_noa_action_problems(body, noa_request_expected))
-        agreed = _confirms_payment_direction(body, email)
+        agreed = _confirms_payment_direction(body, email, change_announced=change_announced)
         if agreed:
             problems.append(f"payment direction {agreed!r} answering a confirmation request")
         if problems:

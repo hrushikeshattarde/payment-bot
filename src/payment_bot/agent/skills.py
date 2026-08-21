@@ -422,7 +422,7 @@ def build_cargotel_payment_status_intake(
     signature: str = "Circle Delivers Payments",
     documents_email: str = "freightpay@circledelivers.com",
     unlocated_loads: list[str] | None = None,
-    withheld_count: int = 0,
+    withheld_loads: list[str] | None = None,
     rate_question: bool = False,
     stated_rates: list[StatedRate] | None = None,
 ) -> str:
@@ -455,7 +455,7 @@ def build_cargotel_payment_status_intake(
             f"- Missing paperwork should be emailed to: {documents_email}",
             *_cargotel_rate_lines(rate_question, stated_rates),
             *_unlocated_line(unlocated_loads),
-            *_withheld_line(withheld_count),
+            *_withheld_line(withheld_loads),
             "",
             "Run the cargotel_payment_status procedure for the load id(s) above and submit a "
             "grounded draft.",
@@ -517,29 +517,29 @@ def _unlocated_line(unlocated_loads: list[str] | None) -> list[str]:
     ]
 
 
-def _withheld_line(withheld_count: int) -> list[str]:
-    """Tell the agent that some of the sender's loads are not covered, without naming them.
+def _withheld_line(withheld_loads: list[str] | None) -> list[str]:
+    """Name the loads this reply does not cover, when the sender named them first.
 
-    The sibling of :func:`_unlocated_line`, for the loads that were DENIED rather than
-    unfound. Those are withheld on purpose — the sender is not authorized for them and the
-    reply must say nothing about them — but silence about the whole list is its own problem.
-    Observed live: an RTS statement listed four invoices across three carriers, one of which
-    RTS factors; the draft answered that one and never acknowledged the other three, so a
-    four-load question came back looking like a one-load answer.
+    The sibling of :func:`_unlocated_line`, for loads DENIED rather than unfound. Those are
+    withheld on purpose — the sender is not authorized for them — but silence about the whole
+    list is its own problem. Observed live: an RTS statement listed four invoices across three
+    carriers, one of which RTS factors; the draft answered that one and never acknowledged the
+    other three.
 
-    The count is given to the agent and must NOT reach the reply. Confirming how many of
-    their numbers we recognise as loads is itself a disclosure, and it is not needed: the
-    sender already knows what they asked about. What they cannot tell is whether we saw the
-    rest, and one sentence fixes that without characterising any of them.
+    NAMES them, where an earlier version only said "some". A Parasource enquiry put three
+    loads in its subject line and got a reply covering two, with "any other loads on your list
+    are not addressed here" — which left the sender to work out which. Repeating a number
+    they wrote themselves discloses nothing: they already know they asked. What must stay out
+    is anything ABOUT the load — its status, carrier, amount or why it is withheld.
     """
 
-    if withheld_count < 1:
+    if not withheld_loads:
         return []
     return [
-        "- The sender named other load(s) this reply does NOT cover. Do not name them, "
-        "describe them, say how many there are, or explain why — you are not authorized to "
-        "discuss them. Add one plain sentence saying this reply covers the load(s) above "
-        "and that any others on their list are not addressed here.",
+        f"- Load(s) {', '.join(withheld_loads)} are NOT covered by this reply. Name them in "
+        "one plain sentence as not addressed here, and say nothing else about them: no "
+        "status, no amount, no carrier, and no reason. You are not authorized to discuss "
+        "them, and 'why' is itself something you must not disclose.",
     ]
 
 
@@ -551,7 +551,7 @@ def build_payment_status_intake(
     documents_email: str = "freightpay@circledelivers.com",
     prenoa_loads: list[str] | None = None,
     unlocated_loads: list[str] | None = None,
-    withheld_count: int = 0,
+    withheld_loads: list[str] | None = None,
 ) -> str:
     """Compose the first user turn: the email plus the deterministic intake results."""
 
@@ -569,7 +569,7 @@ def build_payment_status_intake(
             f"- Sign the reply exactly as: {signature}",
             f"- Missing paperwork should be emailed to: {documents_email}",
             *_unlocated_line(unlocated_loads),
-            *_withheld_line(withheld_count),
+            *_withheld_line(withheld_loads),
             *(
                 [
                     "- The sender is a roster-verified factoring company but no NOA is on "
@@ -595,7 +595,7 @@ def build_rate_verification_intake(
     documents_email: str = "freightpay@circledelivers.com",
     prenoa_loads: list[str] | None = None,
     unlocated_loads: list[str] | None = None,
-    withheld_count: int = 0,
+    withheld_loads: list[str] | None = None,
 ) -> str:
     """Compose the first user turn for rate verification, including the stated amount(s)."""
 
@@ -622,7 +622,7 @@ def build_rate_verification_intake(
             f"- Sign the reply exactly as: {signature}",
             f"- Missing paperwork should be emailed to: {documents_email}",
             *_unlocated_line(unlocated_loads),
-            *_withheld_line(withheld_count),
+            *_withheld_line(withheld_loads),
             *(
                 [
                     "- The sender is a roster-verified factoring company but no NOA is on "

@@ -366,6 +366,25 @@ class PaymentBotPipeline:
                 _BULK_PORTAL_SKILL_ID,
             )
 
+        # Answer the loads the sender NAMED, and look up nothing else.
+        #
+        # This used to sit after authorization, which meant every load-shaped number an
+        # attachment contributed was looked up first. A BasicBlock rate verification naming
+        # ONE load, #322500, carried paperwork whose 6-digit numbers took the count to eleven:
+        # eleven lookups, a CargoTel "no load exists" wall in the escalation, and ten ids
+        # reported back as loads the sender had asked about. None of them was ever going to be
+        # answered — the narrowing removed them again further down — so the only thing the
+        # lookups bought was noise.
+        #
+        # THE TRADE, and it is a real one: the second bulk check counts what survived
+        # authorization, to tell "one load written, nine reference numbers attached" (answer
+        # the one) from "one written, forty of the sender's REAL loads attached" (deflect to
+        # the portal). Narrowing here collapses the second case into the first, so such an
+        # email now answers the written load instead of sending a portal link. Taken
+        # deliberately: looking up numbers the sender never mentioned is the worse failure.
+        load_ids = self._narrow_to_written(load_ids, identifiers.written_load_ids, correlation_id)
+        routes = {lid: routes[lid] for lid in load_ids}
+
         tp_loads = [lid for lid, sys in routes.items() if sys is System.TRANSPORT_PRO]
         # `System.QUICKBOOKS` is the §4.1 routing label for 6-digit ids. CargoTel is the
         # system that actually holds them; QuickBooks receives them downstream as bills.
@@ -507,8 +526,8 @@ class PaymentBotPipeline:
         # without naming them. DENY only: a load Transport Pro resolved and this sender is
         # not entitled to. Cancellations and lookup failures are excluded on purpose — the
         # first is answerable and the second is already surfaced as `unlocated_loads`, and
-        # since the id filter now runs after authorization, a phantom id fails as CANCELLED
-        # rather than DENY and so cannot inflate this.
+        # Only ids the sender wrote reach authorization at all now, so nothing an attachment
+        # contributed can appear here.
         withheld_named = [
             lid
             for lid, reason in unauthorized
@@ -536,13 +555,6 @@ class PaymentBotPipeline:
                 _BULK_PORTAL_SKILL_ID,
             )
 
-        # Deflection is ruled out, so this reply will name loads — and only now is it safe to
-        # ask which ones the sender actually asked about. Not earlier: both bulk checks above
-        # need the unnarrowed set to tell "one written, nine reference numbers" from "one
-        # written, forty real loads", and the second one is decided by authorization, not by
-        # writtenness.
-        load_ids = self._narrow_to_written(load_ids, identifiers.written_load_ids, correlation_id)
-
         # 2. Select the skill by intent -------------------------------------
         # Built from load_ids, not routes: dropped loads (non-TP, unauthorized) must not
         # reappear in the intake prompt.
@@ -556,7 +568,7 @@ class PaymentBotPipeline:
             system,
             prenoa_loads,
             unresolved_loads,
-            len(withheld_named),
+            withheld_named,
         )
 
         # 3. Agent tool-use loop --------------------------------------------
@@ -709,7 +721,7 @@ class PaymentBotPipeline:
         system: System,
         prenoa_loads: list[str],
         unlocated_loads: list[str],
-        withheld_count: int = 0,
+        withheld_loads: list[str] | None = None,
     ) -> tuple[Skill, str]:
         """Pick the skill + build its intake from the classified intent.
 
@@ -779,7 +791,7 @@ class PaymentBotPipeline:
                 signature=self._settings.reply_signature,
                 documents_email=self._settings.documents_email,
                 unlocated_loads=unlocated_loads,
-                withheld_count=withheld_count,
+                withheld_loads=withheld_loads,
                 rate_question=wants_rate,
                 stated_rates=identifiers.stated_rates,
             )
@@ -795,7 +807,7 @@ class PaymentBotPipeline:
                 documents_email=self._settings.documents_email,
                 prenoa_loads=prenoa_loads,
                 unlocated_loads=unlocated_loads,
-                withheld_count=withheld_count,
+                withheld_loads=withheld_loads,
             )
         return PAYMENT_STATUS_SKILL, build_payment_status_intake(
             email,
@@ -805,7 +817,7 @@ class PaymentBotPipeline:
             documents_email=self._settings.documents_email,
             prenoa_loads=prenoa_loads,
             unlocated_loads=unlocated_loads,
-            withheld_count=withheld_count,
+            withheld_loads=withheld_loads,
         )
 
     def _bulk_portal_draft(self, email: InboundEmail) -> SubmitDraftOutput:

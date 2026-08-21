@@ -916,16 +916,24 @@ def test_confirm_the_payment_status_is_not_a_remit_request() -> None:
 # Loads the sender named that the reply does not cover.
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_the_withheld_line_never_leaks_the_count_or_the_ids() -> None:
-    """The agent is told how many so it knows the situation; the reply must not say."""
+def test_the_withheld_line_names_the_loads_and_nothing_about_them() -> None:
+    """It used to say only "some", and that was worse than saying nothing.
+
+    A Parasource enquiry put three loads in its subject and got a reply covering two, ending
+    "any other loads on your list are not addressed here" — leaving the sender to work out
+    which. Repeating a number they wrote themselves discloses nothing. What must stay out is
+    anything ABOUT the load: status, amount, carrier, or why it is withheld.
+    """
 
     from payment_bot.agent.skills import _withheld_line
 
-    assert _withheld_line(0) == []
-    line = _withheld_line(3)[0]
-    assert "3" not in line
-    assert "do not name" in line.lower()
-    assert "not addressed here" in line.lower()
+    assert _withheld_line(None) == []
+    assert _withheld_line([]) == []
+    line = _withheld_line(["2436437"])[0]
+    assert "2436437" in line
+    assert "no reason" in line
+    assert "not authorized to discuss" in line
+
 
 
 @pytest.mark.unit

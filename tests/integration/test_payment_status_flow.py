@@ -302,8 +302,16 @@ def test_bulk_attachment_loads_get_the_portal_reply() -> None:
 
     result = pipeline.process_email(bulk)
 
+    # CHANGED DELIBERATELY. This used to get the portal link, because the seven attachment
+    # ids survived to the post-authorization bulk count. Looking up numbers the sender never
+    # mentioned turned out to be the worse failure — a BasicBlock mail naming ONE load had
+    # eleven ids looked up and ten of them reported back as loads it had asked about — so the
+    # narrowing to written ids moved ahead of authorization, and this shape now answers the
+    # one load the subject names. The portal fallback still fires on a statement whose ids are
+    # attachment-ONLY, which is the case it was built for.
     assert result.outcome is Outcome.SENT, result.detail
-    assert "payment-status-lookup" in gmail.sent[0].body  # the portal link
+    assert "payment-status-lookup" not in gmail.sent[0].body
+    assert "2462934" in gmail.sent[0].body
     assert slack.escalations == []
 
 
@@ -661,7 +669,9 @@ def test_an_escalation_says_which_ids_came_from_an_attachment() -> None:
 
     assert result.outcome is Outcome.ESCALATED
     detail = result.detail
-    assert "contributed by an attachment: 1002691, 3210943" in detail
-    # The one the sender wrote is not in that list, and no attachment id is called cancelled.
-    assert "attachment: 1002691, 3210943, 2462934" not in detail
+    # Stronger than it was: the attachment's ids are not merely LABELLED any more, they never
+    # reach authorization, so nothing looks them up and the escalation cannot name them.
+    assert "1002691" not in detail
+    assert "3210943" not in detail
+    assert "2462934" in detail
     assert "cancelled" not in detail

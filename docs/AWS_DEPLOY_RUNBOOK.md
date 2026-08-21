@@ -281,7 +281,7 @@ aws logs tail /aws/lambda/paybot-worker-prod --since 24h --filter-pattern "gate_
 Once parallel running is clean:
 
 ```bash
-schtasks /change /tn "Payment Bot Hourly" /disable
+schtasks /change /tn "PaymentBot-DraftRun" /disable
 ```
 
 Leave it *disabled*, not deleted, for a week. It is your fastest rollback.

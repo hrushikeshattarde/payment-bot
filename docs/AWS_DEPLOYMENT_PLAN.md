@@ -391,7 +391,7 @@ GitHub Actions on the repo (branches already in use):
    two days of interleaved parallel running. Thread-skip guarantees no duplicate drafts;
    what to verify is *parity of outcomes* per email (draft/escalation with same reasons)
    and Bedrock draft quality (expect strictly fewer gate blocks and style repairs).
-3. Disable the Windows task: `schtasks /change /tn "Payment Bot Hourly" /disable`.
+3. Disable the Windows task: `schtasks /change /tn "PaymentBot-DraftRun" /disable`.
 4. One week later, delete the task and rotate the TP password + Google key (retiring the
    plaintext `.env` copies).
 

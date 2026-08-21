@@ -126,7 +126,9 @@ identifiers stay in the gitignored `deploy/params.prod.json`.
       draft-or-escalate decisions daily:
       `aws logs tail /aws/lambda/paybot-worker-prod --since 24h`
 - [ ] Park the workstation task (disabled, not deleted — it is the fastest rollback):
-      `schtasks /change /tn "Payment Bot Hourly" /disable`
+      `schtasks /change /tn "PaymentBot-DraftRun" /disable`
+      (the task's real name, verified 2026-08-20 — earlier docs said "Payment Bot Hourly",
+      which matches nothing and fails exactly when you need the rollback)
 - [ ] After one clean week: delete the task, then **rotate** the Transport Pro password
       and the Google key, retiring the plaintext `.env` copies on the workstation.
 

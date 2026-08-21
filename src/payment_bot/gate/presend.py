@@ -184,16 +184,27 @@ def _confirms_payment_direction(
     has asked us to affirm where their money goes does agreeing to it become the §7 problem.
     """
 
-    if not change_announced:
-        asked = "\n".join(
-            part
-            for part in (email.subject, strip_quoted(email.body), strip_quoted(email.html_text))
-            if part
-        )
-        if not _REMIT_CONFIRMATION_REQUEST_RE.search(asked):
-            return None
+    asked = "\n".join(
+        part
+        for part in (email.subject, strip_quoted(email.body), strip_quoted(email.html_text))
+        if part
+    )
+    requested = bool(_REMIT_CONFIRMATION_REQUEST_RE.search(asked))
+    if not (requested or change_announced):
+        return None
     match = _PAYMENT_DIRECTION_RE.search(draft_body)
-    return " ".join(match.group(0).split()) if match else None
+    if not match:
+        return None
+    # Name the trigger that actually armed, not whichever one was written first. Reported as
+    # "answering a confirmation request" regardless, the message sent a reviewer looking for
+    # the word "confirm" in an RTS email that never used it — the arm had fired on
+    # detect_sensitive_change's own bank signal ("below remittance") instead.
+    trigger = (
+        "answering a confirmation request"
+        if requested
+        else "on mail already flagged as a payment-detail change"
+    )
+    return f"{' '.join(match.group(0).split())} {trigger}"
 
 
 def _noa_action_problems(body: str, noa_request_expected: bool) -> list[str]:
@@ -679,7 +690,7 @@ class PreSendGate:
         problems.extend(_noa_action_problems(body, noa_request_expected))
         agreed = _confirms_payment_direction(body, email, change_announced=change_announced)
         if agreed:
-            problems.append(f"payment direction {agreed!r} answering a confirmation request")
+            problems.append(f"payment direction {agreed!r}")
         if problems:
             return GateCheck(
                 name="change_acknowledgment",

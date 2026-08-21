@@ -252,6 +252,25 @@ Parameters:
       rostered to another company, loads with no factor on file, and sensitive-change mail are
       refused regardless. Every auto-add is logged WARNING as auto_roster_entry_added and
       marked AUTO-ADDED in factoring_domains_manual.json so it can be revoked.
+  CarrierNameMatch:
+    Type: String
+    Default: shadow
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Whether a sender whose ADDRESS names the carrier on the load may be authorised.
+      Carriers on this inbox are overwhelmingly on free mail, so the address cannot identify
+      them and carrier_contacts.json needs a hand-added entry per mailbox — which is why
+      free-mail carriers escalate over and over. This matches the sender's local part or
+      domain against the carrier company Transport Pro holds on the load.
+      IT WIDENS AUTHORISATION ON EVIDENCE THE SENDER CONTROLS: a free-mail local part is
+      chosen by whoever registered the mailbox, so a match shows someone knew the carrier's
+      name, not that they are the carrier. Defaults to shadow — logged, not applied — so a
+      day of live mail can be read back before it grants anything, the way LlmIdFilter was
+      introduced. Every match logs carrier_name_match at WARNING in all three modes. A name
+      of only industry words ("Transport LLC") can never match. The pre-send gate is
+      unchanged: a reply still cannot confirm a remittance change or disclose another
+      carrier's load.
+
   LlmIdFilter:
     Type: String
     Default: shadow
@@ -508,6 +527,7 @@ Resources:
           PAYBOT_NOA_ATTACHMENT_REPLIES: !Ref NoaAttachmentReplies
           PAYBOT_FACTORING_PRENOA_REPLIES: !Ref FactoringPrenoaReplies
           PAYBOT_LLM_ID_FILTER: !Ref LlmIdFilter
+          PAYBOT_CARRIER_NAME_MATCH: !Ref CarrierNameMatch
           PAYBOT_GATE_BLOCK_RETRY_LIMIT: !Ref GateBlockRetryLimit
           PAYBOT_ESCALATION_RETRY_LIMIT: !Ref EscalationRetryLimit
           PAYBOT_AGENT_ESCALATION_RETRY_LIMIT: !Ref AgentEscalationRetryLimit

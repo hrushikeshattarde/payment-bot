@@ -33,6 +33,13 @@ from payment_bot.tools.base import Tool, ToolContext
 _log = get_logger("tools.shared")
 
 # Company-name tokens too generic to prove identity by themselves.
+#: Corporate suffixes only. Dropped from the whole-name form in :func:`_name_keys` so
+#: "NUC EXPRESS INC" and "NUC EXPRESS" reduce alike; kept apart from _STOPWORDS because the
+#: distinctive-token form still has to treat "express" and "trucking" as furniture while a
+#: whole-name match is allowed to use them.
+_CORPORATE_SUFFIXES = frozenset({"inc", "llc", "corp", "co", "ltd", "incorporated",
+                                 "company", "corporation"})  # fmt: skip
+
 _STOPWORDS = frozenset(
     {
         "inc", "llc", "corp", "co", "ltd", "incorporated", "company", "corporation",
@@ -591,6 +598,75 @@ def _factor_names_match(configured_name: str, on_file: str) -> bool:
         (company_tokens(key) - _FACTOR_GENERIC_TOKENS)
         & (company_tokens(name) - _FACTOR_GENERIC_TOKENS)
     )
+
+
+#: Minimum characters of carrier name that must appear in the sender's address.
+#:
+#: Six is short enough for a real name and long enough that an incidental substring is not
+#: a match. Below it the rule stops being evidence: a three-letter fragment turns up inside
+#: unrelated words, and the whole point of this match is that the sender proves something.
+_CARRIER_NAME_MIN_CHARS = 6
+
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _name_keys(carrier_company: str) -> tuple[str, list[str]]:
+    """``(whole, distinctive)`` forms of a carrier name, ready to look for in an address.
+
+    ``whole`` is every token run together, corporate suffixes dropped: "NUC EXPRESS INC"
+    becomes ``nucexpress``. ``distinctive`` is the tokens that are not industry furniture,
+    per :data:`_STOPWORDS`: ``["cleanpeace"]`` for "CLEANPEACE EXPRESS LLC".
+
+    Both are needed because carriers name their mailboxes either way. ``accnucexpress@`` has
+    the whole name inside it; ``cleanpeace.safety@`` has only the distinctive half.
+    """
+
+    normalised = _normalize_company_name(carrier_company)
+    tokens = [t for t in normalised.split() if t not in _CORPORATE_SUFFIXES]
+    distinctive = [t for t in tokens if t not in _STOPWORDS]
+    return "".join(tokens), distinctive
+
+
+def carrier_name_matches_sender(carrier_company: str, sender_email: str) -> str | None:
+    """The carrier's own name, found inside the sender's address. Reason string, or None.
+
+    Carriers on this inbox are overwhelmingly on free mail, so the address alone can never
+    identify them and an exact-address roster cannot keep up with a mailbox per carrier.
+    This matches what the sender's address SAYS against the carrier company Transport Pro
+    records on the load: ``accnucexpress@yahoo.com`` against "NUC EXPRESS INC".
+
+    BE CLEAR ABOUT WHAT THIS IS WORTH. A free-mail local part is chosen by whoever registered
+    the mailbox, so this is evidence that someone knew the carrier's name, not proof they are
+    the carrier. Anyone can register ``nucexpress@gmail.com``. It is a deliberate widening of
+    who may be answered, which is why it ships behind a mode switch, logs every match, and
+    never relaxes the pre-send gate: a reply still may not confirm a remittance change,
+    disclose another carrier's load, or state an ungrounded figure.
+
+    Refuses outright when the name has no distinctive token of its own. "Transport LLC"
+    reduces to industry furniture, and matching on that would authorise every mailbox with
+    "transport" in it for a carrier called nothing else.
+    """
+
+    whole, distinctive = _name_keys(carrier_company)
+    if not distinctive:
+        return None
+
+    sender = sender_email.strip().lower()
+    local, _, domain = sender.partition("@")
+    haystacks = {
+        _NON_ALNUM_RE.sub("", local),
+        _NON_ALNUM_RE.sub("", domain.rsplit(".", 1)[0]),
+    }
+
+    for hay in haystacks:
+        if not hay:
+            continue
+        if len(whole) >= _CARRIER_NAME_MIN_CHARS and whole in hay:
+            return f"sender address contains the carrier name {whole!r}"
+        joined = "".join(distinctive)
+        if len(joined) >= _CARRIER_NAME_MIN_CHARS and all(t in hay for t in distinctive):
+            return f"sender address contains the carrier's distinctive name {joined!r}"
+    return None
 
 
 def _is_configured_carrier_contact(
@@ -1700,6 +1776,35 @@ class CheckAuthorization(Tool):
                     "to PAYBOT_FACTORING_DOMAINS if it is genuine"
                 ),
             )
+
+        # Last resort before refusing: does the sender's own address name this carrier?
+        #
+        # Carriers on this inbox are overwhelmingly on free mail, so an exact-address roster
+        # needs a hand-added entry per mailbox and never keeps up — CLEANPEACE EXPRESS wrote
+        # from cleanpeace.safety@gmail.com while their signature gave cleanpeacetruck@, two
+        # mailboxes at one carrier, neither on file. See carrier_name_matches_sender for what
+        # this is and is not worth. Shadow by default so the agreement can be measured on real
+        # mail before it authorises anything, the way LlmIdFilter was introduced.
+        named = carrier_name_matches_sender(auth.carrier_company or "", params.sender_email)
+        if named:
+            mode = ctx.settings.carrier_name_match
+            _log.warning(
+                "carrier_name_match",
+                extra={
+                    "mode": mode,
+                    "load_id": params.load_id,
+                    "sender": params.sender_email,
+                    "carrier": auth.carrier_company,
+                    "evidence": named,
+                },
+            )
+            if mode == "enforce":
+                return CheckAuthorizationOutput(
+                    decision=AuthDecision.ALLOW,
+                    authorized=True,
+                    matched_party=auth.carrier_company,
+                    reason=f"carrier name match ({named})",
+                )
 
         return CheckAuthorizationOutput(
             decision=AuthDecision.DENY,

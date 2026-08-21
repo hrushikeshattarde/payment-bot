@@ -226,6 +226,22 @@ class Settings(BaseSettings):
     #: to measure agreement on real mail before anything depends on it. ``enforce`` applies
     #: it. See :mod:`payment_bot.id_filter`; the model only ever removes candidates the
     #: regex already produced, so it cannot introduce a load id.
+    #: Whether a sender whose ADDRESS names the carrier on the load may be authorised.
+    #:
+    #: ``off`` | ``shadow`` | ``enforce``. Carriers here are overwhelmingly on free mail, so
+    #: the address cannot identify them and carrier_contacts.json needs a hand-added entry per
+    #: mailbox — which is why free-mail carriers escalate over and over. This matches the
+    #: sender's local part or domain against the carrier company Transport Pro holds on the
+    #: load.
+    #:
+    #: It widens who may be answered on evidence the sender controls: a free-mail local part
+    #: is chosen by whoever registered the mailbox, so this shows someone knew the carrier's
+    #: name, not that they are the carrier. Defaults to ``shadow`` — logged, not applied —
+    #: so a day of real mail can be read back from `carrier_name_match` before it grants
+    #: anything, the way llm_id_filter was introduced. Every match logs at WARNING in every
+    #: mode. The pre-send gate is unchanged either way.
+    carrier_name_match: str = "shadow"
+
     llm_id_filter: str = "off"
 
     #: Review artifact listing, per factor, the domains our OWN records hold and how many

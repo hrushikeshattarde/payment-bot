@@ -248,11 +248,18 @@ def _multi_id_email(from_email: str) -> InboundEmail:
     )
 
 
-def test_a_refused_email_never_pays_for_the_id_filter() -> None:
-    """The saving, stated as the number that matters: zero model calls.
+def test_a_refused_email_still_pays_for_the_id_filter_on_purpose() -> None:
+    """The cost saving here was taken back, deliberately, and this records why.
 
-    Before the move, every email carrying two or more candidates paid one filter call before
-    the authorization refusal it was always going to get. Refusals are the majority outcome.
+    The filter briefly ran AFTER authorization so a refused email — the majority outcome —
+    paid no model call. What that bought was worse than what it saved: with the filter behind
+    authorization, phantom candidates reach Transport Pro and get named in the escalation as
+    loads the sender asked about. A WEX collections table put the carrier's motor-carrier
+    number 1133075 beside load 2480506 and the refusal listed both; an OTR rate confirmation
+    did the same with an MC and a DOT number.
+
+    Knowing WHICH load and WHICH carrier an email is about is worth more than the call, and
+    MIN_CANDIDATES keeps single-id mail free either way.
     """
 
     settings = _settings(llm_id_filter="enforce")
@@ -263,7 +270,8 @@ def test_a_refused_email_never_pays_for_the_id_filter() -> None:
 
     assert [r.outcome for r in results] == [Outcome.ESCALATED]
     assert "not authorized" in results[0].detail
-    assert llm.calls == [], "a refused email must cost no model call at all"
+    # One call, and it failed closed on an exhausted script — the point is that it was made.
+    assert len(llm.calls) == 1
 
 
 def test_the_filter_is_still_called_when_the_email_is_answerable() -> None:

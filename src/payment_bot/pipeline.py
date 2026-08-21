@@ -260,7 +260,22 @@ class PaymentBotPipeline:
             ctx,
         )
         identifiers = ExtractIdentifiersOutput.model_validate(ident_out.payload)
-        load_ids = list(identifiers.load_ids)
+        # The id filter runs HERE, before routing and authorization.
+        #
+        # It was moved AFTER authorization as a cost measure: one model call, paid by every
+        # email with two or more candidates including the majority that were about to be
+        # refused. Moved back, because what it bought was worse than what it saved. A WEX
+        # collections table writes the motor-carrier number in a header-row column and the
+        # load two columns along; the 24-character label guard cannot see across rows, so
+        # 1133075 reached authorization as a load and the escalation reported the carrier's
+        # MC number as one of the loads the sender had asked about. Same shape twice more the
+        # same day: an MC and a DOT number off a rate confirmation on LD#2550332.
+        #
+        # Cheap where it matters: MIN_CANDIDATES means a single-id email never calls the model
+        # at all, so the cost lands only on multi-candidate mail — which is exactly where the
+        # phantoms are. Correct identification of WHICH load and WHICH carrier an email is
+        # about is worth more than the call.
+        load_ids = self._filter_ids(list(identifiers.load_ids), email, correlation_id)
         if not load_ids:
             # No valid id — carrier-name lookup / clarification is out of this slice.
             return self._escalate(
@@ -341,20 +356,6 @@ class PaymentBotPipeline:
         # and it deflects here without spending an authorization lookup per load.
         written = set(identifiers.written_load_ids)
         written_ids = [lid for lid in load_ids if lid in written]
-        id_filter_spent = False
-        if len(written_ids or load_ids) > self._settings.bulk_threshold:
-            # About to deflect on a count taken from UNFILTERED candidates, which the filter
-            # exists to correct. A WEX-shaped collections table writes MC numbers, an account
-            # number and an invoice number beside the one real load; six of those in the body
-            # clear this threshold and would send a portal link in answer to a one-load
-            # question — the MDR failure again, through a different door.
-            #
-            # So the filter is spent HERE when it can still change the answer, and only on the
-            # borderline email. Everything else still reaches authorization without paying for
-            # it. A model call is cheap next to deflecting a real question.
-            load_ids = self._filter_ids(load_ids, email, correlation_id)
-            id_filter_spent = True
-            written_ids = [lid for lid in load_ids if lid in written]
         if len(written_ids or load_ids) > self._settings.bulk_threshold:
             return self._finalize(
                 email,
@@ -513,37 +514,6 @@ class PaymentBotPipeline:
             for lid, reason in unauthorized
             if lid in written and reason.startswith(AuthDecision.DENY.value)
         ]
-
-        # The id filter runs HERE rather than at intake, and the move is a cost decision.
-        #
-        # It is one model call, and it used to be paid by every email that reached intake with
-        # two or more candidates — including every email that was about to be refused. Most of
-        # them are: escalations are the majority outcome, and an authorization refusal is the
-        # commonest reason. Those calls bought nothing, because nothing downstream ever ran.
-        #
-        # Sound because the filter can only ever REMOVE candidates (see id_filter's module
-        # docstring). If no id in the unfiltered set authorizes, none in any subset of it can
-        # either, so the refusal above is the same refusal it would have produced afterwards.
-        # What the filter still does here is what it was built for: drop an id that is not a
-        # load at all but that the sender happens to be authorized for, before the reply
-        # discloses it.
-        #
-        # The trade, taken deliberately: authorization now runs over the unfiltered set, so a
-        # phantom costs a Transport Pro call it used to be spared. Those are free and about
-        # half a second; the model call was neither.
-        filtered = load_ids if id_filter_spent else self._filter_ids(
-            load_ids, email, correlation_id
-        )
-        if filtered and filtered != load_ids:
-            dropped = [lid for lid in load_ids if lid not in set(filtered)]
-            _log.info(
-                "authorized_ids_filtered",
-                extra={"correlation_id": correlation_id, "dropped": dropped},
-            )
-            load_ids = filtered
-            keep = set(load_ids)
-            prenoa_loads = [lid for lid in prenoa_loads if lid in keep]
-            unresolved_loads = [lid for lid in unresolved_loads if lid in keep]
 
         # The bulk decision's SECOND half, on the set that survived authorization. This is the
         # count that actually matters: a phantom id from an attachment fails authorization and

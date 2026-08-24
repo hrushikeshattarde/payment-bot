@@ -552,12 +552,21 @@ def test_each_row_links_to_the_approval_card_so_a_reviewer_can_act() -> None:
     )
     row = _texts(queue_card([entry], now=NOW, expiry_days=3))[1]
 
-    assert "https://chat.google.com/room/AAQAnvSk2WY/p7dH0UiVeRc.wbi1j0I5tdo" in row
+    assert (
+        "https://chat.google.com/room/AAQAnvSk2WY/p7dH0UiVeRc/wbi1j0I5tdo?cls=10" in row
+    )
     # The email stays reachable beside it, for reading what was actually asked.
     assert "rfc822msgid" in row
     assert ">email</a>" in row
 
-    assert _chat_message_link("spaces/S/messages/M") == "https://chat.google.com/room/S/M"
+    # The shape was confirmed against a link copied out of the space. The dot in a message
+    # name is the thread/message boundary and the URL wants two segments — passing
+    # `thread.message` as one is a well-formed URL that opens nothing, which is what shipped
+    # first and what a reviewer reported as "it does not take me to that card".
+    assert (
+        _chat_message_link("spaces/AAQAnvSk2WY/messages/1DtXZn3gulU.HAOPq9FXNMs")
+        == "https://chat.google.com/room/AAQAnvSk2WY/1DtXZn3gulU/HAOPq9FXNMs?cls=10"
+    )
 
 
 @pytest.mark.unit
@@ -573,7 +582,9 @@ def test_a_row_with_no_card_still_renders_and_still_links_the_email() -> None:
 
     from payment_bot.clients.google_chat import _chat_message_link
 
-    for junk in ("", "nonsense", "spaces/S", "spaces/S/threads/T"):
+    # A name that does not split into thread and message yields no link at all. A row with
+    # no link is honest; a row whose link resolves nowhere is not.
+    for junk in ("", "nonsense", "spaces/S", "spaces/S/threads/T.M", "spaces/S/messages/NoDot"):
         assert _chat_message_link(junk) == ""
 
 
@@ -641,3 +652,27 @@ def test_the_redrawn_card_points_its_chips_back_at_the_callback() -> None:
 
     assert '"function": "https://own.example/"' in rendered
     assert '"function": "queue_filter"' not in rendered
+
+
+@pytest.mark.unit
+def test_subjects_and_addresses_are_escaped_for_the_card() -> None:
+    """Card text takes a little HTML — the rows are built from <a> and <br> — so an
+    ampersand arriving in a subject is markup Chat has to parse, and one unescaped `&` makes
+    the whole card unrenderable. Live in the queue: a subject reading "… Request for … & …".
+    """
+
+    entry = replace(
+        _entry("e", hours_old=5, to="a&b@carrier.com", loads=("2469115",)),
+        subject="Re: Payment Status for A & B <urgent>",
+    )
+    row = _texts(queue_card([entry], now=NOW, expiry_days=3))[1]
+
+    assert "&amp;" in row
+    assert "&lt;urgent&gt;" in row
+    # Our own markup survives untouched.
+    assert "<br>" in row
+    assert "<a href=" in row
+    # And no raw ampersand is left outside an entity.
+    import re as _re
+
+    assert not _re.search(r"&(?!amp;|lt;|gt;|quot;|#)", row)

@@ -53,6 +53,20 @@ ACTION_MOVE = "move_to_drafts"
 ACTION_REJECT = "reject"
 
 
+def _esc(text: str) -> str:
+    """Escape a value for a card's rich-text field.
+
+    Card text takes a small amount of HTML — the tracker's rows are built from ``<a>`` and
+    ``<br>`` — so any ``&`` or angle bracket arriving in a subject or an address is markup
+    Chat has to parse. A live queue held ``Re: Payment Status Request for … & …``, and one
+    unescaped ampersand is enough to make the whole card unrenderable.
+
+    Only the VALUES go through this; the tags this module writes itself must not.
+    """
+
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _trim(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -73,26 +87,37 @@ def _gmail_link(message_id: str) -> str:
 
 
 def _chat_message_link(chat_message: str) -> str:
-    """A link that opens one approval card in the space. ``""`` when there is none.
+    """A link that opens one approval card in the space. ``""`` when it cannot be built.
 
-    Built from the resource name Chat returned when the card was posted —
-    ``spaces/AAQAnvSk2WY/messages/p7dH0UiVeRc.wbi1j0I5tdo`` becomes
-    ``https://chat.google.com/room/AAQAnvSk2WY/p7dH0UiVeRc.wbi1j0I5tdo``. The API exposes no
-    permalink field, so this is assembled from the two ids rather than read from a response.
+    The API exposes no permalink field, so this is assembled from the resource name. The
+    shape was confirmed against a link copied out of the space itself, because guessing it
+    produced a link that resolved nowhere:
 
-    The tracker needs it because the queue is a list of things to DO, and the doing happens
-    on the approval card: its Approve button is the only way a reply goes out. A row that
-    linked only to the email in Gmail told a reviewer what was waiting and then left them to
-    scroll the space for the card that could action it.
+    ``spaces/AAQAnvSk2WY/messages/1DtXZn3gulU.HAOPq9FXNMs``
+    → ``https://chat.google.com/room/AAQAnvSk2WY/1DtXZn3gulU/HAOPq9FXNMs?cls=10``
+
+    **The dot is a path separator, not part of the id.** A message name ends in
+    ``{thread}.{message}`` and the URL wants those as two segments — the earlier version
+    passed the whole ``thread.message`` string as one, which is a well-formed URL that opens
+    nothing. Anything that does not split into exactly two halves yields no link at all: a
+    row with no link is honest, a row with a link that goes nowhere is not.
+
+    ``cls=10`` is carried verbatim from the copied link rather than reasoned about.
+
+    The tracker needs this because the queue is a list of things to DO, and the doing happens
+    on the approval card: its Approve button is the only way a reply goes out. A row linking
+    only to the email in Gmail told a reviewer what was waiting and then left them scrolling
+    the space for the card that could action it.
     """
 
     parts = chat_message.strip().strip("/").split("/")
-    if len(parts) < 4 or parts[0] != "spaces" or parts[2] != "messages":
+    if len(parts) != 4 or parts[0] != "spaces" or parts[2] != "messages":
         return ""
     space, message = parts[1], parts[3]
-    if not (space and message):
+    thread, _, tail = message.partition(".")
+    if not (space and thread and tail):
         return ""
-    return f"https://chat.google.com/room/{space}/{message}"
+    return f"https://chat.google.com/room/{space}/{thread}/{tail}?cls=10"
 
 
 def _open_email_button(message_id: str) -> dict[str, Any]:
@@ -486,7 +511,7 @@ def queue_card(
         # here to do. The email stays reachable beside it for the cases where they need to
         # read what was actually asked before deciding. Both are inline anchors rather than
         # buttons: twelve rows of buttons is a card Chat would reject.
-        who = _trim(entry.to, 60)
+        who = _esc(_trim(entry.to, 60))
         primary = f'<a href="{card_link}">{who}</a>' if card_link else who
         secondary = f' · <a href="{_gmail_link(entry.message_id)}">email</a>'
         widgets.append(
@@ -494,8 +519,8 @@ def queue_card(
                 "decoratedText": {
                     "topLabel": f"{_age(hours)} · {when}",
                     "text": (
-                        f"{primary} · {loads}{secondary}"
-                        f"<br>{_trim(entry.subject or '(no subject)', 90)}"
+                        f"{primary} · {_esc(loads)}{secondary}"
+                        f"<br>{_esc(_trim(entry.subject or '(no subject)', 90))}"
                     ),
                     "wrapText": True,
                 }

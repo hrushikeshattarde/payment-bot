@@ -363,14 +363,24 @@ def bucket_of(hours_old: float) -> str:
     return "older"
 
 
-#: How many queued drafts the tracker card lists by name.
+#: Hard ceiling on rows, and a backstop rather than the real limit — :data:`_CARD_BUDGET`
+#: almost always binds first. Kept so a pathological queue of one-character subjects cannot
+#: produce a card with hundreds of widgets: Chat allows 100 per section.
+_QUEUE_ROWS = 90
+
+#: Bytes of serialised card the tracker will fill before it stops adding rows.
 #:
-#: A cap, not a preference. Chat rejects an oversized card outright, and the queue has run
-#: to 86 entries — one widget each would be a card nobody could read even if the API took
-#: it. The rows are the urgent tail (oldest first, so the ones about to expire), and the
-#: count line above them always states the true total, so a trimmed card never reads as a
-#: shorter queue than there is.
-_QUEUE_ROWS = 12
+#: Chat rejects a card over roughly 32KB outright, so this is a real limit and not a taste
+#: decision — but it is a limit on SIZE, and the row count was being capped at twelve, which
+#: measured out at 6KB. Five sixths of the allowance went unused and a 96-entry queue showed
+#: twelve rows and "84 more". Measured on the live queue: 60 rows is 26.7KB, 80 rows is
+#: 35.6KB and over the line. 28KB leaves headroom for the response envelope and for a subject
+#: longer than any currently in the queue.
+#:
+#: Budget rather than a row count because rows are not a fixed size — a load list and a long
+#: subject can be triple a bare one — so any count safe for the worst case wastes most of the
+#: card in the normal one.
+_CARD_BUDGET = 28_000
 
 
 def queue_card(
@@ -380,6 +390,7 @@ def queue_card(
     expiry_days: int,
     refreshed: str = "",
     rows: int = _QUEUE_ROWS,
+    budget: int = _CARD_BUDGET,
     bucket: str = "all",
     action_url: str = "",
     interactive: bool = False,
@@ -498,6 +509,15 @@ def queue_card(
             }
         )
 
+    # Rows are added until the card is nearly full rather than up to a fixed count: see
+    # _CARD_BUDGET. `overhead` is everything that is not a row — header, nav bar, lead line
+    # — measured rather than estimated, so the budget cannot drift as those change.
+    overhead = len(json.dumps({"cardId": "approval-queue-tracker", "card": {
+        "header": {"title": "Drafts awaiting approval", "subtitle": ""},
+        "sections": [{"widgets": widgets}]}}))
+    spent = overhead
+    listed = 0
+
     for hours, entry in shown[:rows]:
         left = cutoff_hours - hours
         when = (
@@ -514,25 +534,42 @@ def queue_card(
         who = _esc(_trim(entry.to, 60))
         primary = f'<a href="{card_link}">{who}</a>' if card_link else who
         secondary = f' · <a href="{_gmail_link(entry.message_id)}">email</a>'
-        widgets.append(
-            {
-                "decoratedText": {
-                    "topLabel": f"{_age(hours)} · {when}",
-                    "text": (
-                        f"{primary} · {_esc(loads)}{secondary}"
-                        f"<br>{_esc(_trim(entry.subject or '(no subject)', 90))}"
-                    ),
-                    "wrapText": True,
-                }
+        row = {
+            "decoratedText": {
+                "topLabel": f"{_age(hours)} · {when}",
+                "text": (
+                    f"{primary} · {_esc(loads)}{secondary}"
+                    f"<br>{_esc(_trim(entry.subject or '(no subject)', 90))}"
+                ),
+                "wrapText": True,
             }
-        )
+        }
+        cost = len(json.dumps(row))
+        if listed and spent + cost > budget:
+            break
+        widgets.append(row)
+        spent += cost
+        listed += 1
 
-    if len(shown) > rows:
+    if len(shown) > listed:
+        # Only reachable when a single view genuinely cannot fit, which after the budget
+        # change means the unfiltered card on a large queue. The date chips are the way
+        # through it — each bucket is a fraction of the whole and fits on its own — so the
+        # line points at them rather than just reporting a shortfall.
+        remaining = len(shown) - listed
         widgets.append(
             {
                 "decoratedText": {
                     "topLabel": "Not listed",
-                    "text": f"{len(shown) - rows} more, all newer than those above.",
+                    "text": (
+                        f"{remaining} more, all newer than those above. "
+                        + (
+                            "Tap a date above to see them — each day fits on its own."
+                            if selected == "all"
+                            else "This day is larger than one card."
+                        )
+                    ),
+                    "wrapText": True,
                 }
             }
         )

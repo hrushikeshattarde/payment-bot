@@ -676,3 +676,68 @@ def test_subjects_and_addresses_are_escaped_for_the_card() -> None:
     import re as _re
 
     assert not _re.search(r"&(?!amp;|lt;|gt;|quot;|#)", row)
+
+
+@pytest.mark.unit
+def test_a_whole_bucket_is_listed_when_it_fits() -> None:
+    """The row cap was 12 against a card allowance of ~32KB, which twelve rows fill to 6KB.
+    Five sixths of the space went unused, so a 96-entry queue showed twelve rows and "84
+    more" — and every date bucket was in fact small enough to list completely."""
+
+    entries = [_entry(f"e{i}", hours_old=30 + i * 0.1, to=f"a{i}@carrier.com") for i in range(40)]
+    card = queue_card(entries, now=NOW, expiry_days=3)
+    rows = [t for t in _labels(card) if "old" in t]
+
+    assert len(rows) == 40
+    assert "Not listed" not in _labels(card)
+
+
+@pytest.mark.unit
+def test_rows_stop_at_the_byte_budget_not_at_a_row_count() -> None:
+    """Rows are not a fixed size — a long subject and a load list can be triple a bare row —
+    so any count safe for the worst case wastes most of the card in the normal one. Chat
+    rejects an oversized card outright, so the budget is a real limit."""
+
+    fat = [
+        replace(
+            _entry(f"e{i}", hours_old=60 - i * 0.01, to=f"someone.with.a.long.address{i}@carrier.example.com"),
+            subject="Re: " + "Payment status request for a great many loads " * 3,
+        )
+        for i in range(90)
+    ]
+    card = queue_card(fat, now=NOW, expiry_days=3, budget=12_000)
+
+    assert len(json.dumps(card)) < 16_000, "budget must bound the card"
+    listed = len([t for t in _labels(card) if "old" in t])
+    assert 0 < listed < 90
+    tail = _texts(card)[-1]
+    assert f"{90 - listed} more" in tail
+
+
+@pytest.mark.unit
+def test_one_row_is_always_listed_even_if_it_alone_exceeds_the_budget() -> None:
+    """A single enormous entry must not render an empty queue. Better an oversized card Chat
+    might refuse than a card that silently says nothing is waiting."""
+
+    huge = replace(_entry("e", hours_old=5, to="a@c.com"), subject="x" * 400)
+    card = queue_card([huge], now=NOW, expiry_days=3, budget=1)
+
+    assert len([t for t in _labels(card) if "old" in t]) == 1
+
+
+@pytest.mark.unit
+def test_the_unfiltered_tail_points_at_the_date_chips() -> None:
+    """When one view genuinely cannot fit, the chips are the way through it — each bucket is
+    a fraction of the whole. Reporting a shortfall without saying that leaves the reviewer
+    with no next step."""
+
+    entries = [_entry(f"e{i}", hours_old=70 - i * 0.5, to=f"a{i}@carrier.example.com") for i in range(120)]
+
+    unfiltered = queue_card(entries, now=NOW, expiry_days=3)
+    assert "Tap a date above" in _texts(unfiltered)[-1]
+
+    # A filtered view that still cannot fit says so plainly instead of pointing at the
+    # chips the reviewer has already used. Budget forced small so the case is reachable.
+    narrowed = queue_card(entries, now=NOW, expiry_days=3, bucket="older", budget=4_000)
+    assert "larger than one card" in _texts(narrowed)[-1]
+    assert "Tap a date above" not in _texts(narrowed)[-1]

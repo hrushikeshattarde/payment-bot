@@ -644,16 +644,11 @@ Resources:
           PAYBOT_REVIEWERS: !Ref Reviewers
           PAYBOT_CHAT_AUDIENCE: !Ref ChatAudience
           PAYBOT_REPLY_TO: !Ref ReplyTo
-          # The callback re-renders cards too, and a card it renders needs the same
-          # endpoint on its buttons that the worker puts there. Missing here, every button
-          # on a callback-rendered card carried the bare verb instead of the URL: on the
-          # add-ons runtime that sends the click to an endpoint literally named after the
-          # verb, so the FIRST click on a worker-rendered tracker worked, the redraw came
-          # back with dead chips, and every click after it failed with Chat's generic
-          # "unable to process your request" and nothing in any log.
-          # !GetAtt on the URL this function owns is not circular — CloudFormation resolves
-          # the URL resource first, exactly as it does for the worker on line 550.
-          PAYBOT_CHAT_ACTION_URL: !If [HasChatSpace, !GetAtt CallbackUrl.FunctionUrl, ""]
+          # No PAYBOT_CHAT_ACTION_URL here, and it cannot be added: CallbackUrl depends on
+          # this function, so feeding its url back into this function's environment is a
+          # circular dependency CloudFormation rejects outright (tried 2026-08-24). The
+          # handler derives the same value from the request's Host header instead — see
+          # chat_callback.handler, which already parses it for audience verification.
 
   # Function URL, not API Gateway: free, and the CHAT_APPROVAL_PLAN.md §8 cost case
   # depends on it. AuthType NONE is required — Google Chat cannot sign SigV4 — so the

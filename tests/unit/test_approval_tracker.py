@@ -441,3 +441,30 @@ def test_a_legacy_schema_click_carries_its_parameters_too() -> None:
 
     assert _click_param(legacy, "bucket") == "today"
     assert _click_param(legacy, "nothing") == ""
+
+
+@pytest.mark.unit
+def test_the_tracker_is_created_the_same_way_approval_cards_are() -> None:
+    """PATCH 403'd on two plainly-POSTed trackers inside an hour while succeeding on 55 of
+    58 approval cards the same week. The creation path was the only measured difference, so
+    the tracker uses the one that yields an editable message: threadKey plus
+    messageReplyOption. Pinned here so a future tidy-up cannot quietly undo it."""
+
+    import json as _json
+
+    chat, transport = _chat(200)
+    captured: dict[str, object] = {}
+
+    def request(method: str, url: str, **kwargs: object):
+        captured["url"] = url
+        captured["body"] = _json.loads(kwargs["body"])  # type: ignore[arg-type]
+        transport.calls.append(method)
+        from payment_bot.clients.http import HttpResponse
+
+        return HttpResponse(200, b'{"name": "spaces/S/messages/t.t"}')
+
+    chat._transport.request = request  # type: ignore[assignment,method-assign]
+    chat.post_card(queue_card([], now=NOW, expiry_days=3), fallback_text="x")
+
+    assert "messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" in str(captured["url"])
+    assert captured["body"]["thread"]["threadKey"] == "paybot-queue-tracker"  # type: ignore[index]

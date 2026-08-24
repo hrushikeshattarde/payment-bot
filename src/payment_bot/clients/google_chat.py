@@ -633,19 +633,31 @@ class GoogleChatClient:
 
         return self.patch_card(message_name, card) == 200
 
-    def post_card(self, card: dict[str, Any], *, fallback_text: str) -> str:
-        """Post one unthreaded card and return its resource name, or ``""`` on failure.
+    def post_card(self, card: dict[str, Any], *, fallback_text: str, thread_key: str = "") -> str:
+        """Post one card and return its resource name, or ``""`` on failure.
 
-        Unthreaded because a pin applies to a message and a card buried in a thread is not
-        pinnable anywhere useful.
+        Created through the SAME request shape as the approval cards — ``threadKey`` plus
+        ``messageReplyOption`` — and that is the point rather than an accident. A plainly
+        POSTed tracker could not be edited afterwards: PATCH returned 403 on two separate
+        tracker messages within the hour, while the identical PATCH succeeded on 55 of 58
+        approval cards over the same week. The creation path was the only measured
+        difference between them, so the tracker now takes the one that demonstrably yields
+        an editable message.
         """
 
         try:
             response = self._transport.request(
                 "POST",
-                f"{CHAT_API_BASE}/{urllib.parse.quote(self._space)}/messages",
+                f"{CHAT_API_BASE}/{urllib.parse.quote(self._space)}/messages"
+                "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD",
                 headers=self._headers(),
-                body=json.dumps({"text": fallback_text, "cardsV2": [card]}).encode("utf-8"),
+                body=json.dumps(
+                    {
+                        "thread": {"threadKey": thread_key or "paybot-queue-tracker"},
+                        "text": fallback_text,
+                        "cardsV2": [card],
+                    }
+                ).encode("utf-8"),
                 timeout=self._timeout,
             )
             if not response.ok:

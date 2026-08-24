@@ -442,7 +442,14 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
         # A date chip on the tracker. Nothing is claimed and nothing is sent — the card is
         # redrawn filtered to one day. Still behind the roster check: one pinned message
         # serves the whole space, so narrowing it changes what everyone sees.
-        return _queue_response(store, settings, _click_param(chat_event, "bucket"), addons)
+        chosen, source = _click_param(chat_event, "bucket")
+        # Logged explicitly because the event dump cannot show it: a bucket that silently
+        # arrives empty renders as `all`, which looks like a button that does nothing.
+        _log.info(
+            "queue_filter_clicked",
+            extra={"bucket": chosen or "(empty)", "parsed_from": source, "clicker": clicker},
+        )
+        return _queue_response(store, settings, chosen, addons)
 
     if not entry_id:
         return _respond_text("That button carried no entry — repost the card.", addons)
@@ -634,8 +641,33 @@ def _sanitised(chat_event: dict[str, Any]) -> str:
             return [scrub(v) for v in value]
         return value
 
+    def prune(event: Any) -> Any:
+        """Drop the clicked card Chat echoes back. It is ours, it is huge, and it hid a bug.
+
+        A card click carries the whole rendered message in
+        ``chat.buttonClickedPayload.message``. On the tracker that is a dozen rows of HTML,
+        which alone exceeds the cap below — and because the dump is key-sorted,
+        ``commonEventObject`` is alphabetically last and was therefore the first thing lost.
+        The one field needed to debug a click was the one field never logged.
+        """
+
+        if not isinstance(event, dict):
+            return event
+        trimmed = dict(event)
+        chat = trimmed.get("chat")
+        if isinstance(chat, dict):
+            chat = dict(chat)
+            for key in ("buttonClickedPayload", "messagePayload", "appCommandPayload"):
+                payload = chat.get(key)
+                if isinstance(payload, dict) and "message" in payload:
+                    payload = dict(payload)
+                    payload["message"] = "(echoed card dropped)"
+                    chat[key] = payload
+            trimmed["chat"] = chat
+        return trimmed
+
     try:
-        return json.dumps(scrub(chat_event), sort_keys=True)[:2000]
+        return json.dumps(scrub(prune(chat_event)), sort_keys=True)[:2000]
     except (TypeError, ValueError):  # pragma: no cover - json-parsed input is dumpable
         return "(unserialisable)"
 
@@ -660,25 +692,40 @@ def _respond_text(text: str, addons: bool) -> dict[str, Any]:
     return _http(200, {"text": text})
 
 
-def _click_param(chat_event: dict[str, Any], key: str) -> str:
-    """One click parameter, read across both event schemas. ``""`` when absent.
+def _click_param(chat_event: dict[str, Any], key: str) -> tuple[str, str]:
+    """``(value, where it was found)`` for one click parameter. ``("", "none")`` if absent.
 
-    The sibling of :func:`_normalise_event`, which returns only the verb and the entry id
-    because those were all any button carried. A date chip carries a bucket instead, and
-    widening that tuple for every future parameter would be worse than one lookup.
+    Reads a parameter block whether it arrives as a **mapping** (``{"bucket": "today"}``) or
+    as a **list of key/value objects** (``[{"key": "bucket", "value": "today"}]``). Chat uses
+    both shapes in different places and an earlier version of this only handled the mapping,
+    which is a silent failure: the verb still parsed, the click still dispatched, and the
+    filter simply always came out ``all`` — a nav bar whose buttons appeared to do nothing.
+
+    Returns where it matched as well as what, because the logged event is no help here: the
+    add-ons payload echoes the entire clicked card back, so CloudWatch truncates the line
+    long before ``commonEventObject``. See :func:`_sanitised`, which now drops that echo.
     """
 
-    for holder in (chat_event.get("commonEventObject"), chat_event.get("common")):
+    def from_block(block: Any) -> str:
+        if isinstance(block, dict):
+            value = block.get(key)
+            return "" if value is None else str(value)
+        if isinstance(block, list):
+            for item in block:
+                if isinstance(item, dict) and str(item.get("key")) == key:
+                    return str(item.get("value") or "")
+        return ""
+
+    for label, holder in (
+        ("commonEventObject", chat_event.get("commonEventObject")),
+        ("common", chat_event.get("common")),
+        ("action", chat_event.get("action")),
+    ):
         if isinstance(holder, dict):
-            params = holder.get("parameters")
-            if isinstance(params, dict) and params.get(key) is not None:
-                return str(params[key])
-    action = chat_event.get("action")
-    if isinstance(action, dict):
-        for item in action.get("parameters") or []:
-            if isinstance(item, dict) and str(item.get("key")) == key:
-                return str(item.get("value") or "")
-    return ""
+            found = from_block(holder.get("parameters"))
+            if found:
+                return found, label
+    return "", "none"
 
 
 def _replace_card(card: dict[str, Any], addons: bool) -> dict[str, Any]:

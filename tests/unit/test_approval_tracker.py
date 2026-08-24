@@ -263,7 +263,6 @@ def test_the_first_ever_refresh_posts_and_remembers_the_name() -> None:
 # queue out of the space the team already works in.
 
 
-
 def _chat(status: int, post_name: str = "spaces/S/messages/new"):
     """A GoogleChatClient over a transport that records methods and answers one status."""
 
@@ -408,20 +407,14 @@ def test_a_chip_click_reads_the_queue_fresh_and_redraws_in_place() -> None:
     """A reviewer may tap a card minutes old; showing them a stale list under a filter they
     just chose is what would make the nav bar untrustworthy."""
 
-    from payment_bot.chat_callback import _click_param, _queue_response
+    from payment_bot.chat_callback import _queue_response
     from payment_bot.config import Settings
 
     store = InMemoryApprovalStore()
     store.put_pending(_entry("fresh", hours_old=1, to="fresh@c.com"))
     store.put_pending(_entry("old", hours_old=60, to="old@c.com"))
 
-    event = {
-        "commonEventObject": {"parameters": {"action": "queue_filter", "bucket": "older"}}
-    }
-    assert _click_param(event, "bucket") == "older"
-
-    response = _queue_response(store, Settings(_env_file=None), "older", False)
-    body = json.loads(response["body"])
+    body = json.loads(_queue_response(store, Settings(_env_file=None), "older", False)["body"])
 
     assert body["actionResponse"]["type"] == "UPDATE_MESSAGE"
     rendered = json.dumps(body["cardsV2"][0])
@@ -430,17 +423,62 @@ def test_a_chip_click_reads_the_queue_fresh_and_redraws_in_place() -> None:
 
 
 @pytest.mark.unit
-def test_a_legacy_schema_click_carries_its_parameters_too() -> None:
+def test_a_click_parameter_is_read_whether_it_is_a_map_or_a_list() -> None:
+    """The live bug. Chat sends a parameter block as a mapping in some payloads and as a
+    list of key/value objects in others. Handling only the mapping failed silently in the
+    worst way: the verb still parsed, the click still dispatched, and the bucket came back
+    empty — so every chip rendered `all` and the nav bar looked inert."""
+
     from payment_bot.chat_callback import _click_param
 
+    as_map = {"commonEventObject": {"parameters": {"action": "queue_filter", "bucket": "today"}}}
+    as_list = {
+        "commonEventObject": {
+            "parameters": [
+                {"key": "action", "value": "queue_filter"},
+                {"key": "bucket", "value": "yesterday"},
+            ]
+        }
+    }
     legacy = {
         "action": {
-            "parameters": [{"key": "action", "value": "queue_filter"}, {"key": "bucket", "value": "today"}]
+            "parameters": [
+                {"key": "action", "value": "queue_filter"},
+                {"key": "bucket", "value": "older"},
+            ]
         }
     }
 
-    assert _click_param(legacy, "bucket") == "today"
-    assert _click_param(legacy, "nothing") == ""
+    assert _click_param(as_map, "bucket") == ("today", "commonEventObject")
+    assert _click_param(as_list, "bucket") == ("yesterday", "commonEventObject")
+    assert _click_param(legacy, "bucket") == ("older", "action")
+    assert _click_param(as_map, "nothing") == ("", "none")
+    assert _click_param({}, "bucket") == ("", "none")
+
+
+@pytest.mark.unit
+def test_the_echoed_card_is_dropped_so_the_click_payload_survives_the_log_cap() -> None:
+    """The reason the bug took two rounds to find. A click echoes the whole rendered card
+    back, which alone exceeded the 2000-char cap — and since the dump is key-sorted,
+    `commonEventObject` sorted last and was the first thing lost. The one field needed to
+    debug a click was the one field never logged."""
+
+    from payment_bot.chat_callback import _sanitised
+
+    event = {
+        "chat": {
+            "buttonClickedPayload": {"message": {"cardsV2": [{"card": {"x": "y" * 5000}}]}},
+            "user": {"email": "a@b.com"},
+        },
+        "commonEventObject": {"parameters": {"bucket": "yesterday"}},
+    }
+
+    dumped = _sanitised(event)
+
+    assert "echoed card dropped" in dumped
+    assert "yyyy" not in dumped
+    # The whole point: the click parameters are still in there.
+    assert "yesterday" in dumped
 
 
 @pytest.mark.unit

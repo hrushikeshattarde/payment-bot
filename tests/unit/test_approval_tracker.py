@@ -310,7 +310,7 @@ def test_the_nav_bar_offers_every_day_with_its_own_count() -> None:
         _entry("e", hours_old=70, to="older2@c.com"),
     ]
 
-    labels = [b["text"] for b in _buttons(queue_card(entries, now=NOW, expiry_days=3, interactive=True))]
+    labels = [b["text"] for b in _buttons(queue_card(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True))]
 
     assert labels == ["● All (5)", "Today (2)", "Yesterday (1)", "2 days + (2)"]
 
@@ -322,7 +322,7 @@ def test_selecting_a_day_shows_only_that_day_and_says_so() -> None:
         _entry("c", hours_old=30, to="yesterday@c.com"),
     ]
 
-    card = queue_card(entries, now=NOW, expiry_days=3, bucket="yesterday", interactive=True)
+    card = queue_card(entries, now=NOW, expiry_days=3, bucket="yesterday", action_url="https://cb/", interactive=True)
     body = "\n".join(_texts(card))
 
     assert "yesterday@c.com" in body
@@ -339,7 +339,7 @@ def test_the_selected_chip_is_marked_and_not_clickable_again() -> None:
         now=NOW,
         expiry_days=3,
         bucket="yesterday",
-        interactive=True,
+        action_url="https://cb/", interactive=True,
     )
     chips = {b["text"].lstrip("● "): b for b in _buttons(card)}
 
@@ -356,7 +356,7 @@ def test_an_empty_day_says_so_rather_than_looking_like_an_empty_queue() -> None:
         now=NOW,
         expiry_days=3,
         bucket="today",
-        interactive=True,
+        action_url="https://cb/", interactive=True,
     )
 
     assert "No unanswered drafts from that day" in "\n".join(_texts(card))
@@ -594,3 +594,25 @@ def test_ages_under_a_day_are_shown_in_hours() -> None:
     card = queue_card([_entry("e", hours_old=9, to="a@c.com")], now=NOW, expiry_days=3)
     assert "9h old" in _labels(card)[1]
     assert "0d old" not in _labels(card)[1]
+
+
+@pytest.mark.unit
+def test_chips_are_omitted_when_there_is_no_endpoint_to_send_them_to() -> None:
+    """The live failure, and the reason it was so hard to see. PAYBOT_CHAT_ACTION_URL was
+    set on the worker but not on the callback, so a worker-rendered card had working chips
+    and the callback's redraw of it did not. The first click succeeded, the redraw came back
+    dead, and every click after it produced Chat's generic "unable to process your request"
+    with nothing in any log — because those clicks went to an endpoint named `queue_filter`
+    and never reached us.
+
+    A static card is strictly better than a button that looks live and isn't."""
+
+    entries = [_entry("e", hours_old=5, to="a@c.com")]
+
+    with_url = queue_card(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True)
+    assert [b["text"] for b in _buttons(with_url)], "chips expected when the URL is present"
+
+    without_url = queue_card(entries, now=NOW, expiry_days=3, action_url="", interactive=True)
+    assert _buttons(without_url) == []
+    # The queue itself still renders — losing the filter must not lose the list.
+    assert "a@c.com" in "\n".join(_texts(without_url))

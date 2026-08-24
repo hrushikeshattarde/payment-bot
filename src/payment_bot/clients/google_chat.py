@@ -400,6 +400,15 @@ def queue_card(
         aged.append(((now - created).total_seconds() / 3600.0, entry))
     aged.sort(key=lambda pair: pair[0], reverse=True)
 
+    # Chips without an endpoint are dead controls, and they fail in the worst way: the
+    # add-ons runtime posts the click to an endpoint named after the verb, so the button
+    # looks live, does nothing, and Chat blames itself with "unable to process your
+    # request". A static card is strictly better than that, and the warning names the
+    # missing setting rather than leaving somebody to find it from the symptom.
+    if interactive and not action_url:
+        _log.warning("chat_queue_chips_disabled_no_action_url")
+        interactive = False
+
     counts = {key: 0 for key, _, _ in QUEUE_BUCKETS}
     for hours, _ in aged:
         counts["all"] += 1

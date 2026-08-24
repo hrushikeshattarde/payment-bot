@@ -449,7 +449,14 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
             "queue_filter_clicked",
             extra={"bucket": chosen or "(empty)", "parsed_from": source, "clicker": clicker},
         )
-        return _queue_response(store, settings, chosen, addons)
+        # This function's OWN url, taken from the request that just arrived rather than from
+        # configuration. The chips on the card we are about to draw must point back here, and
+        # an env var cannot carry it: the Function URL resource depends on this function, so a
+        # template that fed the url back into the function's environment is a circular
+        # dependency CloudFormation refuses outright (tried, rejected, 2026-08-24). The host
+        # header is the same value, already parsed above for audience verification.
+        own_url = f"https://{host}/" if host else settings.chat_action_url
+        return _queue_response(store, settings, chosen, addons, action_url=own_url)
 
     if not entry_id:
         return _respond_text("That button carried no entry — repost the card.", addons)
@@ -746,7 +753,12 @@ def _replace_card(card: dict[str, Any], addons: bool) -> dict[str, Any]:
 
 
 def _queue_response(
-    store: ApprovalStore, settings: Settings, bucket: str, addons: bool
+    store: ApprovalStore,
+    settings: Settings,
+    bucket: str,
+    addons: bool,
+    *,
+    action_url: str = "",
 ) -> dict[str, Any]:
     """Redraw the tracker filtered to one date bucket.
 
@@ -764,7 +776,11 @@ def _queue_response(
         expiry_days=settings.approval_expiry_days,
         refreshed=now.strftime("%b %d %H:%M UTC"),
         bucket=bucket or "all",
-        action_url=settings.chat_action_url,
+        # Without this the redrawn chips fall back to the bare verb, and on the add-ons
+        # runtime that posts the click to an endpoint named after the verb: the first click
+        # on a worker-rendered card worked, its redraw came back dead, and Chat blamed
+        # itself. queue_card now drops the chips entirely rather than draw dead ones.
+        action_url=action_url or settings.chat_action_url,
         interactive=True,
     )
     return _replace_card(card, addons)

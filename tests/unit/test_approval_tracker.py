@@ -616,3 +616,28 @@ def test_chips_are_omitted_when_there_is_no_endpoint_to_send_them_to() -> None:
     assert _buttons(without_url) == []
     # The queue itself still renders — losing the filter must not lose the list.
     assert "a@c.com" in "\n".join(_texts(without_url))
+
+
+@pytest.mark.unit
+def test_the_redrawn_card_points_its_chips_back_at_the_callback() -> None:
+    """The chips must carry the callback's own URL, and it cannot come from configuration:
+    the Function URL resource depends on the function, so feeding the URL back into the
+    function's environment is a circular dependency CloudFormation refuses. It is derived
+    from the request's Host header instead — the same value the audience check already reads.
+    """
+
+    from payment_bot.chat_callback import _queue_response
+    from payment_bot.config import Settings
+
+    store = InMemoryApprovalStore()
+    store.put_pending(_entry("e", hours_old=5, to="a@c.com"))
+
+    body = json.loads(
+        _queue_response(
+            store, Settings(_env_file=None), "all", False, action_url="https://own.example/"
+        )["body"]
+    )
+    rendered = json.dumps(body["cardsV2"][0])
+
+    assert '"function": "https://own.example/"' in rendered
+    assert '"function": "queue_filter"' not in rendered

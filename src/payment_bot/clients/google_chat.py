@@ -313,6 +313,20 @@ def _bucket_button(key: str, label: str, count: int, selected: bool, action_url:
     }
 
 
+def _age(hours: float) -> str:
+    """How old, in the unit a reader can act on.
+
+    Hours below a day, days above it. Rendering everything in days put "0d old" against every
+    row of the Today bucket — true, and useless: it cannot separate a draft queued twenty
+    minutes ago from one queued this morning, which is exactly the distinction someone
+    triaging today's backlog is looking for.
+    """
+
+    if hours < 24:
+        return f"{max(hours, 0):.0f}h old"
+    return f"{hours / 24:.0f}d old"
+
+
 def bucket_of(hours_old: float) -> str:
     """Which date bucket an entry of this age belongs to."""
 
@@ -455,7 +469,7 @@ def queue_card(
         when = (
             "EXPIRED"
             if cutoff_hours and left <= 0
-            else (f"{left:.0f}h left" if cutoff_hours else f"{hours / 24:.0f}d old")
+            else (f"{left:.0f}h left" if cutoff_hours else _age(hours))
         )
         loads = ", ".join(entry.load_ids) or "no load id"
         card_link = _chat_message_link(entry.chat_message)
@@ -469,7 +483,7 @@ def queue_card(
         widgets.append(
             {
                 "decoratedText": {
-                    "topLabel": f"{hours / 24:.0f}d old · {when}",
+                    "topLabel": f"{_age(hours)} · {when}",
                     "text": (
                         f"{primary} · {loads}{secondary}"
                         f"<br>{_trim(entry.subject or '(no subject)', 90)}"

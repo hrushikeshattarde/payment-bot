@@ -575,3 +575,22 @@ def test_a_row_with_no_card_still_renders_and_still_links_the_email() -> None:
 
     for junk in ("", "nonsense", "spaces/S", "spaces/S/threads/T"):
         assert _chat_message_link(junk) == ""
+
+
+@pytest.mark.unit
+def test_ages_under_a_day_are_shown_in_hours() -> None:
+    """Every row of the Today bucket read "0d old" — true, and useless. It cannot separate a
+    draft queued twenty minutes ago from one queued this morning, which is the distinction
+    someone triaging today's backlog is actually looking for."""
+
+    from payment_bot.clients.google_chat import _age
+
+    assert _age(0.4) == "0h old"
+    assert _age(9) == "9h old"
+    assert _age(23.6) == "24h old"
+    assert _age(24) == "1d old"
+    assert _age(60) == "2d old"
+
+    card = queue_card([_entry("e", hours_old=9, to="a@c.com")], now=NOW, expiry_days=3)
+    assert "9h old" in _labels(card)[1]
+    assert "0d old" not in _labels(card)[1]

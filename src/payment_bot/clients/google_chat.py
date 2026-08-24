@@ -72,6 +72,29 @@ def _gmail_link(message_id: str) -> str:
     return f"https://mail.google.com/mail/u/0/#search/{query}"
 
 
+def _chat_message_link(chat_message: str) -> str:
+    """A link that opens one approval card in the space. ``""`` when there is none.
+
+    Built from the resource name Chat returned when the card was posted —
+    ``spaces/AAQAnvSk2WY/messages/p7dH0UiVeRc.wbi1j0I5tdo`` becomes
+    ``https://chat.google.com/room/AAQAnvSk2WY/p7dH0UiVeRc.wbi1j0I5tdo``. The API exposes no
+    permalink field, so this is assembled from the two ids rather than read from a response.
+
+    The tracker needs it because the queue is a list of things to DO, and the doing happens
+    on the approval card: its Approve button is the only way a reply goes out. A row that
+    linked only to the email in Gmail told a reviewer what was waiting and then left them to
+    scroll the space for the card that could action it.
+    """
+
+    parts = chat_message.strip().strip("/").split("/")
+    if len(parts) < 4 or parts[0] != "spaces" or parts[2] != "messages":
+        return ""
+    space, message = parts[1], parts[3]
+    if not (space and message):
+        return ""
+    return f"https://chat.google.com/room/{space}/{message}"
+
+
 def _open_email_button(message_id: str) -> dict[str, Any]:
     return {
         "text": "Open the email in Gmail",
@@ -435,13 +458,21 @@ def queue_card(
             else (f"{left:.0f}h left" if cutoff_hours else f"{hours / 24:.0f}d old")
         )
         loads = ", ".join(entry.load_ids) or "no load id"
+        card_link = _chat_message_link(entry.chat_message)
+        # The recipient is the link to the CARD, because approving is what a reviewer came
+        # here to do. The email stays reachable beside it for the cases where they need to
+        # read what was actually asked before deciding. Both are inline anchors rather than
+        # buttons: twelve rows of buttons is a card Chat would reject.
+        who = _trim(entry.to, 60)
+        primary = f'<a href="{card_link}">{who}</a>' if card_link else who
+        secondary = f' · <a href="{_gmail_link(entry.message_id)}">email</a>'
         widgets.append(
             {
                 "decoratedText": {
                     "topLabel": f"{hours / 24:.0f}d old · {when}",
                     "text": (
-                        f"<a href=\"{_gmail_link(entry.message_id)}\">{_trim(entry.to, 60)}</a>"
-                        f" · {loads}<br>{_trim(entry.subject or '(no subject)', 90)}"
+                        f"{primary} · {loads}{secondary}"
+                        f"<br>{_trim(entry.subject or '(no subject)', 90)}"
                     ),
                     "wrapText": True,
                 }

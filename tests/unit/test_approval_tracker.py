@@ -536,3 +536,42 @@ def test_a_deleted_card_is_replaced_by_the_miss_counter_not_by_a_special_case() 
     _refresh_queue_tracker(store, chat, _settings())
     assert transport.calls == ["POST"]
     assert store.tracker() == ("spaces/S/messages/replacement", 0)
+
+
+@pytest.mark.unit
+def test_each_row_links_to_the_approval_card_so_a_reviewer_can_act() -> None:
+    """The queue is a list of things to do, and the doing happens on the approval card —
+    its Approve button is the only way a reply goes out. A row that linked only to Gmail
+    told a reviewer what was waiting and left them scrolling the space for the card."""
+
+    from payment_bot.clients.google_chat import _chat_message_link
+
+    entry = replace(
+        _entry("e", hours_old=5, to="ar@carrier.com", loads=("2469115",)),
+        chat_message="spaces/AAQAnvSk2WY/messages/p7dH0UiVeRc.wbi1j0I5tdo",
+    )
+    row = _texts(queue_card([entry], now=NOW, expiry_days=3))[1]
+
+    assert "https://chat.google.com/room/AAQAnvSk2WY/p7dH0UiVeRc.wbi1j0I5tdo" in row
+    # The email stays reachable beside it, for reading what was actually asked.
+    assert "rfc822msgid" in row
+    assert ">email</a>" in row
+
+    assert _chat_message_link("spaces/S/messages/M") == "https://chat.google.com/room/S/M"
+
+
+@pytest.mark.unit
+def test_a_row_with_no_card_still_renders_and_still_links_the_email() -> None:
+    """`chat_message` is blank when the post failed or the entry predates the field. That
+    must cost the recipient's link, not the whole row."""
+
+    row = _texts(queue_card([_entry("e", hours_old=5, to="ar@carrier.com")], now=NOW, expiry_days=3))[1]
+
+    assert "ar@carrier.com" in row
+    assert "chat.google.com" not in row
+    assert ">email</a>" in row
+
+    from payment_bot.clients.google_chat import _chat_message_link
+
+    for junk in ("", "nonsense", "spaces/S", "spaces/S/threads/T"):
+        assert _chat_message_link(junk) == ""

@@ -14,6 +14,7 @@ against a three-day expiry. Newest-first would have rendered that as a busy, hea
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -216,3 +217,162 @@ def test_a_failed_edit_falls_back_to_posting_a_fresh_card() -> None:
     card = queue_card([], now=NOW, expiry_days=3)
 
     assert chat.upsert_tracker(card, "spaces/S/messages/gone") == "spaces/S/messages/reposted"
+
+
+# --- the date nav bar -------------------------------------------------------
+#
+# Asked for in these words: "make it easy for the users. They are not from technical
+# background so like a navigation bar where they can select unanswered emails date wise."
+#
+# So: chips, not a slash command. A command you have to know to type is the worst possible
+# affordance for someone who does not live in developer tools, and App Home would move the
+# queue out of the space the team already works in.
+
+
+def _buttons(card: dict) -> list[dict]:
+    for w in card["card"]["sections"][0]["widgets"]:
+        if "buttonList" in w:
+            return w["buttonList"]["buttons"]
+    return []
+
+
+@pytest.mark.unit
+def test_the_nav_bar_offers_every_day_with_its_own_count() -> None:
+    entries = [
+        _entry("a", hours_old=2, to="today1@c.com"),
+        _entry("b", hours_old=5, to="today2@c.com"),
+        _entry("c", hours_old=30, to="yesterday@c.com"),
+        _entry("d", hours_old=60, to="older1@c.com"),
+        _entry("e", hours_old=70, to="older2@c.com"),
+    ]
+
+    labels = [b["text"] for b in _buttons(queue_card(entries, now=NOW, expiry_days=3, interactive=True))]
+
+    assert labels == ["● All (5)", "Today (2)", "Yesterday (1)", "2 days + (2)"]
+
+
+@pytest.mark.unit
+def test_selecting_a_day_shows_only_that_day_and_says_so() -> None:
+    entries = [
+        _entry("a", hours_old=2, to="today@c.com"),
+        _entry("c", hours_old=30, to="yesterday@c.com"),
+    ]
+
+    card = queue_card(entries, now=NOW, expiry_days=3, bucket="yesterday", interactive=True)
+    body = "\n".join(_texts(card))
+
+    assert "yesterday@c.com" in body
+    assert "today@c.com" not in body
+    # The true total still leads, so a filtered card can never read as the whole queue.
+    assert "<b>2</b> drafted replies" in _texts(card)[0]
+    assert "Showing <b>1</b> from yesterday" in _texts(card)[0]
+
+
+@pytest.mark.unit
+def test_the_selected_chip_is_marked_and_not_clickable_again() -> None:
+    card = queue_card(
+        [_entry("a", hours_old=30, to="a@c.com")],
+        now=NOW,
+        expiry_days=3,
+        bucket="yesterday",
+        interactive=True,
+    )
+    chips = {b["text"].lstrip("● "): b for b in _buttons(card)}
+
+    assert chips["Yesterday (1)"]["disabled"] is True
+    assert chips["All (1)"]["disabled"] is False
+
+
+@pytest.mark.unit
+def test_an_empty_day_says_so_rather_than_looking_like_an_empty_queue() -> None:
+    """The trap this avoids: 'Today (0)' rendering as though nothing is outstanding."""
+
+    card = queue_card(
+        [_entry("a", hours_old=60, to="old@c.com")],
+        now=NOW,
+        expiry_days=3,
+        bucket="today",
+        interactive=True,
+    )
+
+    assert "No unanswered drafts from that day" in "\n".join(_texts(card))
+    assert "<b>1</b> drafted reply" in _texts(card)[0]
+
+
+@pytest.mark.unit
+def test_a_chip_carries_the_callback_url_not_a_bare_verb() -> None:
+    """The add-ons runtime sends the click to whatever `function` names, so a bare verb
+    reaches an endpoint literally called "queue_filter" — the live lesson behind
+    _action_button's comment."""
+
+    card = queue_card(
+        [_entry("a", hours_old=2, to="a@c.com")],
+        now=NOW,
+        expiry_days=3,
+        action_url="https://cb.example.test/",
+        interactive=True,
+    )
+    chip = _buttons(card)[1]
+
+    assert chip["onClick"]["action"]["function"] == "https://cb.example.test/"
+    params = {p["key"]: p["value"] for p in chip["onClick"]["action"]["parameters"]}
+    assert params == {"action": "queue_filter", "bucket": "today"}
+
+
+@pytest.mark.unit
+def test_a_non_interactive_tracker_has_no_chips_at_all() -> None:
+    """Shadow mode posts the same card without controls, like the approval card does."""
+
+    card = queue_card([_entry("a", hours_old=2, to="a@c.com")], now=NOW, expiry_days=3)
+
+    assert _buttons(card) == []
+
+
+@pytest.mark.unit
+def test_an_unknown_bucket_falls_back_to_all_rather_than_showing_nothing() -> None:
+    card = queue_card(
+        [_entry("a", hours_old=2, to="a@c.com")], now=NOW, expiry_days=3, bucket="last-tuesday"
+    )
+
+    assert "a@c.com" in "\n".join(_texts(card))
+    assert "Showing" not in _texts(card)[0]
+
+
+@pytest.mark.unit
+def test_a_chip_click_reads_the_queue_fresh_and_redraws_in_place() -> None:
+    """A reviewer may tap a card minutes old; showing them a stale list under a filter they
+    just chose is what would make the nav bar untrustworthy."""
+
+    from payment_bot.chat_callback import _click_param, _queue_response
+    from payment_bot.config import Settings
+
+    store = InMemoryApprovalStore()
+    store.put_pending(_entry("fresh", hours_old=1, to="fresh@c.com"))
+    store.put_pending(_entry("old", hours_old=60, to="old@c.com"))
+
+    event = {
+        "commonEventObject": {"parameters": {"action": "queue_filter", "bucket": "older"}}
+    }
+    assert _click_param(event, "bucket") == "older"
+
+    response = _queue_response(store, Settings(_env_file=None), "older", False)
+    body = json.loads(response["body"])
+
+    assert body["actionResponse"]["type"] == "UPDATE_MESSAGE"
+    rendered = json.dumps(body["cardsV2"][0])
+    assert "old@c.com" in rendered
+    assert "fresh@c.com" not in rendered
+
+
+@pytest.mark.unit
+def test_a_legacy_schema_click_carries_its_parameters_too() -> None:
+    from payment_bot.chat_callback import _click_param
+
+    legacy = {
+        "action": {
+            "parameters": [{"key": "action", "value": "queue_filter"}, {"key": "bucket", "value": "today"}]
+        }
+    }
+
+    assert _click_param(legacy, "bucket") == "today"
+    assert _click_param(legacy, "nothing") == ""

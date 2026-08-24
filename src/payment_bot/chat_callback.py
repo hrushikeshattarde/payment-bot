@@ -46,8 +46,10 @@ from payment_bot.clients.google_auth import (
 from payment_bot.clients.google_chat import (
     ACTION_APPROVE,
     ACTION_MOVE,
+    ACTION_QUEUE_FILTER,
     ACTION_REJECT,
     approval_card,
+    queue_card,
 )
 from payment_bot.clients.http import HttpTransport, UrllibTransport
 from payment_bot.clients.mime import build_reply
@@ -417,7 +419,7 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
             addons,
         )
 
-    if not action or not entry_id:
+    if not action:
         return _respond_text("That button carried no action — repost the card.", addons)
 
     roster = {r.strip().lower() for r in settings.reviewers if r.strip()}
@@ -435,6 +437,15 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
     if not bucket:
         return _respond_text("Misconfigured: no state bucket. Nothing was done.", addons)
     store = S3ApprovalStore(bucket)
+
+    if action == ACTION_QUEUE_FILTER:
+        # A date chip on the tracker. Nothing is claimed and nothing is sent — the card is
+        # redrawn filtered to one day. Still behind the roster check: one pinned message
+        # serves the whole space, so narrowing it changes what everyone sees.
+        return _queue_response(store, settings, _click_param(chat_event, "bucket"), addons)
+
+    if not entry_id:
+        return _respond_text("That button carried no entry — repost the card.", addons)
 
     return _act(settings, store, entry_id, action, clicker, addons=addons)
 
@@ -649,6 +660,69 @@ def _respond_text(text: str, addons: bool) -> dict[str, Any]:
     return _http(200, {"text": text})
 
 
+def _click_param(chat_event: dict[str, Any], key: str) -> str:
+    """One click parameter, read across both event schemas. ``""`` when absent.
+
+    The sibling of :func:`_normalise_event`, which returns only the verb and the entry id
+    because those were all any button carried. A date chip carries a bucket instead, and
+    widening that tuple for every future parameter would be worse than one lookup.
+    """
+
+    for holder in (chat_event.get("commonEventObject"), chat_event.get("common")):
+        if isinstance(holder, dict):
+            params = holder.get("parameters")
+            if isinstance(params, dict) and params.get(key) is not None:
+                return str(params[key])
+    action = chat_event.get("action")
+    if isinstance(action, dict):
+        for item in action.get("parameters") or []:
+            if isinstance(item, dict) and str(item.get("key")) == key:
+                return str(item.get("value") or "")
+    return ""
+
+
+def _replace_card(card: dict[str, Any], addons: bool) -> dict[str, Any]:
+    """The "redraw this message" response, in whichever schema the app was provisioned with."""
+
+    if addons:
+        return _http(
+            200,
+            {
+                "hostAppDataAction": {
+                    "chatDataAction": {
+                        "updateMessageAction": {"message": {"cardsV2": [card]}}
+                    }
+                }
+            },
+        )
+    return _http(200, {"actionResponse": {"type": "UPDATE_MESSAGE"}, "cardsV2": [card]})
+
+
+def _queue_response(
+    store: ApprovalStore, settings: Settings, bucket: str, addons: bool
+) -> dict[str, Any]:
+    """Redraw the tracker filtered to one date bucket.
+
+    Reads the queue fresh rather than trusting anything in the click: the card a reviewer
+    tapped may be minutes old, and showing them a stale list under a filter they just chose
+    is the one thing that would make the nav bar untrustworthy.
+    """
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    card = queue_card(
+        store.live_entries(),
+        now=now,
+        expiry_days=settings.approval_expiry_days,
+        refreshed=now.strftime("%b %d %H:%M UTC"),
+        bucket=bucket or "all",
+        action_url=settings.chat_action_url,
+        interactive=True,
+    )
+    return _replace_card(card, addons)
+
+
 def _update_card_response(
     store: ApprovalStore,
     entry_id: str,
@@ -674,21 +748,7 @@ def _update_card_response(
         status=status,
         message_id=entry.message_id,
     )
-    if addons:
-        return _http(
-            200,
-            {
-                "hostAppDataAction": {
-                    "chatDataAction": {
-                        "updateMessageAction": {"message": {"cardsV2": [card]}}
-                    }
-                }
-            },
-        )
-    return _http(
-        200,
-        {"actionResponse": {"type": "UPDATE_MESSAGE"}, "cardsV2": [card]},
-    )
+    return _replace_card(card, addons)
 
 
 def _now_iso() -> str:

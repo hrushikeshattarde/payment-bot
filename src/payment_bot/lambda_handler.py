@@ -415,6 +415,11 @@ def _refresh_queue_tracker(
             now=datetime.now(UTC),
             expiry_days=settings.approval_expiry_days,
             refreshed=datetime.now(UTC).strftime("%b %d %H:%M UTC"),
+            # Always the unfiltered view: the scheduled refresh is what heals a card some
+            # reviewer narrowed to one day, so it must never carry a filter forward.
+            bucket="all",
+            action_url=settings.chat_action_url,
+            interactive=chat.interactive,
         )
         name = chat.upsert_tracker(card, store.tracker_message())
         if name and name != store.tracker_message():

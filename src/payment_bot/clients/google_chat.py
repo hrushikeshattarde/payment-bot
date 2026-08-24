@@ -251,6 +251,56 @@ def notice_card(
     }
 
 
+#: The verb a date chip on the tracker card invokes.
+ACTION_QUEUE_FILTER = "queue_filter"
+
+#: The date buckets the tracker's nav bar offers, newest first, keyed by the chip a
+#: reviewer clicks. ``all`` is always present and always the default.
+#:
+#: Days, not hours or carriers, because that is what was asked for and what a
+#: non-technical reviewer already thinks in: "what came in yesterday that nobody has
+#: answered". The buckets stop at 2 because the sweep expires an approval at three days —
+#: there is no such thing as a live entry older than that, so a "week" chip would be an
+#: always-empty control.
+QUEUE_BUCKETS: tuple[tuple[str, str, int | None], ...] = (
+    ("all", "All", None),
+    ("today", "Today", 0),
+    ("yesterday", "Yesterday", 1),
+    ("older", "2 days +", 2),
+)
+
+
+def _bucket_button(key: str, label: str, count: int, selected: bool, action_url: str) -> dict[str, Any]:
+    """One date chip. The count rides in the label so the bar reads as a summary too."""
+
+    return {
+        "text": f"{'● ' if selected else ''}{label} ({count})",
+        "disabled": selected,
+        "onClick": {
+            "action": {
+                # Same add-ons-runtime rule as _action_button: `function` must be the
+                # endpoint URL, and the verb rides in the parameters.
+                "function": action_url or ACTION_QUEUE_FILTER,
+                "parameters": [
+                    {"key": "action", "value": ACTION_QUEUE_FILTER},
+                    {"key": "bucket", "value": key},
+                ],
+            }
+        },
+    }
+
+
+def bucket_of(hours_old: float) -> str:
+    """Which date bucket an entry of this age belongs to."""
+
+    days = int(hours_old // 24)
+    if days <= 0:
+        return "today"
+    if days == 1:
+        return "yesterday"
+    return "older"
+
+
 #: How many queued drafts the tracker card lists by name.
 #:
 #: A cap, not a preference. Chat rejects an oversized card outright, and the queue has run
@@ -268,6 +318,9 @@ def queue_card(
     expiry_days: int,
     refreshed: str = "",
     rows: int = _QUEUE_ROWS,
+    bucket: str = "all",
+    action_url: str = "",
+    interactive: bool = False,
 ) -> dict[str, Any]:
     """The standing tracker: every drafted reply still waiting for a click.
 
@@ -284,6 +337,17 @@ def queue_card(
     against a three-day expiry. A tracker sorted newest-first would have shown a busy,
     healthy space.
 
+    A row of date chips across the top is the nav bar: All / Today / Yesterday / 2 days +,
+    each carrying its own count. Clicking one redraws this same card filtered to that day —
+    no command to type, no menu to find, which is the whole point for reviewers who do not
+    live in developer tools.
+
+    **The filter is deliberately transient.** One pinned message serves seven reviewers, so a
+    chip one person clicks changes what all of them see. Rather than build per-person state,
+    the next scheduled refresh re-renders at ``all`` — so a narrowed card heals itself within
+    fifteen minutes, and the header always names the filter and the true total so a filtered
+    view can never be mistaken for the whole queue.
+
     Read-only. It reports the queue and changes nothing about expiry or sending.
     """
 
@@ -299,8 +363,28 @@ def queue_card(
         aged.append(((now - created).total_seconds() / 3600.0, entry))
     aged.sort(key=lambda pair: pair[0], reverse=True)
 
+    counts = {key: 0 for key, _, _ in QUEUE_BUCKETS}
+    for hours, _ in aged:
+        counts["all"] += 1
+        counts[bucket_of(hours)] += 1
+
+    selected = bucket if bucket in counts else "all"
+    shown = aged if selected == "all" else [p for p in aged if bucket_of(p[0]) == selected]
+
     expiring = sum(1 for hours, _ in aged if cutoff_hours and hours >= cutoff_hours - 24)
-    widgets: list[dict[str, Any]] = [
+    widgets: list[dict[str, Any]] = []
+    if interactive:
+        widgets.append(
+            {
+                "buttonList": {
+                    "buttons": [
+                        _bucket_button(key, label, counts[key], key == selected, action_url)
+                        for key, label, _ in QUEUE_BUCKETS
+                    ]
+                }
+            }
+        )
+    widgets.append(
         {
             "decoratedText": {
                 "topLabel": "Waiting on a click",
@@ -311,11 +395,17 @@ def queue_card(
                         if expiring
                         else " — none near expiry"
                     )
+                    + (
+                        ""
+                        if selected == "all"
+                        else f"<br>Showing <b>{len(shown)}</b> from "
+                        f"{ {k: la for k, la, _ in QUEUE_BUCKETS}[selected].lower()}"
+                    )
                 ),
                 "wrapText": True,
             }
         }
-    ]
+    )
     if not aged:
         widgets.append(
             {
@@ -326,7 +416,18 @@ def queue_card(
             }
         )
 
-    for hours, entry in aged[:rows]:
+    if aged and not shown:
+        widgets.append(
+            {
+                "decoratedText": {
+                    "topLabel": "Nothing in this day",
+                    "text": "No unanswered drafts from that day. Tap All to see the rest.",
+                    "wrapText": True,
+                }
+            }
+        )
+
+    for hours, entry in shown[:rows]:
         left = cutoff_hours - hours
         when = (
             "EXPIRED"
@@ -347,12 +448,12 @@ def queue_card(
             }
         )
 
-    if len(aged) > rows:
+    if len(shown) > rows:
         widgets.append(
             {
                 "decoratedText": {
                     "topLabel": "Not listed",
-                    "text": f"{len(aged) - rows} more, all newer than those above.",
+                    "text": f"{len(shown) - rows} more, all newer than those above.",
                 }
             }
         )

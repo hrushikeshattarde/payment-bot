@@ -390,6 +390,16 @@ def _sweep_approvals(
             )
 
 
+#: Failed edits tolerated on the tracker before it is abandoned and reposted.
+#:
+#: Four is an hour at the current cadence. High enough that a Chat outage or a transient 503
+#: costs nothing, low enough that a genuinely deleted card is replaced the same morning. The
+#: cost of getting this wrong is asymmetric: too eager and the space fills with duplicate
+#: trackers (which is exactly what happened with no counter at all), too patient and the
+#: queue view silently stops updating.
+_TRACKER_GIVE_UP_AFTER = 4
+
+
 def _refresh_queue_tracker(
     store: S3ApprovalStore, slack: SlackClient, settings: Settings
 ) -> None:
@@ -421,12 +431,41 @@ def _refresh_queue_tracker(
             action_url=settings.chat_action_url,
             interactive=chat.interactive,
         )
-        name = chat.upsert_tracker(card, store.tracker_message())
-        if name and name != store.tracker_message():
-            store.set_tracker_message(name)
+        name, misses = store.tracker()
+        if name:
+            status = chat.patch_card(name, card)
+            if status == 200:
+                store.set_tracker(name, 0)
+            elif misses + 1 >= _TRACKER_GIVE_UP_AFTER:
+                # Chat has refused this message repeatedly. Forget it and post a fresh one
+                # NEXT run rather than immediately, so a Chat outage cannot turn one bad
+                # edit into a card per invocation.
+                _log.warning(
+                    "approval_tracker_abandoned",
+                    extra={"chat_message": name, "status": status, "misses": misses + 1},
+                )
+                store.set_tracker("", 0)
+            else:
+                # Keep the message and try again next run. Reposting on a failed edit is
+                # what put two trackers in the space: a 403 or a 503 is not evidence the
+                # card is gone, and treating it that way spams a new one every 15 minutes.
+                store.set_tracker(name, misses + 1)
+                _log.info(
+                    "approval_tracker_edit_retry",
+                    extra={"chat_message": name, "status": status, "misses": misses + 1},
+                )
+            _log.info(
+                "approval_tracker_refreshed",
+                extra={"waiting": len(entries), "chat_message": name, "status": status},
+            )
+            return
+
+        posted = chat.post_card(card, fallback_text="Drafts awaiting approval")
+        if posted:
+            store.set_tracker(posted, 0)
         _log.info(
             "approval_tracker_refreshed",
-            extra={"waiting": len(entries), "chat_message": name},
+            extra={"waiting": len(entries), "chat_message": posted},
         )
     except Exception as exc:  # pragma: no cover - bookkeeping, never fatal
         _log.warning("approval_tracker_failed", extra={"error": str(exc)})

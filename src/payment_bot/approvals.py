@@ -143,13 +143,18 @@ class ApprovalStore(Protocol):
     def release_claim(self, entry_id: str) -> None:
         """Undo a claim whose action failed, so a later click can retry."""
 
-    def tracker_message(self) -> str:
-        """Chat resource name of the standing queue card, or ``""`` if never posted."""
+    def tracker(self) -> tuple[str, int]:
+        """``(chat message name, consecutive edit failures)``. ``("", 0)`` when unposted.
 
-    def set_tracker_message(self, name: str) -> None:
-        """Remember the queue card, so the next run edits it instead of reposting.
+        The failure count is what stops a broken edit from becoming a new card every
+        fifteen minutes: the handler retries the same message while the count is low and
+        only gives up on it once. See ``lambda_handler._refresh_queue_tracker``.
+        """
 
-        One name for the whole space, not one per entry: the tracker is a single message
+    def set_tracker(self, name: str, misses: int = 0) -> None:
+        """Remember the queue card and its recent edit failures.
+
+        One record for the whole space, not one per entry: the tracker is a single message
         rewritten in place. Kept in the store rather than in the chat client because the
         client is rebuilt every invocation and this has to outlive it.
         """
@@ -162,7 +167,7 @@ class InMemoryApprovalStore:
         self._pending: dict[str, PendingApproval] = {}
         self.results: dict[str, dict[str, Any]] = {}
         self.claims: dict[str, dict[str, Any]] = {}
-        self._tracker = ""
+        self._tracker: tuple[str, int] = ("", 0)
 
     def put_pending(self, entry: PendingApproval) -> None:
         self._pending[entry.entry_id] = entry
@@ -188,11 +193,11 @@ class InMemoryApprovalStore:
     def release_claim(self, entry_id: str) -> None:
         self.claims.pop(entry_id, None)
 
-    def tracker_message(self) -> str:
+    def tracker(self) -> tuple[str, int]:
         return self._tracker
 
-    def set_tracker_message(self, name: str) -> None:
-        self._tracker = name
+    def set_tracker(self, name: str, misses: int = 0) -> None:
+        self._tracker = (name, misses)
 
 
 class S3ApprovalStore:
@@ -311,29 +316,28 @@ class S3ApprovalStore:
                 return False
             raise
 
-    def tracker_message(self) -> str:
-        """The queue card's resource name, or ``""`` when there is none to edit.
+    def tracker(self) -> tuple[str, int]:
+        """The queue card's name and its consecutive edit failures.
 
-        A read failure returns ``""``, which makes the next refresh post a fresh card. That
-        is the right way to fail: a duplicate tracker is untidy, an unreadable one is a queue
-        nobody can see.
+        A read failure returns ``("", 0)``, which makes the next refresh post a fresh card.
+        That is the right way to fail: a duplicate tracker is untidy, an unreadable one is a
+        queue nobody can see.
         """
 
         raw = self._get(_TRACKER_KEY)
         if not raw:
-            return ""
+            return "", 0
         try:
-            return str(json.loads(raw).get("chat_message") or "")
-        except (ValueError, AttributeError):
-            return ""
+            record = json.loads(raw)
+            return str(record.get("chat_message") or ""), int(record.get("misses") or 0)
+        except (ValueError, AttributeError, TypeError):
+            return "", 0
 
-    def set_tracker_message(self, name: str) -> None:
-        if not name:
-            return
+    def set_tracker(self, name: str, misses: int = 0) -> None:
         self._s3().put_object(
             Bucket=self._bucket,
             Key=_TRACKER_KEY,
-            Body=json.dumps({"chat_message": name}).encode("utf-8"),
+            Body=json.dumps({"chat_message": name, "misses": misses}).encode("utf-8"),
             ContentType="application/json",
         )
 

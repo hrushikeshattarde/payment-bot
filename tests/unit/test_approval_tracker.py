@@ -22,6 +22,7 @@ import pytest
 
 from payment_bot.approvals import InMemoryApprovalStore, PendingApproval
 from payment_bot.clients.google_chat import queue_card
+from payment_bot.lambda_handler import _refresh_queue_tracker
 
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
 
@@ -156,67 +157,100 @@ def test_each_row_links_to_the_clickers_own_copy_of_the_email() -> None:
 
 
 @pytest.mark.unit
-def test_the_store_remembers_one_card_for_the_space() -> None:
-    """Editing in place is what keeps the pin, so the name has to outlive the invocation."""
+def test_the_store_remembers_the_card_and_its_failed_edits() -> None:
+    """Editing in place is what keeps the pin, so the name has to outlive the invocation —
+    and so does the failure count that decides when to stop trusting it."""
 
     store = InMemoryApprovalStore()
-    assert store.tracker_message() == ""
+    assert store.tracker() == ("", 0)
 
-    store.set_tracker_message("spaces/AAQAnvSk2WY/messages/abc")
-    assert store.tracker_message() == "spaces/AAQAnvSk2WY/messages/abc"
+    store.set_tracker("spaces/AAQAnvSk2WY/messages/abc")
+    assert store.tracker() == ("spaces/AAQAnvSk2WY/messages/abc", 0)
+
+    store.set_tracker("spaces/AAQAnvSk2WY/messages/abc", 2)
+    assert store.tracker() == ("spaces/AAQAnvSk2WY/messages/abc", 2)
 
 
 @pytest.mark.unit
-def test_upsert_edits_the_existing_card_and_only_posts_when_there_is_none() -> None:
-    from payment_bot.clients.google_chat import GoogleChatClient
-    from payment_bot.clients.http import HttpResponse
+def test_patch_reports_the_status_so_failures_can_be_told_apart() -> None:
+    """A 503 is worth retrying on the same message; a 403 eventually is not. A bool cannot
+    distinguish them, which is why the primitive returns the status."""
 
-    class Transport:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
-
-        def request(self, method: str, url: str, **kwargs: object) -> HttpResponse:
-            self.calls.append(method)
-            return HttpResponse(200, b'{"name": "spaces/S/messages/new"}')
-
-    class Tokens:
-        def token(self) -> str:
-            return "t"
-
-    transport = Transport()
-    chat = GoogleChatClient(Tokens(), "spaces/S", transport=transport)  # type: ignore[arg-type]
     card = queue_card([], now=NOW, expiry_days=3)
+    for status in (200, 403, 503):
+        chat, transport = _chat(status)
+        assert chat.patch_card("spaces/S/messages/m", card) == status
+        # The sweep's bool contract is unchanged: only 200 counts as updated.
+        assert chat.update_status("spaces/S/messages/m", card) is (status == 200)
+        assert transport.calls == ["PATCH", "PATCH"]
 
-    # No stored name: one POST, and the new name comes back to be stored.
-    assert chat.upsert_tracker(card, "") == "spaces/S/messages/new"
+    chat, transport = _chat(200)
+    assert chat.patch_card("", card) == 0
+    assert transport.calls == []
+
+
+@pytest.mark.unit
+def test_a_failed_edit_does_not_post_a_second_tracker() -> None:
+    """The regression. Live on 2026-08-24: the PATCH came back 403, the handler treated that
+    as "the card is gone" and posted a fresh one, and the space acquired a second tracker
+    fifteen minutes after the first. A failed edit is not evidence the message is gone —
+    Chat returns 503 for an outage and 403 for both a deleted and a foreign message — so the
+    name is kept and retried instead."""
+
+    store = InMemoryApprovalStore()
+    store.set_tracker("spaces/S/messages/first")
+    chat, transport = _chat(403)
+
+    _refresh_queue_tracker(store, chat, _settings())
+
+    assert transport.calls == ["PATCH"], "a failed edit must never POST"
+    assert store.tracker() == ("spaces/S/messages/first", 1)
+
+
+@pytest.mark.unit
+def test_a_successful_edit_clears_the_failure_count() -> None:
+    store = InMemoryApprovalStore()
+    store.set_tracker("spaces/S/messages/first", 3)
+    chat, transport = _chat(200)
+
+    _refresh_queue_tracker(store, chat, _settings())
+
+    assert transport.calls == ["PATCH"]
+    assert store.tracker() == ("spaces/S/messages/first", 0)
+
+
+@pytest.mark.unit
+def test_the_card_is_abandoned_only_after_repeated_refusals() -> None:
+    """Four failures is an hour at this cadence: long enough that an outage costs nothing,
+    short enough that a genuinely deleted card is replaced the same morning. Abandoning
+    clears the name so the NEXT run posts — never the same run, or one bad edit would still
+    produce a card immediately."""
+
+    store = InMemoryApprovalStore()
+    store.set_tracker("spaces/S/messages/first", 3)
+    chat, transport = _chat(403)
+
+    _refresh_queue_tracker(store, chat, _settings())
+
+    assert transport.calls == ["PATCH"], "abandoning must not post in the same run"
+    assert store.tracker() == ("", 0)
+
+    # Only now, with no name held, does a run post a fresh card.
+    chat2, transport2 = _chat(200, post_name="spaces/S/messages/second")
+    _refresh_queue_tracker(store, chat2, _settings())
+    assert transport2.calls == ["POST"]
+    assert store.tracker() == ("spaces/S/messages/second", 0)
+
+
+@pytest.mark.unit
+def test_the_first_ever_refresh_posts_and_remembers_the_name() -> None:
+    store = InMemoryApprovalStore()
+    chat, transport = _chat(200, post_name="spaces/S/messages/new")
+
+    _refresh_queue_tracker(store, chat, _settings())
+
     assert transport.calls == ["POST"]
-
-    # Stored name: PATCH only, and the same name is kept — so the pin survives.
-    assert chat.upsert_tracker(card, "spaces/S/messages/kept") == "spaces/S/messages/kept"
-    assert transport.calls == ["POST", "PATCH"]
-
-
-@pytest.mark.unit
-def test_a_failed_edit_falls_back_to_posting_a_fresh_card() -> None:
-    """A deleted tracker must not leave the space with no queue view at all."""
-
-    from payment_bot.clients.google_chat import GoogleChatClient
-    from payment_bot.clients.http import HttpResponse
-
-    class Transport:
-        def request(self, method: str, url: str, **kwargs: object) -> HttpResponse:
-            if method == "PATCH":
-                return HttpResponse(404, b'{"error": "not found"}')
-            return HttpResponse(200, b'{"name": "spaces/S/messages/reposted"}')
-
-    class Tokens:
-        def token(self) -> str:
-            return "t"
-
-    chat = GoogleChatClient(Tokens(), "spaces/S", transport=Transport())  # type: ignore[arg-type]
-    card = queue_card([], now=NOW, expiry_days=3)
-
-    assert chat.upsert_tracker(card, "spaces/S/messages/gone") == "spaces/S/messages/reposted"
+    assert store.tracker() == ("spaces/S/messages/new", 0)
 
 
 # --- the date nav bar -------------------------------------------------------
@@ -227,6 +261,37 @@ def test_a_failed_edit_falls_back_to_posting_a_fresh_card() -> None:
 # So: chips, not a slash command. A command you have to know to type is the worst possible
 # affordance for someone who does not live in developer tools, and App Home would move the
 # queue out of the space the team already works in.
+
+
+
+def _chat(status: int, post_name: str = "spaces/S/messages/new"):
+    """A GoogleChatClient over a transport that records methods and answers one status."""
+
+    from payment_bot.clients.google_chat import GoogleChatClient
+    from payment_bot.clients.http import HttpResponse
+
+    class Transport:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def request(self, method: str, url: str, **kwargs: object) -> HttpResponse:
+            self.calls.append(method)
+            if method == "POST":
+                return HttpResponse(status, json.dumps({"name": post_name}).encode())
+            return HttpResponse(status, b"{}")
+
+    class Tokens:
+        def token(self) -> str:
+            return "t"
+
+    transport = Transport()
+    return GoogleChatClient(Tokens(), "spaces/S", transport=transport), transport  # type: ignore[arg-type]
+
+
+def _settings():
+    from payment_bot.config import Settings
+
+    return Settings(_env_file=None)
 
 
 def _buttons(card: dict) -> list[dict]:

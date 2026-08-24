@@ -593,11 +593,17 @@ class GoogleChatClient:
         return SlackPost(slack_ts=name, channel=self._space)
 
     # -- card updates ------------------------------------------------------------
-    def update_status(self, message_name: str, card: dict[str, Any]) -> bool:
-        """Replace a posted card in place (expiry sweeps). True on success."""
+    def patch_card(self, message_name: str, card: dict[str, Any]) -> int:
+        """Replace a posted card in place. Returns the HTTP status; 0 if it never went out.
+
+        The status, not a bool, because the caller's next move depends on WHICH failure.
+        A 5xx is worth retrying on the same message; a 403/404 means Chat will not let us
+        touch it again — the API returns "permission denied … or the resource doesn't exist"
+        for both a foreign message and a deleted one, so they are indistinguishable here.
+        """
 
         if not message_name:
-            return False
+            return 0
         try:
             response = self._transport.request(
                 "PATCH",
@@ -607,37 +613,39 @@ class GoogleChatClient:
                 timeout=self._timeout,
             )
             if not response.ok:
-                raise RuntimeError(f"HTTP {response.status}: {response.text()[:200]}")
-            return True
+                _log.warning(
+                    "chat_card_update_failed",
+                    extra={
+                        "chat_message": message_name,
+                        "error": f"HTTP {response.status}: {response.text()[:200]}",
+                    },
+                )
+            return int(response.status)
         except Exception as exc:
             _log.warning(
                 "chat_card_update_failed",
                 extra={"chat_message": message_name, "error": str(exc)},
             )
-            return False
+            return 0
 
-    def upsert_tracker(self, card: dict[str, Any], message_name: str = "") -> str:
-        """Refresh the tracker card in place, or post it once. Returns its message name.
+    def update_status(self, message_name: str, card: dict[str, Any]) -> bool:
+        """Replace a posted card in place (expiry sweeps). True on success."""
 
-        Editing beats reposting for the same reason the expiry sweep edits: a pinned message
-        keeps its pin, and a queue that reposted itself every fifteen minutes would bury the
-        approval cards it exists to point at.
+        return self.patch_card(message_name, card) == 200
 
-        Posted unthreaded — a pin applies to a message, and a card buried in a thread is not
-        pinnable in a useful place. Returns ``""`` on failure, and the caller then simply
-        tries again next run; the tracker is a view, so losing one refresh costs nothing.
+    def post_card(self, card: dict[str, Any], *, fallback_text: str) -> str:
+        """Post one unthreaded card and return its resource name, or ``""`` on failure.
+
+        Unthreaded because a pin applies to a message and a card buried in a thread is not
+        pinnable anywhere useful.
         """
 
-        if message_name and self.update_status(message_name, card):
-            return message_name
         try:
             response = self._transport.request(
                 "POST",
                 f"{CHAT_API_BASE}/{urllib.parse.quote(self._space)}/messages",
                 headers=self._headers(),
-                body=json.dumps(
-                    {"text": "Drafts awaiting approval", "cardsV2": [card]}
-                ).encode("utf-8"),
+                body=json.dumps({"text": fallback_text, "cardsV2": [card]}).encode("utf-8"),
                 timeout=self._timeout,
             )
             if not response.ok:

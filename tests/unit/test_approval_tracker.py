@@ -444,13 +444,20 @@ def test_a_legacy_schema_click_carries_its_parameters_too() -> None:
 
 
 @pytest.mark.unit
-def test_the_tracker_is_created_the_same_way_approval_cards_are() -> None:
-    """PATCH 403'd on two plainly-POSTed trackers inside an hour while succeeding on 55 of
-    58 approval cards the same week. The creation path was the only measured difference, so
-    the tracker uses the one that yields an editable message: threadKey plus
-    messageReplyOption. Pinned here so a future tidy-up cannot quietly undo it."""
+def test_the_tracker_is_posted_unthreaded_so_it_can_be_pinned() -> None:
+    """Pinning applies to a message, so a threaded tracker is unpinnable — and a FIXED
+    threadKey is worse than useless: with REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD every repost
+    after the first lands as a reply inside the old thread.
+
+    This shipped briefly, chasing a 403 that PATCH kept returning on tracker messages. The
+    403 was simply a card someone had deleted — Chat reports deleted and forbidden alike.
+    Approval cards can use that option safely because each carries a UNIQUE key per email;
+    a standing card reusing one key cannot. Pinned as a test so the mistake is not repeated.
+    """
 
     import json as _json
+
+    from payment_bot.clients.http import HttpResponse
 
     chat, transport = _chat(200)
     captured: dict[str, object] = {}
@@ -459,12 +466,35 @@ def test_the_tracker_is_created_the_same_way_approval_cards_are() -> None:
         captured["url"] = url
         captured["body"] = _json.loads(kwargs["body"])  # type: ignore[arg-type]
         transport.calls.append(method)
-        from payment_bot.clients.http import HttpResponse
-
         return HttpResponse(200, b'{"name": "spaces/S/messages/t.t"}')
 
     chat._transport.request = request  # type: ignore[assignment,method-assign]
     chat.post_card(queue_card([], now=NOW, expiry_days=3), fallback_text="x")
 
-    assert "messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" in str(captured["url"])
-    assert captured["body"]["thread"]["threadKey"] == "paybot-queue-tracker"  # type: ignore[index]
+    assert captured["url"] == "https://chat.googleapis.com/v1/spaces/S/messages"
+    assert "messageReplyOption" not in str(captured["url"])
+    assert "thread" not in captured["body"]  # type: ignore[operator]
+
+
+@pytest.mark.unit
+def test_a_deleted_card_is_replaced_by_the_miss_counter_not_by_a_special_case() -> None:
+    """The live cause of both 403s: a reviewer deleted the card. That needs no new code —
+    four refused edits abandons the name and the next run posts fresh."""
+
+    store = InMemoryApprovalStore()
+    store.set_tracker("spaces/S/messages/deleted")
+
+    for expected_misses in (1, 2, 3):
+        chat, transport = _chat(403)
+        _refresh_queue_tracker(store, chat, _settings())
+        assert transport.calls == ["PATCH"]
+        assert store.tracker() == ("spaces/S/messages/deleted", expected_misses)
+
+    chat, transport = _chat(403)
+    _refresh_queue_tracker(store, chat, _settings())
+    assert store.tracker() == ("", 0)
+
+    chat, transport = _chat(200, post_name="spaces/S/messages/replacement")
+    _refresh_queue_tracker(store, chat, _settings())
+    assert transport.calls == ["POST"]
+    assert store.tracker() == ("spaces/S/messages/replacement", 0)

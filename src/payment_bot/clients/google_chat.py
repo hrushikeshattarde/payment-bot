@@ -633,31 +633,30 @@ class GoogleChatClient:
 
         return self.patch_card(message_name, card) == 200
 
-    def post_card(self, card: dict[str, Any], *, fallback_text: str, thread_key: str = "") -> str:
-        """Post one card and return its resource name, or ``""`` on failure.
+    def post_card(self, card: dict[str, Any], *, fallback_text: str) -> str:
+        """Post one standalone card and return its resource name, or ``""`` on failure.
 
-        Created through the SAME request shape as the approval cards — ``threadKey`` plus
-        ``messageReplyOption`` — and that is the point rather than an accident. A plainly
-        POSTed tracker could not be edited afterwards: PATCH returned 403 on two separate
-        tracker messages within the hour, while the identical PATCH succeeded on 55 of 58
-        approval cards over the same week. The creation path was the only measured
-        difference between them, so the tracker now takes the one that demonstrably yields
-        an editable message.
+        **Unthreaded, and it must stay that way.** A pin applies to a message, so a tracker
+        posted into a thread is not pinnable anywhere a reviewer would find it.
+
+        This briefly went out with a fixed ``threadKey`` and
+        ``messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD``, chasing a 403 that
+        PATCH kept returning on tracker messages while the identical PATCH succeeded on 55
+        of 58 approval cards. The 403 turned out to be simpler than that: the cards had been
+        deleted by hand, and Chat reports a deleted message and a forbidden one with the same
+        "permission denied … or the resource doesn't exist". Copying the approval cards'
+        creation path fixed nothing and broke something — they use a UNIQUE key per email, so
+        they always start a new thread, whereas one fixed key means every repost after the
+        first lands as a reply inside the old thread. Deleted cards are already handled, by
+        the miss counter in ``lambda_handler._refresh_queue_tracker``.
         """
 
         try:
             response = self._transport.request(
                 "POST",
-                f"{CHAT_API_BASE}/{urllib.parse.quote(self._space)}/messages"
-                "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD",
+                f"{CHAT_API_BASE}/{urllib.parse.quote(self._space)}/messages",
                 headers=self._headers(),
-                body=json.dumps(
-                    {
-                        "thread": {"threadKey": thread_key or "paybot-queue-tracker"},
-                        "text": fallback_text,
-                        "cardsV2": [card],
-                    }
-                ).encode("utf-8"),
+                body=json.dumps({"text": fallback_text, "cardsV2": [card]}).encode("utf-8"),
                 timeout=self._timeout,
             )
             if not response.ok:

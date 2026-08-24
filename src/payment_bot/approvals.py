@@ -52,6 +52,11 @@ PRUNE_DAYS = 7
 #: the one ``state/*`` grant the worker role already has. No new IAM.
 S3_PREFIX = "state/approvals"
 
+#: Where the standing tracker card's resource name lives. Beside the three entry families
+#: rather than among them: it is one value for the space, not per approval, and the sweep's
+#: prune walks the families by prefix and must never see it.
+_TRACKER_KEY = f"{S3_PREFIX}/tracker.json"
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -138,6 +143,17 @@ class ApprovalStore(Protocol):
     def release_claim(self, entry_id: str) -> None:
         """Undo a claim whose action failed, so a later click can retry."""
 
+    def tracker_message(self) -> str:
+        """Chat resource name of the standing queue card, or ``""`` if never posted."""
+
+    def set_tracker_message(self, name: str) -> None:
+        """Remember the queue card, so the next run edits it instead of reposting.
+
+        One name for the whole space, not one per entry: the tracker is a single message
+        rewritten in place. Kept in the store rather than in the chat client because the
+        client is rebuilt every invocation and this has to outlive it.
+        """
+
 
 class InMemoryApprovalStore:
     """Dict-backed store for tests and local experiments. Same contract, no S3."""
@@ -146,6 +162,7 @@ class InMemoryApprovalStore:
         self._pending: dict[str, PendingApproval] = {}
         self.results: dict[str, dict[str, Any]] = {}
         self.claims: dict[str, dict[str, Any]] = {}
+        self._tracker = ""
 
     def put_pending(self, entry: PendingApproval) -> None:
         self._pending[entry.entry_id] = entry
@@ -170,6 +187,12 @@ class InMemoryApprovalStore:
 
     def release_claim(self, entry_id: str) -> None:
         self.claims.pop(entry_id, None)
+
+    def tracker_message(self) -> str:
+        return self._tracker
+
+    def set_tracker_message(self, name: str) -> None:
+        self._tracker = name
 
 
 class S3ApprovalStore:
@@ -287,6 +310,32 @@ class S3ApprovalStore:
             if _is_precondition_failure(exc):
                 return False
             raise
+
+    def tracker_message(self) -> str:
+        """The queue card's resource name, or ``""`` when there is none to edit.
+
+        A read failure returns ``""``, which makes the next refresh post a fresh card. That
+        is the right way to fail: a duplicate tracker is untidy, an unreadable one is a queue
+        nobody can see.
+        """
+
+        raw = self._get(_TRACKER_KEY)
+        if not raw:
+            return ""
+        try:
+            return str(json.loads(raw).get("chat_message") or "")
+        except (ValueError, AttributeError):
+            return ""
+
+    def set_tracker_message(self, name: str) -> None:
+        if not name:
+            return
+        self._s3().put_object(
+            Bucket=self._bucket,
+            Key=_TRACKER_KEY,
+            Body=json.dumps({"chat_message": name}).encode("utf-8"),
+            ContentType="application/json",
+        )
 
     def release_claim(self, entry_id: str) -> None:
         try:

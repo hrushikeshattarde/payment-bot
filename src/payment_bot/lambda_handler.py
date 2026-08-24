@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import MutableMapping
+from datetime import UTC, datetime
 from typing import Any
 
 from payment_bot.approvals import ChatPostLedger, S3ApprovalStore
@@ -45,6 +46,7 @@ from payment_bot.clients.google_chat import (
     GoogleChatClient,
     approval_card,
     build_google_chat_client,
+    queue_card,
 )
 from payment_bot.config import Settings, get_settings
 from payment_bot.local_runner import _Clients, process_inbox
@@ -388,6 +390,43 @@ def _sweep_approvals(
             )
 
 
+def _refresh_queue_tracker(
+    store: S3ApprovalStore, slack: SlackClient, settings: Settings
+) -> None:
+    """Rewrite the standing "drafts awaiting approval" card. Bookkeeping; never fatal.
+
+    Runs after the sweep so the card reflects this invocation's expiries, and after the mail
+    run so it reflects the drafts it just queued. One message, edited in place, which is the
+    nearest thing Chat offers to a tab — there is no API for adding one, so a pinned message
+    the app keeps current is the panel.
+
+    Read-only about the queue: it reports what is waiting and changes nothing about expiry,
+    sending, or which mail gets drafted. Every failure is swallowed, because a view that
+    cannot render must not turn a completed mail run into an invocation error.
+    """
+
+    chat = slack if isinstance(slack, GoogleChatClient) else None
+    if chat is None:
+        return
+    try:
+        entries = store.live_entries()
+        card = queue_card(
+            entries,
+            now=datetime.now(UTC),
+            expiry_days=settings.approval_expiry_days,
+            refreshed=datetime.now(UTC).strftime("%b %d %H:%M UTC"),
+        )
+        name = chat.upsert_tracker(card, store.tracker_message())
+        if name and name != store.tracker_message():
+            store.set_tracker_message(name)
+        _log.info(
+            "approval_tracker_refreshed",
+            extra={"waiting": len(entries), "chat_message": name},
+        )
+    except Exception as exc:  # pragma: no cover - bookkeeping, never fatal
+        _log.warning("approval_tracker_failed", extra={"error": str(exc)})
+
+
 #: Resolved once per container. A cold-start failure must surface as an invocation error —
 #: an import-time raise here is what makes a broken secret or roster page immediately
 #: rather than turning into a run that quietly answers nothing.
@@ -447,6 +486,9 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
         )
         if approval_store is not None:
             _sweep_approvals(approval_store, clients.slack, settings)
+            # After the sweep, so the card shows this run's expiries, and after the mail run,
+            # so it shows the drafts it just queued.
+            _refresh_queue_tracker(approval_store, clients.slack, settings)
     finally:
         # Saved even when the run raises or is cut off mid-batch: blocks recorded before
         # the interruption must count, or a timeout-looping run never spends its budget.

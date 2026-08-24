@@ -30,9 +30,10 @@ from __future__ import annotations
 
 import json
 import urllib.parse
+from datetime import datetime
 from typing import Any
 
-from payment_bot.approvals import ChatPostLedger, entry_id_for
+from payment_bot.approvals import ChatPostLedger, PendingApproval, entry_id_for
 from payment_bot.clients.http import HttpTransport, UrllibTransport
 from payment_bot.clients.slack import ApprovalSummary, SlackPost
 from payment_bot.logging import get_logger
@@ -250,6 +251,127 @@ def notice_card(
     }
 
 
+#: How many queued drafts the tracker card lists by name.
+#:
+#: A cap, not a preference. Chat rejects an oversized card outright, and the queue has run
+#: to 86 entries — one widget each would be a card nobody could read even if the API took
+#: it. The rows are the urgent tail (oldest first, so the ones about to expire), and the
+#: count line above them always states the true total, so a trimmed card never reads as a
+#: shorter queue than there is.
+_QUEUE_ROWS = 12
+
+
+def queue_card(
+    entries: list[PendingApproval],
+    *,
+    now: datetime,
+    expiry_days: int,
+    refreshed: str = "",
+    rows: int = _QUEUE_ROWS,
+) -> dict[str, Any]:
+    """The standing tracker: every drafted reply still waiting for a click.
+
+    One card, rewritten in place each run (see :meth:`GoogleChatClient.upsert_tracker`), so
+    the space carries a live queue rather than a trail of stale summaries. Pin it once and it
+    behaves like a panel — which is as close to a tab as Chat gets, there being no API for
+    adding one.
+
+    **Ordered oldest first, and led by what is about to be lost.** An approval is not a
+    backlog item that waits politely: the sweep expires it at ``approval_expiry_days`` and
+    the draft is then gone, while the intake query only reaches back ``newer_than`` — so a
+    draft that ages out has roughly a day in which it could be redrafted at all, and only if
+    the mail is still unread. Measured on the live queue: 86 waiting, 52 of them two days old
+    against a three-day expiry. A tracker sorted newest-first would have shown a busy,
+    healthy space.
+
+    Read-only. It reports the queue and changes nothing about expiry or sending.
+    """
+
+    cutoff_hours = max(expiry_days, 0) * 24
+    aged: list[tuple[float, PendingApproval]] = []
+    for entry in entries:
+        try:
+            created = datetime.fromisoformat(entry.created_at)
+        except ValueError:
+            # An unparseable stamp must not hide the entry; treat it as brand new, which
+            # sorts it last and never fabricates urgency.
+            created = now
+        aged.append(((now - created).total_seconds() / 3600.0, entry))
+    aged.sort(key=lambda pair: pair[0], reverse=True)
+
+    expiring = sum(1 for hours, _ in aged if cutoff_hours and hours >= cutoff_hours - 24)
+    widgets: list[dict[str, Any]] = [
+        {
+            "decoratedText": {
+                "topLabel": "Waiting on a click",
+                "text": (
+                    f"<b>{len(aged)}</b> drafted repl{'y' if len(aged) == 1 else 'ies'}"
+                    + (
+                        f" — <b>{expiring}</b> within 24h of expiring"
+                        if expiring
+                        else " — none near expiry"
+                    )
+                ),
+                "wrapText": True,
+            }
+        }
+    ]
+    if not aged:
+        widgets.append(
+            {
+                "decoratedText": {
+                    "topLabel": "Queue",
+                    "text": "Empty — every drafted reply has been actioned.",
+                }
+            }
+        )
+
+    for hours, entry in aged[:rows]:
+        left = cutoff_hours - hours
+        when = (
+            "EXPIRED"
+            if cutoff_hours and left <= 0
+            else (f"{left:.0f}h left" if cutoff_hours else f"{hours / 24:.0f}d old")
+        )
+        loads = ", ".join(entry.load_ids) or "no load id"
+        widgets.append(
+            {
+                "decoratedText": {
+                    "topLabel": f"{hours / 24:.0f}d old · {when}",
+                    "text": (
+                        f"<a href=\"{_gmail_link(entry.message_id)}\">{_trim(entry.to, 60)}</a>"
+                        f" · {loads}<br>{_trim(entry.subject or '(no subject)', 90)}"
+                    ),
+                    "wrapText": True,
+                }
+            }
+        )
+
+    if len(aged) > rows:
+        widgets.append(
+            {
+                "decoratedText": {
+                    "topLabel": "Not listed",
+                    "text": f"{len(aged) - rows} more, all newer than those above.",
+                }
+            }
+        )
+
+    return {
+        "cardId": "approval-queue-tracker",
+        "card": {
+            "header": {
+                "title": "Drafts awaiting approval",
+                "subtitle": (
+                    f"expire after {expiry_days} day{'' if expiry_days == 1 else 's'}"
+                    + (f" · refreshed {refreshed}" if refreshed else "")
+                ),
+            },
+            "sections": [{"widgets": widgets}],
+        },
+    }
+
+
 class GoogleChatClient:
     """Posts approval and notice cards into one space; never raises into the pipeline.
 
@@ -392,6 +514,40 @@ class GoogleChatClient:
                 extra={"chat_message": message_name, "error": str(exc)},
             )
             return False
+
+    def upsert_tracker(self, card: dict[str, Any], message_name: str = "") -> str:
+        """Refresh the tracker card in place, or post it once. Returns its message name.
+
+        Editing beats reposting for the same reason the expiry sweep edits: a pinned message
+        keeps its pin, and a queue that reposted itself every fifteen minutes would bury the
+        approval cards it exists to point at.
+
+        Posted unthreaded — a pin applies to a message, and a card buried in a thread is not
+        pinnable in a useful place. Returns ``""`` on failure, and the caller then simply
+        tries again next run; the tracker is a view, so losing one refresh costs nothing.
+        """
+
+        if message_name and self.update_status(message_name, card):
+            return message_name
+        try:
+            response = self._transport.request(
+                "POST",
+                f"{CHAT_API_BASE}/{urllib.parse.quote(self._space)}/messages",
+                headers=self._headers(),
+                body=json.dumps(
+                    {"text": "Drafts awaiting approval", "cardsV2": [card]}
+                ).encode("utf-8"),
+                timeout=self._timeout,
+            )
+            if not response.ok:
+                raise RuntimeError(f"HTTP {response.status}: {response.text()[:200]}")
+            data = response.json()
+            name = str(data.get("name") or "") if isinstance(data, dict) else ""
+        except Exception as exc:
+            _log.warning("chat_tracker_post_failed", extra={"error": str(exc)})
+            return ""
+        _log.info("chat_tracker_posted", extra={"chat_message": name})
+        return name
 
     # -- internals ---------------------------------------------------------------
     def _headers(self) -> dict[str, str]:

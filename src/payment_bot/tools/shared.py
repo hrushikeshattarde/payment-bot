@@ -307,7 +307,7 @@ _INVOICE_RE = re.compile(r"invoice\s*(?:no\.?|number|#)?\s*:?\s*(\d{3,})", re.IG
 #: templates write the load itself as "Reference#: 2520504", which is why ``ref`` has always
 #: been excluded from :data:`_NOT_A_LOAD_LABEL_RE`.
 _LOAD_LABEL_RE = re.compile(
-    r"\b(?:load|order|pro|trip|reference|ref)\b\W{0,3}(?:no|nbr|num|number)?\W{0,3}(\d{6,7})\b",
+    r"\b(?:load|order|pro|po|trip|reference|ref)\b\W{0,3}(?:no|nbr|num|number)?\W{0,3}(\d{6,7})\b",
     re.IGNORECASE,
 )
 
@@ -428,7 +428,9 @@ def _prefer_declared_id_length_across_systems(load_ids: list[str], text: str) ->
     return kept
 
 
-def _drop_stray_sender_invoice_ids(load_ids: list[str], invoice_numbers: list[str]) -> list[str]:
+def _drop_stray_sender_invoice_ids(
+    load_ids: list[str], invoice_numbers: list[str], text: str = ""
+) -> list[str]:
     """Drop an id that is only the sender's own invoice number, pulled into another system.
 
     Live on an OperFi second-request email. It named "Load #: 2485194" — a Transport Pro
@@ -456,7 +458,18 @@ def _drop_stray_sender_invoice_ids(load_ids: list[str], invoice_numbers: list[st
     number — with no anchor there is nothing to contradict it, so "Invoice 2462934" survives.
     """
 
-    invoice_set = set(invoice_numbers)
+    # An id the sender LABELLED as a load or a PO is not their stray invoice number, whatever
+    # else they also called it. Factoring Express numbers each invoice after the PO, so one
+    # number arrived as "Invoice # 2534728" AND "PO # 2534728" while a six-digit "ID 187351"
+    # sat beside it: the invoice id became the anchor, the real load was dropped as the stray,
+    # and 187351 went to CargoTel and was denied. The load appeared four times in that email
+    # and the number that appeared once is what survived.
+    #
+    # Subtracted HERE rather than fixed downstream because this runs before
+    # `_prefer_labelled_loads_across_systems`: by the time that guard could protect a
+    # labelled id, this one has already removed it.
+    labelled = set(_LOAD_LABEL_RE.findall(text))
+    invoice_set = set(invoice_numbers) - labelled
     if len(load_ids) < 2 or not invoice_set:
         return load_ids
 
@@ -1012,7 +1025,7 @@ class ExtractIdentifiers(Tool):
 
         load_ids = _dedupe(_load_ids_in(text))
         invoice_numbers = _dedupe(_INVOICE_RE.findall(text))
-        load_ids = _drop_stray_sender_invoice_ids(load_ids, invoice_numbers)
+        load_ids = _drop_stray_sender_invoice_ids(load_ids, invoice_numbers, text)
         load_ids = _prefer_labelled_loads_across_systems(load_ids, text)
         # After the label guard, not before: an id the sender actually called a load is
         # stronger evidence than a length they declared once in an account name.

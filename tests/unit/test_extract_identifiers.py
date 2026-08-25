@@ -989,3 +989,41 @@ def test_a_row_printed_twice_does_not_double_the_total(ctx: ToolContext) -> None
     )
 
     assert (None, "550.00") in [(r.load_id, str(r.amount)) for r in out.stated_rates]
+
+
+@pytest.mark.unit
+def test_a_load_the_sender_also_called_an_invoice_is_not_dropped(ctx: ToolContext) -> None:
+    """Live on a Factoring Express follow-up, 2026-08-25.
+
+    They number each invoice after the PO, so one number arrived as "Invoice # 2534728" AND
+    "PO # 2534728", with a six-digit "ID 187351" beside it. The invoice-drop guard took the
+    ID as its anchor and removed 2534728 as the stray -- so the load that appeared four times
+    in the email lost to the number that appeared once, and 187351 was looked up in CargoTel
+    and denied.
+
+    A positive load/PO label outranks the invoice-drop. It has to be applied inside that
+    guard: `_prefer_labelled_loads_across_systems` runs afterwards and can only protect an id
+    that is still there.
+    """
+
+    out = _run(
+        ctx,
+        subject="Follow-Up on Invoice Submission 2534728 (NATURAL EXPRESS LLC)",
+        body=(
+            "invoice sent 5 days ago for 2534728\nID 187351\n"
+            "Invoice #\t2534728\nPO #\t2534728\nAmount\t1,600.00"
+        ),
+    )
+
+    assert out.load_ids == ["2534728"]
+    assert "187351" not in out.load_ids
+
+
+@pytest.mark.unit
+def test_po_box_is_still_not_a_load_label(ctx: ToolContext) -> None:
+    """`po` joined the load labels, and a remit footer is where that could go wrong."""
+
+    from payment_bot.tools.shared import _LOAD_LABEL_RE
+
+    assert _LOAD_LABEL_RE.findall("Check Payments: PO Box 840267 Nashville TN") == []
+    assert _LOAD_LABEL_RE.findall("PO # 2534728") == ["2534728"]

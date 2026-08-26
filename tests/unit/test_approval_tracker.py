@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from payment_bot.approvals import InMemoryApprovalStore, PendingApproval
-from payment_bot.clients.google_chat import queue_card
+from payment_bot.clients.google_chat import queue_cards
 from payment_bot.lambda_handler import _refresh_queue_tracker
 
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
@@ -42,18 +42,22 @@ def _entry(entry_id: str, *, hours_old: float, to: str, loads: tuple[str, ...] =
     )
 
 
-def _texts(card: dict) -> list[str]:
-    return [
-        w["decoratedText"]["text"]
-        for w in card["card"]["sections"][0]["widgets"]
-        if "decoratedText" in w
-    ]
+def _widgets(cards: list[dict]) -> list[dict]:
+    """Every widget across the message, in order. The tracker spans several cards once the
+    queue outgrows one — see _split_cards — and a reader of the message cannot tell where a
+    card boundary fell, so neither should these assertions."""
+
+    return [w for c in cards for w in c["card"]["sections"][0]["widgets"]]
 
 
-def _labels(card: dict) -> list[str]:
+def _texts(cards: list[dict]) -> list[str]:
+    return [w["decoratedText"]["text"] for w in _widgets(cards) if "decoratedText" in w]
+
+
+def _labels(cards: list[dict]) -> list[str]:
     return [
         w["decoratedText"].get("topLabel", "")
-        for w in card["card"]["sections"][0]["widgets"]
+        for w in _widgets(cards)
         if "decoratedText" in w
     ]
 
@@ -62,7 +66,7 @@ def _labels(card: dict) -> list[str]:
 def test_the_oldest_drafts_come_first() -> None:
     """The queue is read for what is about to be lost, not for what just arrived."""
 
-    card = queue_card(
+    card = queue_cards(
         [
             _entry("new", hours_old=1, to="new@carrier.com", loads=("2500001",)),
             _entry("old", hours_old=68, to="old@carrier.com", loads=("2400001",)),
@@ -82,7 +86,7 @@ def test_the_count_leads_and_names_what_is_nearly_expired() -> None:
     entries = [_entry(f"e{i}", hours_old=60, to=f"a{i}@c.com") for i in range(4)]
     entries += [_entry("fresh", hours_old=2, to="fresh@c.com")]
 
-    card = queue_card(entries, now=NOW, expiry_days=3)
+    card = queue_cards(entries, now=NOW, expiry_days=3)
     lead = _texts(card)[0]
 
     assert "<b>5</b> drafted replies" in lead
@@ -92,7 +96,7 @@ def test_the_count_leads_and_names_what_is_nearly_expired() -> None:
 
 @pytest.mark.unit
 def test_hours_remaining_are_shown_per_row_and_expiry_is_named() -> None:
-    card = queue_card(
+    card = queue_cards(
         [_entry("e", hours_old=60, to="a@c.com", loads=("2469115",))],
         now=NOW,
         expiry_days=3,
@@ -105,7 +109,7 @@ def test_hours_remaining_are_shown_per_row_and_expiry_is_named() -> None:
 
 @pytest.mark.unit
 def test_an_overdue_entry_reads_as_expired_not_as_negative_hours() -> None:
-    card = queue_card([_entry("e", hours_old=100, to="a@c.com")], now=NOW, expiry_days=3)
+    card = queue_cards([_entry("e", hours_old=100, to="a@c.com")], now=NOW, expiry_days=3)
 
     assert "EXPIRED" in _labels(card)[1]
     assert "-" not in _labels(card)[1].replace("·", "")
@@ -118,17 +122,18 @@ def test_a_capped_card_says_where_the_page_sits_in_the_whole() -> None:
     says which slice of it this is."""
 
     entries = [_entry(f"e{i}", hours_old=50 - i, to=f"a{i}@c.com") for i in range(30)]
-    card = queue_card(entries, now=NOW, expiry_days=3, rows=12)
+    card = queue_cards(entries, now=NOW, expiry_days=3, rows=12)
 
     assert "<b>30</b> drafted replies" in _texts(card)[0]
-    assert "Showing <b>1–12</b> of <b>30</b>" in _texts(card)[-1]
+    assert "Showing <b>1-12</b> of <b>30</b>" in _texts(card)[-1]
     # lead + 12 rows + the page line
     assert len(_texts(card)) == 14
+    assert len(card) == 1, "twelve rows fit in one card"
 
 
 @pytest.mark.unit
 def test_an_empty_queue_says_so_rather_than_rendering_a_bare_header() -> None:
-    card = queue_card([], now=NOW, expiry_days=3)
+    card = queue_cards([], now=NOW, expiry_days=3)
 
     assert "<b>0</b> drafted replies" in _texts(card)[0]
     assert "none near expiry" in _texts(card)[0]
@@ -141,7 +146,7 @@ def test_an_unparseable_timestamp_is_treated_as_new_and_never_invents_urgency() 
 
     broken = replace(_entry("e", hours_old=1, to="a@c.com"), created_at="not-a-date")
 
-    card = queue_card([broken], now=NOW, expiry_days=3)
+    card = queue_cards([broken], now=NOW, expiry_days=3)
 
     assert "a@c.com" in "\n".join(_texts(card))
     assert "none near expiry" in _texts(card)[0]
@@ -151,7 +156,7 @@ def test_an_unparseable_timestamp_is_treated_as_new_and_never_invents_urgency() 
 def test_each_row_links_to_the_clickers_own_copy_of_the_email() -> None:
     """rfc822msgid search, not a thread url — Gmail thread ids are per-mailbox."""
 
-    card = queue_card([_entry("e", hours_old=5, to="a@c.com")], now=NOW, expiry_days=3)
+    card = queue_cards([_entry("e", hours_old=5, to="a@c.com")], now=NOW, expiry_days=3)
 
     assert "rfc822msgid" in _texts(card)[1]
     assert "mail.google.com" in _texts(card)[1]
@@ -177,7 +182,7 @@ def test_patch_reports_the_status_so_failures_can_be_told_apart() -> None:
     """A 503 is worth retrying on the same message; a 403 eventually is not. A bool cannot
     distinguish them, which is why the primitive returns the status."""
 
-    card = queue_card([], now=NOW, expiry_days=3)
+    card = queue_cards([], now=NOW, expiry_days=3)
     for status in (200, 403, 503):
         chat, transport = _chat(status)
         assert chat.patch_card("spaces/S/messages/m", card) == status
@@ -294,19 +299,19 @@ def _settings():
     return Settings(_env_file=None)
 
 
-def _buttons(card: dict) -> list[dict]:
-    """The date chips — the FIRST button list on the card."""
+def _buttons(cards: list[dict]) -> list[dict]:
+    """The date chips — the FIRST button list in the message."""
 
-    for w in card["card"]["sections"][0]["widgets"]:
+    for w in _widgets(cards):
         if "buttonList" in w:
             return w["buttonList"]["buttons"]
     return []
 
 
-def _page_buttons(card: dict) -> list[dict]:
+def _page_buttons(cards: list[dict]) -> list[dict]:
     """The Newer/Older buttons — the LAST button list, below the rows."""
 
-    lists = [w for w in card["card"]["sections"][0]["widgets"] if "buttonList" in w]
+    lists = [w for w in _widgets(cards) if "buttonList" in w]
     return lists[-1]["buttonList"]["buttons"] if len(lists) > 1 else []
 
 
@@ -320,7 +325,7 @@ def test_the_nav_bar_offers_every_day_with_its_own_count() -> None:
         _entry("e", hours_old=70, to="older2@c.com"),
     ]
 
-    labels = [b["text"] for b in _buttons(queue_card(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True))]
+    labels = [b["text"] for b in _buttons(queue_cards(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True))]
 
     assert labels == ["● All (5)", "Today (2)", "Yesterday (1)", "2 days + (2)"]
 
@@ -332,7 +337,7 @@ def test_selecting_a_day_shows_only_that_day_and_says_so() -> None:
         _entry("c", hours_old=30, to="yesterday@c.com"),
     ]
 
-    card = queue_card(entries, now=NOW, expiry_days=3, bucket="yesterday", action_url="https://cb/", interactive=True)
+    card = queue_cards(entries, now=NOW, expiry_days=3, bucket="yesterday", action_url="https://cb/", interactive=True)
     body = "\n".join(_texts(card))
 
     assert "yesterday@c.com" in body
@@ -344,7 +349,7 @@ def test_selecting_a_day_shows_only_that_day_and_says_so() -> None:
 
 @pytest.mark.unit
 def test_the_selected_chip_is_marked_and_not_clickable_again() -> None:
-    card = queue_card(
+    card = queue_cards(
         [_entry("a", hours_old=30, to="a@c.com")],
         now=NOW,
         expiry_days=3,
@@ -361,7 +366,7 @@ def test_the_selected_chip_is_marked_and_not_clickable_again() -> None:
 def test_an_empty_day_says_so_rather_than_looking_like_an_empty_queue() -> None:
     """The trap this avoids: 'Today (0)' rendering as though nothing is outstanding."""
 
-    card = queue_card(
+    card = queue_cards(
         [_entry("a", hours_old=60, to="old@c.com")],
         now=NOW,
         expiry_days=3,
@@ -379,7 +384,7 @@ def test_a_chip_carries_the_callback_url_not_a_bare_verb() -> None:
     reaches an endpoint literally called "queue_filter" — the live lesson behind
     _action_button's comment."""
 
-    card = queue_card(
+    card = queue_cards(
         [_entry("a", hours_old=2, to="a@c.com")],
         now=NOW,
         expiry_days=3,
@@ -397,14 +402,14 @@ def test_a_chip_carries_the_callback_url_not_a_bare_verb() -> None:
 def test_a_non_interactive_tracker_has_no_chips_at_all() -> None:
     """Shadow mode posts the same card without controls, like the approval card does."""
 
-    card = queue_card([_entry("a", hours_old=2, to="a@c.com")], now=NOW, expiry_days=3)
+    card = queue_cards([_entry("a", hours_old=2, to="a@c.com")], now=NOW, expiry_days=3)
 
     assert _buttons(card) == []
 
 
 @pytest.mark.unit
 def test_an_unknown_bucket_falls_back_to_all_rather_than_showing_nothing() -> None:
-    card = queue_card(
+    card = queue_cards(
         [_entry("a", hours_old=2, to="a@c.com")], now=NOW, expiry_days=3, bucket="last-tuesday"
     )
 
@@ -525,7 +530,7 @@ def test_the_tracker_is_posted_unthreaded_so_it_can_be_pinned() -> None:
         return HttpResponse(200, b'{"name": "spaces/S/messages/t.t"}')
 
     chat._transport.request = request  # type: ignore[assignment,method-assign]
-    chat.post_card(queue_card([], now=NOW, expiry_days=3), fallback_text="x")
+    chat.post_card(queue_cards([], now=NOW, expiry_days=3), fallback_text="x")
 
     assert captured["url"] == "https://chat.googleapis.com/v1/spaces/S/messages"
     assert "messageReplyOption" not in str(captured["url"])
@@ -568,7 +573,7 @@ def test_each_row_links_to_the_approval_card_so_a_reviewer_can_act() -> None:
         _entry("e", hours_old=5, to="ar@carrier.com", loads=("2469115",)),
         chat_message="spaces/AAQAnvSk2WY/messages/p7dH0UiVeRc.wbi1j0I5tdo",
     )
-    row = _texts(queue_card([entry], now=NOW, expiry_days=3))[1]
+    row = _texts(queue_cards([entry], now=NOW, expiry_days=3))[1]
 
     assert (
         "https://chat.google.com/room/AAQAnvSk2WY/p7dH0UiVeRc/wbi1j0I5tdo?cls=10" in row
@@ -592,7 +597,7 @@ def test_a_row_with_no_card_still_renders_and_still_links_the_email() -> None:
     """`chat_message` is blank when the post failed or the entry predates the field. That
     must cost the recipient's link, not the whole row."""
 
-    row = _texts(queue_card([_entry("e", hours_old=5, to="ar@carrier.com")], now=NOW, expiry_days=3))[1]
+    row = _texts(queue_cards([_entry("e", hours_old=5, to="ar@carrier.com")], now=NOW, expiry_days=3))[1]
 
     assert "ar@carrier.com" in row
     assert "chat.google.com" not in row
@@ -620,7 +625,7 @@ def test_ages_under_a_day_are_shown_in_hours() -> None:
     assert _age(24) == "1d old"
     assert _age(60) == "2d old"
 
-    card = queue_card([_entry("e", hours_old=9, to="a@c.com")], now=NOW, expiry_days=3)
+    card = queue_cards([_entry("e", hours_old=9, to="a@c.com")], now=NOW, expiry_days=3)
     assert "9h old" in _labels(card)[1]
     assert "0d old" not in _labels(card)[1]
 
@@ -638,10 +643,10 @@ def test_chips_are_omitted_when_there_is_no_endpoint_to_send_them_to() -> None:
 
     entries = [_entry("e", hours_old=5, to="a@c.com")]
 
-    with_url = queue_card(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True)
+    with_url = queue_cards(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True)
     assert [b["text"] for b in _buttons(with_url)], "chips expected when the URL is present"
 
-    without_url = queue_card(entries, now=NOW, expiry_days=3, action_url="", interactive=True)
+    without_url = queue_cards(entries, now=NOW, expiry_days=3, action_url="", interactive=True)
     assert _buttons(without_url) == []
     # The queue itself still renders — losing the filter must not lose the list.
     assert "a@c.com" in "\n".join(_texts(without_url))
@@ -683,7 +688,7 @@ def test_subjects_and_addresses_are_escaped_for_the_card() -> None:
         _entry("e", hours_old=5, to="a&b@carrier.com", loads=("2469115",)),
         subject="Re: Payment Status for A & B <urgent>",
     )
-    row = _texts(queue_card([entry], now=NOW, expiry_days=3))[1]
+    row = _texts(queue_cards([entry], now=NOW, expiry_days=3))[1]
 
     assert "&amp;" in row
     assert "&lt;urgent&gt;" in row
@@ -703,7 +708,7 @@ def test_a_whole_bucket_is_listed_when_it_fits() -> None:
     more" — and every date bucket was in fact small enough to list completely."""
 
     entries = [_entry(f"e{i}", hours_old=30 + i * 0.1, to=f"a{i}@carrier.com") for i in range(40)]
-    card = queue_card(entries, now=NOW, expiry_days=3)
+    card = queue_cards(entries, now=NOW, expiry_days=3)
     rows = [t for t in _labels(card) if "old" in t]
 
     assert len(rows) == 40
@@ -723,12 +728,12 @@ def test_rows_stop_at_the_byte_budget_not_at_a_row_count() -> None:
         )
         for i in range(90)
     ]
-    card = queue_card(fat, now=NOW, expiry_days=3, budget=12_000)
+    card = queue_cards(fat, now=NOW, expiry_days=3, budget=12_000)
 
-    assert len(json.dumps(card)) < 16_000, "budget must bound the card"
+    assert len(json.dumps(card)) < 16_000, "budget must bound the message"
     listed = len([t for t in _labels(card) if "old" in t])
     assert 0 < listed < 90
-    assert f"of <b>90</b>" in _texts(card)[-1]
+    assert "of <b>90</b>" in _texts(card)[-1]
 
 
 @pytest.mark.unit
@@ -737,7 +742,7 @@ def test_one_row_is_always_listed_even_if_it_alone_exceeds_the_budget() -> None:
     might refuse than a card that silently says nothing is waiting."""
 
     huge = replace(_entry("e", hours_old=5, to="a@c.com"), subject="x" * 400)
-    card = queue_card([huge], now=NOW, expiry_days=3, budget=1)
+    card = queue_cards([huge], now=NOW, expiry_days=3, budget=1)
 
     assert len([t for t in _labels(card) if "old" in t]) == 1
 
@@ -750,19 +755,19 @@ def test_a_bucket_larger_than_one_card_is_paged_not_truncated() -> None:
 
     entries = [_entry(f"e{i}", hours_old=70 - i * 0.2, to=f"a{i}@carrier.example.com") for i in range(120)]
 
-    first = queue_card(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True)
+    first = queue_cards(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True)
     page_line = next(t for t in _texts(first) if "Showing" in t)
     assert "of <b>120</b>" in page_line
-    assert "Showing <b>1–" in page_line
+    assert "Showing <b>1-" in page_line
 
     labels = [b["text"] for b in _page_buttons(first)]
     assert "Older ▶" in labels
     assert "◀ Newer" not in labels, "no Newer on the first page"
 
-    second = queue_card(
+    second = queue_cards(
         entries, now=NOW, expiry_days=3, offset=30, action_url="https://cb/", interactive=True
     )
-    assert "Showing <b>31–" in next(t for t in _texts(second) if "Showing" in t)
+    assert "Showing <b>31-" in next(t for t in _texts(second) if "Showing" in t)
     assert "◀ Newer" in [b["text"] for b in _page_buttons(second)]
 
 
@@ -782,11 +787,13 @@ def test_every_page_stays_under_the_size_chat_actually_accepts() -> None:
     ]
 
     for offset in (0, 35, 70, 200):
-        card = queue_card(
+        card = queue_cards(
             entries, now=NOW, expiry_days=3, offset=offset,
             action_url="https://cb/", interactive=True,
         )
-        assert len(json.dumps(card)) < 20_000, f"offset {offset} too large"
+        assert len(json.dumps(card)) < 34_000, f"offset {offset} too large"
+        for one in card:
+            assert len(json.dumps(one)) < 17_000, "each card must stay renderable on its own"
 
 
 @pytest.mark.unit
@@ -796,7 +803,7 @@ def test_an_offset_past_the_end_returns_to_the_top() -> None:
     """
 
     entries = [_entry(f"e{i}", hours_old=60 - i, to=f"a{i}@c.com") for i in range(5)]
-    card = queue_card(entries, now=NOW, expiry_days=3, offset=500)
+    card = queue_cards(entries, now=NOW, expiry_days=3, offset=500)
 
     rows = [t for t in _labels(card) if "old" in t]
     assert len(rows) == 5
@@ -808,8 +815,9 @@ def test_page_buttons_carry_the_bucket_and_the_offset() -> None:
     """Paging inside a filtered day must not silently drop back to the unfiltered queue."""
 
     entries = [_entry(f"e{i}", hours_old=30 + i * 0.1, to=f"a{i}@carrier.example.com") for i in range(80)]
-    card = queue_card(
-        entries, now=NOW, expiry_days=3, bucket="yesterday",
+    # Budget forced small so the bucket definitely spans more than one page.
+    card = queue_cards(
+        entries, now=NOW, expiry_days=3, bucket="yesterday", budget=6_000,
         action_url="https://cb/", interactive=True,
     )
     older = next(b for b in _page_buttons(card) if b["text"] == "Older ▶")
@@ -819,3 +827,46 @@ def test_page_buttons_carry_the_bucket_and_the_offset() -> None:
     assert params["bucket"] == "yesterday"
     assert int(params["offset"]) > 0
     assert older["onClick"]["action"]["function"] == "https://cb/"
+
+
+@pytest.mark.unit
+def test_the_message_is_split_across_cards_once_it_outgrows_one() -> None:
+    """cardsV2 is a list, and Chat's 100-widget cap is documented as per CARD rather than per
+    message — with the overflowing section and every section after it dropped silently, so a
+    single card loses its tail without erroring. Splitting keeps each card inside the largest
+    size measured to render (16KB) while the message carries roughly twice one card's worth.
+    """
+
+    entries = [
+        replace(
+            _entry(f"e{i}", hours_old=70 - i * 0.2, to=f"someone.long{i}@carrier.example.com"),
+            subject="Re: Payment Status - A CARRIER NAME INC MC#1234567 INVDHV0458 Load#2506698",
+        )
+        for i in range(200)
+    ]
+    cards = queue_cards(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True)
+
+    assert len(cards) > 1, "a 200-entry queue must span more than one card"
+    for one in cards:
+        assert len(json.dumps(one)) <= 17_000
+        assert len(one["card"]["sections"][0]["widgets"]) <= 90
+
+    # Only the first card carries the header and the chips, so the message reads as one list.
+    assert "header" in cards[0]["card"]
+    assert all("header" not in c["card"] for c in cards[1:])
+    assert len(_buttons(cards)) == 4
+
+    # Card ids must differ or Chat treats them as one card being redefined.
+    assert len({c["cardId"] for c in cards}) == len(cards)
+
+
+@pytest.mark.unit
+def test_a_split_message_still_lists_more_than_a_single_card_could() -> None:
+    entries = [_entry(f"e{i}", hours_old=70 - i * 0.2, to=f"a{i}@carrier.example.com") for i in range(200)]
+
+    one_card = queue_cards(entries, now=NOW, expiry_days=3, budget=16_000)
+    split = queue_cards(entries, now=NOW, expiry_days=3, budget=30_000)
+
+    rows_of = lambda cs: len([t for t in _labels(cs) if "old" in t])  # noqa: E731
+    assert len(split) > len(one_card), "the larger budget must actually span more cards"
+    assert rows_of(split) > rows_of(one_card)

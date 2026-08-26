@@ -46,7 +46,7 @@ from payment_bot.clients.google_chat import (
     GoogleChatClient,
     approval_card,
     build_google_chat_client,
-    queue_card,
+    queue_cards,
 )
 from payment_bot.config import Settings, get_settings
 from payment_bot.local_runner import _Clients, process_inbox
@@ -420,7 +420,7 @@ def _refresh_queue_tracker(
         return
     try:
         entries = store.live_entries()
-        card = queue_card(
+        cards = queue_cards(
             entries,
             now=datetime.now(UTC),
             expiry_days=settings.approval_expiry_days,
@@ -431,9 +431,17 @@ def _refresh_queue_tracker(
             action_url=settings.chat_action_url,
             interactive=chat.interactive,
         )
+        _log.info(
+            "chat_tracker_rendered",
+            extra={
+                "cards": len(cards),
+                "bytes": len(json.dumps(cards)),
+                "waiting": len(entries),
+            },
+        )
         name, misses = store.tracker()
         if name:
-            status = chat.patch_card(name, card)
+            status = chat.patch_card(name, cards)
             if status == 200:
                 store.set_tracker(name, 0)
             elif misses + 1 >= _TRACKER_GIVE_UP_AFTER:
@@ -460,7 +468,7 @@ def _refresh_queue_tracker(
             )
             return
 
-        posted = chat.post_card(card, fallback_text="Drafts awaiting approval")
+        posted = chat.post_card(cards, fallback_text="Drafts awaiting approval")
         if posted:
             store.set_tracker(posted, 0)
         _log.info(

@@ -407,20 +407,41 @@ _QUEUE_ROWS = 90
 #: card in the normal one.
 _CARD_BUDGET = 16_000
 
+#: Bytes of serialised cards the tracker will put in ONE message, across however many cards
+#: that takes.
+#:
+#: ``cardsV2`` is a list, so the rows can be split across several cards in a single message,
+#: and one Chat limit is documented as per-CARD rather than per-message: 100 widgets, with the
+#: overflowing section and every section after it silently dropped. Splitting therefore
+#: genuinely raises that ceiling.
+#:
+#: Whether the SIZE limit is also per-card is not documented anywhere I can reach, and the
+#: measurements only bound it: one card of 14.0KB rendered, one of 28.2KB did not. So this
+#: total is deliberately set below the ~32KB figure Google documents for a message — safe
+#: whichever way the limit is scoped, while still holding roughly twice what a single card
+#: can. ``chat_tracker_rendered`` logs the real total on every refresh, so raising this is a
+#: decision with evidence behind it rather than another guess.
+_MESSAGE_BUDGET = 30_000
 
-def queue_card(
+#: Widgets per card. Chat's documented ceiling is 100, and going over does not error — it
+#: drops that section and all following ones, so a card that looks fine can be missing its
+#: tail. 90 keeps a margin under it.
+_CARD_WIDGETS = 90
+
+
+def queue_cards(
     entries: list[PendingApproval],
     *,
     now: datetime,
     expiry_days: int,
     refreshed: str = "",
     rows: int = _QUEUE_ROWS,
-    budget: int = _CARD_BUDGET,
+    budget: int = _MESSAGE_BUDGET,
     bucket: str = "all",
     offset: int = 0,
     action_url: str = "",
     interactive: bool = False,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     """The standing tracker: every drafted reply still waiting for a click.
 
     One card, rewritten in place each run (see :meth:`GoogleChatClient.upsert_tracker`), so
@@ -543,9 +564,7 @@ def queue_card(
     # Rows are added until the card is nearly full rather than up to a fixed count: see
     # _CARD_BUDGET. `overhead` is everything that is not a row — header, nav bar, lead line
     # — measured rather than estimated, so the budget cannot drift as those change.
-    overhead = len(json.dumps({"cardId": "approval-queue-tracker", "card": {
-        "header": {"title": "Drafts awaiting approval", "subtitle": ""},
-        "sections": [{"widgets": widgets}]}}))
+    overhead = len(json.dumps(widgets)) + 200  # 200 ≈ header + card scaffolding
     spent = overhead
     listed = 0
 
@@ -576,6 +595,8 @@ def queue_card(
             }
         }
         cost = len(json.dumps(row))
+        # Against the MESSAGE budget: the rows are split across cards below, so a single
+        # card's size is no longer what bounds the list.
         if listed and spent + cost > budget:
             break
         widgets.append(row)
@@ -591,7 +612,7 @@ def queue_card(
             {
                 "decoratedText": {
                     "topLabel": "This page",
-                    "text": f"Showing <b>{first}–{last}</b> of <b>{len(shown)}</b>, oldest first.",
+                    "text": f"Showing <b>{first}-{last}</b> of <b>{len(shown)}</b>, oldest first.",
                     "wrapText": True,
                 }
             }
@@ -607,19 +628,61 @@ def queue_card(
             if buttons:
                 widgets.append({"buttonList": {"buttons": buttons}})
 
-    return {
-        "cardId": "approval-queue-tracker",
-        "card": {
-            "header": {
-                "title": "Drafts awaiting approval",
-                "subtitle": (
-                    f"expire after {expiry_days} day{'' if expiry_days == 1 else 's'}"
-                    + (f" · refreshed {refreshed}" if refreshed else "")
-                ),
-            },
-            "sections": [{"widgets": widgets}],
-        },
+    return _split_cards(widgets, expiry_days=expiry_days, refreshed=refreshed)
+
+
+def _split_cards(
+    widgets: list[dict[str, Any]], *, expiry_days: int, refreshed: str
+) -> list[dict[str, Any]]:
+    """One message's worth of widgets, divided into as many cards as they need.
+
+    Chat caps widgets per CARD at 100 and drops the overflowing section — and every section
+    after it — without erroring, so a single card silently loses its tail. Splitting keeps
+    each card inside both that cap and :data:`_CARD_BUDGET`, which is the largest single card
+    measured to render.
+
+    Only the first card carries the header and the date chips; the rest are plain continuation
+    cards, so the message reads as one list rather than as a repeated banner.
+    """
+
+    header = {
+        "title": "Drafts awaiting approval",
+        "subtitle": (
+            f"expire after {expiry_days} day{'' if expiry_days == 1 else 's'}"
+            + (f" · refreshed {refreshed}" if refreshed else "")
+        ),
     }
+
+    cards: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    spent = 0
+
+    def flush() -> None:
+        nonlocal current, spent
+        if not current:
+            return
+        index = len(cards)
+        card: dict[str, Any] = {
+            "cardId": f"approval-queue-tracker-{index}",
+            "card": {"sections": [{"widgets": current}]},
+        }
+        if index == 0:
+            card["card"]["header"] = header
+        cards.append(card)
+        current = []
+        spent = 0
+
+    for widget in widgets:
+        cost = len(json.dumps(widget))
+        if current and (spent + cost > _CARD_BUDGET or len(current) >= _CARD_WIDGETS):
+            flush()
+        current.append(widget)
+        spent += cost
+    flush()
+
+    if not cards:  # pragma: no cover - the lead line is always present
+        cards = [{"cardId": "approval-queue-tracker-0", "card": {"header": header, "sections": []}}]
+    return cards
 
 
 class GoogleChatClient:
@@ -742,7 +805,7 @@ class GoogleChatClient:
         return SlackPost(slack_ts=name, channel=self._space)
 
     # -- card updates ------------------------------------------------------------
-    def patch_card(self, message_name: str, card: dict[str, Any]) -> int:
+    def patch_card(self, message_name: str, cards: list[dict[str, Any]]) -> int:
         """Replace a posted card in place. Returns the HTTP status; 0 if it never went out.
 
         The status, not a bool, because the caller's next move depends on WHICH failure.
@@ -758,7 +821,7 @@ class GoogleChatClient:
                 "PATCH",
                 f"{CHAT_API_BASE}/{urllib.parse.quote(message_name)}?updateMask=cardsV2",
                 headers=self._headers(),
-                body=json.dumps({"cardsV2": [card]}).encode("utf-8"),
+                body=json.dumps({"cardsV2": cards}).encode("utf-8"),
                 timeout=self._timeout,
             )
             if not response.ok:
@@ -778,11 +841,15 @@ class GoogleChatClient:
             return 0
 
     def update_status(self, message_name: str, card: dict[str, Any]) -> bool:
-        """Replace a posted card in place (expiry sweeps). True on success."""
+        """Replace a posted card in place (expiry sweeps). True on success.
 
-        return self.patch_card(message_name, card) == 200
+        Single-card convenience: an approval card is always one card, so the sweep's contract
+        is unchanged by the tracker learning to span several.
+        """
 
-    def post_card(self, card: dict[str, Any], *, fallback_text: str) -> str:
+        return self.patch_card(message_name, [card]) == 200
+
+    def post_card(self, cards: list[dict[str, Any]], *, fallback_text: str) -> str:
         """Post one standalone card and return its resource name, or ``""`` on failure.
 
         **Unthreaded, and it must stay that way.** A pin applies to a message, so a tracker
@@ -805,7 +872,7 @@ class GoogleChatClient:
                 "POST",
                 f"{CHAT_API_BASE}/{urllib.parse.quote(self._space)}/messages",
                 headers=self._headers(),
-                body=json.dumps({"text": fallback_text, "cardsV2": [card]}).encode("utf-8"),
+                body=json.dumps({"text": fallback_text, "cardsV2": cards}).encode("utf-8"),
                 timeout=self._timeout,
             )
             if not response.ok:

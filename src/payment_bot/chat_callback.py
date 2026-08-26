@@ -50,7 +50,7 @@ from payment_bot.clients.google_chat import (
     ACTION_QUEUE_PAGE,
     ACTION_REJECT,
     approval_card,
-    queue_card,
+    queue_cards,
 )
 from payment_bot.clients.http import HttpTransport, UrllibTransport
 from payment_bot.clients.mime import build_reply
@@ -741,7 +741,7 @@ def _click_param(chat_event: dict[str, Any], key: str) -> tuple[str, str]:
     return "", "none"
 
 
-def _replace_card(card: dict[str, Any], addons: bool) -> dict[str, Any]:
+def _replace_cards(cards: list[dict[str, Any]], addons: bool) -> dict[str, Any]:
     """The "redraw this message" response, in whichever schema the app was provisioned with."""
 
     if addons:
@@ -750,12 +750,12 @@ def _replace_card(card: dict[str, Any], addons: bool) -> dict[str, Any]:
             {
                 "hostAppDataAction": {
                     "chatDataAction": {
-                        "updateMessageAction": {"message": {"cardsV2": [card]}}
+                        "updateMessageAction": {"message": {"cardsV2": cards}}
                     }
                 }
             },
         )
-    return _http(200, {"actionResponse": {"type": "UPDATE_MESSAGE"}, "cardsV2": [card]})
+    return _http(200, {"actionResponse": {"type": "UPDATE_MESSAGE"}, "cardsV2": cards})
 
 
 def _queue_response(
@@ -777,7 +777,7 @@ def _queue_response(
     from datetime import UTC, datetime
 
     now = datetime.now(UTC)
-    card = queue_card(
+    cards = queue_cards(
         store.live_entries(),
         now=now,
         expiry_days=settings.approval_expiry_days,
@@ -791,7 +791,7 @@ def _queue_response(
         interactive=True,
         offset=offset,
     )
-    return _replace_card(card, addons)
+    return _replace_cards(cards, addons)
 
 
 def _update_card_response(
@@ -819,7 +819,7 @@ def _update_card_response(
         status=status,
         message_id=entry.message_id,
     )
-    return _replace_card(card, addons)
+    return _replace_cards([card], addons)
 
 
 def _now_iso() -> str:

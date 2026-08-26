@@ -47,12 +47,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: valid load id found" while the same mail drafted fine on a developer's machine. Nothing
 #: fails closed to catch that, which is precisely why it belongs in this list rather than
 #: being left to whoever remembers the extra.
+#: `tzdata` is the second silent one, and it is silent in the same shape. ZoneInfo reads the
+#: SYSTEM tz database. A Lambda runtime that happens to ship one resolves America/New_York and
+#: everything is right; one that does not raises, `_today_in` falls back to the UTC system
+#: date, and the bot is a day ahead every evening — which is the exact bug the timezone work
+#: fixed. Carrying the data removes the dependency on what the base image happens to include.
+#:
+#: This list is hand-kept rather than read from pyproject, so a dependency added there does
+#: NOT reach the package. tzdata was added to pyproject and missing from the first deploy for
+#: precisely that reason; if you add one there, add it here.
 REQUIREMENTS = (
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "google-auth>=2.28",
     "beautifulsoup4>=4.12",
     "pypdf>=4.2",
+    "tzdata>=2024.1",
 )
 
 #: Lambda's Python runtime. Must match `Runtime:` in template.yaml — a mismatch stages

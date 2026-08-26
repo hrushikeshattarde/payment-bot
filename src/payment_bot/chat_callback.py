@@ -777,8 +777,18 @@ def _queue_response(
     from datetime import UTC, datetime
 
     now = datetime.now(UTC)
+    entries = store.live_entries()
+    # Labels come from the cache the worker keeps, never from Gmail here: establishing a state
+    # costs an API call per row and this response has to reach Chat immediately. A row the
+    # worker has not reached yet is simply unlabelled, which renders as UNANSWERED — the safe
+    # direction. Without this the click path drew every row UNANSWERED regardless, which is
+    # how a thread a colleague had already answered kept showing as outstanding.
+    states = {
+        entry_id: record["state"]
+        for entry_id, record in store.row_states().items()
+    }
     cards = queue_cards(
-        store.live_entries(),
+        entries,
         now=now,
         expiry_days=settings.approval_expiry_days,
         refreshed=now.strftime("%b %d %H:%M UTC"),
@@ -790,6 +800,7 @@ def _queue_response(
         action_url=action_url or settings.chat_action_url,
         interactive=True,
         offset=offset,
+        states=states,
     )
     return _replace_cards(cards, addons)
 

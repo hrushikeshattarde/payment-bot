@@ -1043,3 +1043,100 @@ def test_an_entry_with_no_thread_id_is_left_alone() -> None:
     store.put_pending(entry)
 
     assert _queue_states(store, Gmail(), [entry], _settings()) == {}
+
+
+@pytest.mark.unit
+def test_a_chip_click_labels_rows_from_the_cache() -> None:
+    """The reported bug. Labels were wired into the worker's refresh only, so every row a
+    chip click rendered came back UNANSWERED — a 19h-old row whose thread a colleague had
+    already answered still read as outstanding, because reaching it meant clicking Today.
+
+    The click path cannot ask Gmail: that is an API call per row against a response Chat
+    expects immediately. So it reads the cache the worker keeps.
+    """
+
+    from payment_bot.chat_callback import _queue_response
+    from payment_bot.config import Settings
+
+    real_now = datetime.now(UTC)
+    store = InMemoryApprovalStore()
+    for entry_id, hours in (("done", 19), ("open", 20)):
+        store.put_pending(
+            replace(
+                _entry(entry_id, hours_old=0, to=f"{entry_id}@carrier.com"),
+                created_at=(real_now - timedelta(hours=hours)).isoformat(),
+            )
+        )
+    store.set_row_states({"done": {"state": "handled", "at": real_now.isoformat()}})
+
+    body = json.loads(_queue_response(store, Settings(_env_file=None), "all", False)["body"])
+    rendered = json.dumps(body["cardsV2"])
+
+    assert "ANSWERED IN GMAIL" in rendered
+    assert "UNANSWERED" in rendered
+    # And each label lands on the right row.
+    rows = [w["decoratedText"]["text"] for w in _widgets(body["cardsV2"]) if "decoratedText" in w]
+    done_row = next(r for r in rows if "done@carrier.com" in r)
+    open_row = next(r for r in rows if "open@carrier.com" in r)
+    assert "ANSWERED IN GMAIL" in done_row
+    assert "UNANSWERED" in open_row
+
+
+@pytest.mark.unit
+def test_a_fresh_cached_state_is_not_rechecked() -> None:
+    """The check budget has to go to rows nothing is known about, or a queue this size spends
+    every refresh re-establishing what it already knew."""
+
+    from payment_bot.lambda_handler import _queue_states
+
+    class Gmail:
+        def __init__(self) -> None:
+            self.asked: list[str] = []
+
+        def thread_state(self, thread_id: str) -> str:
+            self.asked.append(thread_id)
+            return "open"
+
+    now = datetime.now(UTC)
+    store = InMemoryApprovalStore()
+    entries = []
+    for entry_id in ("fresh", "stale", "unknown"):
+        entry = replace(
+            _entry(entry_id, hours_old=10, to=f"{entry_id}@c.com"), thread_id=f"t-{entry_id}"
+        )
+        store.put_pending(entry)
+        entries.append(entry)
+    store.set_row_states(
+        {
+            "fresh": {"state": "drafting", "at": now.isoformat()},
+            "stale": {"state": "open", "at": (now - timedelta(hours=4)).isoformat()},
+        }
+    )
+
+    gmail = Gmail()
+    states = _queue_states(store, gmail, entries, _settings())
+
+    assert gmail.asked == ["t-stale", "t-unknown"], "the fresh one is trusted"
+    assert states["fresh"] == "drafting", "and its cached label is kept"
+
+
+@pytest.mark.unit
+def test_the_cache_forgets_rows_that_have_left_the_queue() -> None:
+    """Otherwise it grows for the life of the deployment."""
+
+    from payment_bot.lambda_handler import _queue_states
+
+    now = datetime.now(UTC)
+    store = InMemoryApprovalStore()
+    entry = replace(_entry("live", hours_old=10, to="a@c.com"), thread_id="t")
+    store.put_pending(entry)
+    store.set_row_states(
+        {
+            "live": {"state": "open", "at": now.isoformat()},
+            "long-gone": {"state": "handled", "at": now.isoformat()},
+        }
+    )
+
+    _queue_states(store, None, [entry], _settings())
+
+    assert set(store.row_states()) == {"live"}

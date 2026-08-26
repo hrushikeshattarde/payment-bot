@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import MutableMapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from payment_bot.approvals import ChatPostLedger, S3ApprovalStore
@@ -43,6 +43,7 @@ from payment_bot.clients import (
     build_transport_pro_client,
 )
 from payment_bot.clients.google_chat import (
+    QUEUE_BUCKETS,
     GoogleChatClient,
     approval_card,
     build_google_chat_client,
@@ -391,12 +392,28 @@ def _sweep_approvals(
             )
 
 
-#: How many of the board's rows get their Gmail thread checked per refresh.
+#: How many fresh Gmail thread checks one refresh will make.
 #:
-#: One API call each, and the queue runs two hundred deep against a thirty-row card, so
-#: checking all of them would spend most of an invocation establishing state for rows nobody
-#: is about to see. 45 covers the visible page with room for the size budget to trim.
+#: One API call each, so this is a latency budget, not a preference. The cache below is what
+#: makes it enough: a state already known and recent is reused, so a run spends its checks on
+#: rows it has never seen rather than re-establishing the whole board every fifteen minutes.
 _STATE_CHECK_ROWS = 45
+
+#: Rows per bucket that the worker tries to keep a state for.
+#:
+#: The first version checked the first 45 of the "all" ordering only, which is oldest-first
+#: across the whole queue — so a nineteen-hour-old row sat far below the window and never got
+#: checked, while the reviewer reading the Today chip saw it labelled UNANSWERED when a
+#: colleague had already replied. Every chip's first page needs covering, not just the
+#: oldest page of the unfiltered view.
+_STATE_ROWS_PER_BUCKET = 40
+
+#: How long a cached state is trusted before it is checked again.
+#:
+#: A colleague can reply at any moment, so a label is always somewhat behind; the question is
+#: only how far. Thirty minutes is two refreshes — long enough that the check budget goes to
+#: new rows, short enough that a hand-answered email stops being chased within the hour.
+_STATE_TTL_MINUTES = 30
 
 
 def _queue_states(
@@ -418,14 +435,51 @@ def _queue_states(
     is not worth failing a mail run over.
     """
 
-    states: dict[str, str] = {}
+    cached = store.row_states()
+    live_ids = {entry.entry_id for entry in entries}
+    # Forget rows that have left the queue, or the cache grows without bound.
+    states: dict[str, str] = {
+        entry_id: record["state"] for entry_id, record in cached.items() if entry_id in live_ids
+    }
+
+    def save(records: dict[str, dict[str, str]]) -> None:
+        """Persist the cache, pruned to the live queue. Never fatal.
+
+        The click path reads this, so losing the write costs those rows their label until the
+        next refresh — never a wrong label, since unknown reads as UNANSWERED.
+        """
+
+        try:
+            store.set_row_states({k: v for k, v in records.items() if k in live_ids})
+        except Exception as exc:
+            _log.warning(
+                "queue_states_not_saved", extra={"error": f"{type(exc).__name__}: {exc}"}
+            )
+
     checker = getattr(gmail, "thread_state", None)
     if checker is None:
+        # No Gmail here (local runs, or a wiring gap). Still prune: a cache that only ever
+        # grows outlives the entries it describes.
+        save(cached)
         return states
 
-    for entry in entries[:_STATE_CHECK_ROWS]:
+    now = datetime.now(UTC)
+    fresh_enough = now - timedelta(minutes=_STATE_TTL_MINUTES)
+    updated = dict(cached)
+    checks = 0
+
+    for entry in entries:
+        if checks >= _STATE_CHECK_ROWS:
+            break
         if not entry.thread_id:
             continue
+        record = cached.get(entry.entry_id)
+        if record:
+            try:
+                if datetime.fromisoformat(record["at"]) >= fresh_enough:
+                    continue  # still trusted; spend the budget on rows we know nothing about
+            except ValueError:
+                pass
         try:
             state = str(checker(entry.thread_id))
         except Exception as exc:
@@ -434,7 +488,9 @@ def _queue_states(
                 extra={"entry_id": entry.entry_id, "error": str(exc)},
             )
             continue
+        checks += 1
         states[entry.entry_id] = state
+        updated[entry.entry_id] = {"state": state, "at": now.isoformat()}
         if state != "handled":
             continue
         # Retire it. Recorded with its own status rather than reusing "sent": nothing was
@@ -468,6 +524,12 @@ def _queue_states(
                     "error": f"{type(exc).__name__}: {exc}",
                 },
             )
+
+    save(updated)
+    _log.info(
+        "queue_states_refreshed",
+        extra={"checked": checks, "known": len(states), "live": len(live_ids)},
+    )
     return states
 
 
@@ -504,12 +566,18 @@ def _refresh_queue_tracker(
         # Establish state for the rows that will actually be listed, and retire any whose
         # thread a colleague has already answered. Done before the render so a retired row
         # never appears as outstanding, and so the counts on the chips are honest.
-        states = _queue_states(
-            store,
-            gmail,
-            queue_page(entries, now=datetime.now(UTC)),
-            settings,
-        )
+        # Candidates: the head of EVERY bucket, not just the oldest page of the unfiltered
+        # view. A reviewer reading the Today chip is looking at rows the "all" ordering puts
+        # far down, and those were the ones showing UNANSWERED after a colleague had replied.
+        now = datetime.now(UTC)
+        candidates: list[Any] = []
+        seen_ids: set[str] = set()
+        for key, _, _ in QUEUE_BUCKETS:
+            for entry in queue_page(entries, now=now, bucket=key)[:_STATE_ROWS_PER_BUCKET]:
+                if entry.entry_id not in seen_ids:
+                    seen_ids.add(entry.entry_id)
+                    candidates.append(entry)
+        states = _queue_states(store, gmail, candidates, settings)
         if states:
             retired = {eid for eid, st in states.items() if st == "handled"}
             if retired:

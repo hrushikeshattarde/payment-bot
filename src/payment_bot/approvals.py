@@ -57,6 +57,11 @@ S3_PREFIX = "state/approvals"
 #: prune walks the families by prefix and must never see it.
 _TRACKER_KEY = f"{S3_PREFIX}/tracker.json"
 
+#: Cached per-row label states, one object for the whole board. Beside the entry families
+#: rather than among them, for the same reason as the tracker key: the prune walks those
+#: families by prefix and must not see this.
+_STATES_KEY = f"{S3_PREFIX}/row_states.json"
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -143,6 +148,19 @@ class ApprovalStore(Protocol):
     def release_claim(self, entry_id: str) -> None:
         """Undo a claim whose action failed, so a later click can retry."""
 
+    def row_states(self) -> dict[str, dict[str, str]]:
+        """Cached ``{entry_id: {"state": …, "at": …}}`` for the board's labels."""
+
+    def set_row_states(self, states: dict[str, dict[str, str]]) -> None:
+        """Replace the cached label states.
+
+        Cached because the two things that need them have opposite budgets. Establishing a
+        state costs a Gmail call per row; the worker has fifteen minutes and can afford it,
+        while a card click has to answer Chat immediately and cannot. So the worker writes
+        what it learns and the click path reads it — a label up to one refresh stale, which
+        is the right trade for a label.
+        """
+
     def tracker(self) -> tuple[str, int]:
         """``(chat message name, consecutive edit failures)``. ``("", 0)`` when unposted.
 
@@ -168,6 +186,7 @@ class InMemoryApprovalStore:
         self.results: dict[str, dict[str, Any]] = {}
         self.claims: dict[str, dict[str, Any]] = {}
         self._tracker: tuple[str, int] = ("", 0)
+        self._row_states: dict[str, dict[str, str]] = {}
 
     def put_pending(self, entry: PendingApproval) -> None:
         self._pending[entry.entry_id] = entry
@@ -192,6 +211,12 @@ class InMemoryApprovalStore:
 
     def release_claim(self, entry_id: str) -> None:
         self.claims.pop(entry_id, None)
+
+    def row_states(self) -> dict[str, dict[str, str]]:
+        return dict(self._row_states)
+
+    def set_row_states(self, states: dict[str, dict[str, str]]) -> None:
+        self._row_states = dict(states)
 
     def tracker(self) -> tuple[str, int]:
         return self._tracker
@@ -315,6 +340,33 @@ class S3ApprovalStore:
             if _is_precondition_failure(exc):
                 return False
             raise
+
+    def row_states(self) -> dict[str, dict[str, str]]:
+        """Cached label states. An unreadable cache reads as empty — every row UNANSWERED,
+        which is the safe direction: work still owed, never work already done."""
+
+        raw = self._get(_STATES_KEY)
+        if not raw:
+            return {}
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            return {}
+        if not isinstance(record, dict):
+            return {}
+        return {
+            str(k): {"state": str(v.get("state") or "open"), "at": str(v.get("at") or "")}
+            for k, v in record.items()
+            if isinstance(v, dict)
+        }
+
+    def set_row_states(self, states: dict[str, dict[str, str]]) -> None:
+        self._s3().put_object(
+            Bucket=self._bucket,
+            Key=_STATES_KEY,
+            Body=json.dumps(states, sort_keys=True).encode("utf-8"),
+            ContentType="application/json",
+        )
 
     def tracker(self) -> tuple[str, int]:
         """The queue card's name and its consecutive edit failures.

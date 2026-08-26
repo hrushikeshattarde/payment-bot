@@ -415,13 +415,24 @@ _CARD_BUDGET = 16_000
 #: overflowing section and every section after it silently dropped. Splitting therefore
 #: genuinely raises that ceiling.
 #:
-#: Whether the SIZE limit is also per-card is not documented anywhere I can reach, and the
-#: measurements only bound it: one card of 14.0KB rendered, one of 28.2KB did not. So this
-#: total is deliberately set below the ~32KB figure Google documents for a message — safe
-#: whichever way the limit is scoped, while still holding roughly twice what a single card
-#: can. ``chat_tracker_rendered`` logs the real total on every refresh, so raising this is a
-#: decision with evidence behind it rather than another guess.
-_MESSAGE_BUDGET = 30_000
+#: **There are two different size limits here, and the smaller one governs.** Measured:
+#:
+#: * the API write succeeds at 30KB — the worker's scheduled PATCH of a two-card message
+#:   returned 200 twice;
+#: * the INTERACTION RESPONSE does not. A chip click hands the cards back inline in the
+#:   callback's HTTP response, and at ~30KB Chat answers "Payment Bot is unable to process
+#:   your request" while the click itself arrives and parses perfectly.
+#:
+#: So splitting across cards raised the widget ceiling and bought nothing on bytes: 14.0KB
+#: rendered, 28.2KB failed, 30.3KB split across two cards failed too. The bound is on the
+#: whole message, not the card, and the click path is the strictest consumer of it.
+#:
+#: 14KB is therefore the budget — at the only size confirmed to survive a click. Paging
+#: covers the remainder. Raising this means removing the inline response from the click path
+#: entirely: the callback would PATCH the message through the API, which is already known to
+#: accept twice this, and return a bare ack. That is a real option and the numbers above are
+#: the case for it; it is not done here because restoring a working card came first.
+_MESSAGE_BUDGET = 14_000
 
 #: Widgets per card. Chat's documented ceiling is 100, and going over does not error — it
 #: drops that section and all following ones, so a card that looks fine can be missing its

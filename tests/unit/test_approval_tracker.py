@@ -844,7 +844,14 @@ def test_the_message_is_split_across_cards_once_it_outgrows_one() -> None:
         )
         for i in range(200)
     ]
-    cards = queue_cards(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True)
+    # Budget raised past the default: the shipped default is 14KB, which is what a click
+    # response survives, and one card holds that. The splitting itself still has to be right
+    # — the widget cap it exists for is per card, so a larger budget must never produce one
+    # oversized card that silently drops its tail.
+    cards = queue_cards(
+        entries, now=NOW, expiry_days=3, budget=30_000,
+        action_url="https://cb/", interactive=True,
+    )
 
     assert len(cards) > 1, "a 200-entry queue must span more than one card"
     for one in cards:
@@ -870,3 +877,37 @@ def test_a_split_message_still_lists_more_than_a_single_card_could() -> None:
     rows_of = lambda cs: len([t for t in _labels(cs) if "old" in t])  # noqa: E731
     assert len(split) > len(one_card), "the larger budget must actually span more cards"
     assert rows_of(split) > rows_of(one_card)
+
+
+@pytest.mark.unit
+def test_the_default_budget_is_what_a_click_response_survives() -> None:
+    """Two different limits govern this card, and the smaller one wins.
+
+    Measured on a live 235-entry queue: the worker's API PATCH of a 30.3KB two-card message
+    returned 200 twice, so the API write is fine at that size. The same payload handed back
+    inline from a chip click was refused — "Payment Bot is unable to process your request" —
+    while the click itself arrived and parsed correctly. Splitting raised the widget ceiling
+    and bought nothing on bytes: 14.0KB rendered, 28.2KB failed, 30.3KB across two cards
+    failed too.
+
+    So the default has to sit at the size a CLICK survives, not the size the API accepts.
+    """
+
+    from payment_bot.clients.google_chat import _MESSAGE_BUDGET
+
+    assert _MESSAGE_BUDGET <= 14_000
+
+    entries = [
+        replace(
+            _entry(f"e{i}", hours_old=70 - i * 0.2, to=f"someone.long{i}@carrier.example.com"),
+            subject="Re: Payment Status - A CARRIER NAME INC MC#1234567 INVDHV0458 Load#2506698",
+        )
+        for i in range(240)
+    ]
+    for bucket in ("all", "today", "yesterday", "older"):
+        for offset in (0, 30, 90):
+            cards = queue_cards(
+                entries, now=NOW, expiry_days=3, bucket=bucket, offset=offset,
+                action_url="https://cb/", interactive=True,
+            )
+            assert len(json.dumps(cards)) <= 15_000, f"{bucket}@{offset} would be refused"

@@ -397,7 +397,7 @@ def _sweep_approvals(
 #: One API call each, so this is a latency budget, not a preference. The cache below is what
 #: makes it enough: a state already known and recent is reused, so a run spends its checks on
 #: rows it has never seen rather than re-establishing the whole board every fifteen minutes.
-_STATE_CHECK_ROWS = 45
+_STATE_CHECK_ROWS = 90
 
 #: Rows per bucket that the worker tries to keep a state for.
 #:
@@ -406,7 +406,7 @@ _STATE_CHECK_ROWS = 45
 #: checked, while the reviewer reading the Today chip saw it labelled UNANSWERED when a
 #: colleague had already replied. Every chip's first page needs covering, not just the
 #: oldest page of the unfiltered view.
-_STATE_ROWS_PER_BUCKET = 40
+_STATE_ROWS_PER_BUCKET = 60
 
 #: How long a cached state is trusted before it is checked again.
 #:
@@ -570,13 +570,30 @@ def _refresh_queue_tracker(
         # view. A reviewer reading the Today chip is looking at rows the "all" ordering puts
         # far down, and those were the ones showing UNANSWERED after a colleague had replied.
         now = datetime.now(UTC)
+        # Round-robin across the DAY buckets, one row from each in turn.
+        #
+        # "all" is deliberately not among them: it is the union of the other three, and its
+        # head is simply the oldest rows overall — already covered by whichever day they fall
+        # in. Including it starved the rest, because it came first and its forty oldest ate
+        # the whole per-run budget, leaving five checks for Today. A reviewer reading Today
+        # then saw unlabelled rows for hours while the same oldest page was re-established
+        # over and over.
+        #
+        # Interleaved rather than concatenated for the same reason: a budget that runs out
+        # mid-list must leave every day partly covered, never one day fully and the rest not
+        # at all.
+        pages = [
+            queue_page(entries, now=now, bucket=key)[:_STATE_ROWS_PER_BUCKET]
+            for key, _, _ in QUEUE_BUCKETS
+            if key != "all"
+        ]
         candidates: list[Any] = []
         seen_ids: set[str] = set()
-        for key, _, _ in QUEUE_BUCKETS:
-            for entry in queue_page(entries, now=now, bucket=key)[:_STATE_ROWS_PER_BUCKET]:
-                if entry.entry_id not in seen_ids:
-                    seen_ids.add(entry.entry_id)
-                    candidates.append(entry)
+        for row in range(_STATE_ROWS_PER_BUCKET):
+            for page in pages:
+                if row < len(page) and page[row].entry_id not in seen_ids:
+                    seen_ids.add(page[row].entry_id)
+                    candidates.append(page[row])
         states = _queue_states(store, gmail, candidates, settings)
         if states:
             retired = {eid for eid, st in states.items() if st == "handled"}

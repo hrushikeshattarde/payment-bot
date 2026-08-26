@@ -1140,3 +1140,52 @@ def test_the_cache_forgets_rows_that_have_left_the_queue() -> None:
     _queue_states(store, None, [entry], _settings())
 
     assert set(store.row_states()) == {"live"}
+
+
+@pytest.mark.unit
+def test_the_check_budget_is_shared_across_the_days_not_eaten_by_the_oldest() -> None:
+    """The flaw a screenshot of page two exposed.
+
+    Candidates were the head of every bucket INCLUDING "all", concatenated. "all" came first
+    and is the same oldest-first ordering, so its forty oldest rows consumed the whole per-run
+    budget and Today got five checks — a reviewer reading Today saw unlabelled rows for hours
+    while the same oldest page was re-established every quarter hour.
+
+    "all" is the union of the other three, so its head is already covered by whichever day
+    those rows fall in. Interleaving the days means a budget that runs out leaves every day
+    partly covered rather than one day fully and the rest not at all.
+    """
+
+    from payment_bot.clients.google_chat import QUEUE_BUCKETS, bucket_of, queue_page
+    from payment_bot.lambda_handler import _STATE_ROWS_PER_BUCKET
+
+    now = datetime.now(UTC)
+    entries = []
+    for bucket_hours, count in ((6, 50), (30, 50), (60, 50)):
+        for i in range(count):
+            entries.append(
+                replace(
+                    _entry(f"b{bucket_hours}-{i}", hours_old=0, to=f"b{bucket_hours}-{i}@c.com"),
+                    created_at=(now - timedelta(hours=bucket_hours, minutes=i)).isoformat(),
+                )
+            )
+
+    pages = [
+        queue_page(entries, now=now, bucket=key)[:_STATE_ROWS_PER_BUCKET]
+        for key, _, _ in QUEUE_BUCKETS
+        if key != "all"
+    ]
+    candidates, seen = [], set()
+    for row in range(_STATE_ROWS_PER_BUCKET):
+        for page in pages:
+            if row < len(page) and page[row].entry_id not in seen:
+                seen.add(page[row].entry_id)
+                candidates.append(page[row])
+
+    # Whatever the budget, the first slice of candidates touches all three days.
+    for budget in (9, 30, 60):
+        covered = {
+            bucket_of((now - datetime.fromisoformat(e.created_at)).total_seconds() / 3600)
+            for e in candidates[:budget]
+        }
+        assert covered == {"today", "yesterday", "older"}, f"budget {budget} starved a day"

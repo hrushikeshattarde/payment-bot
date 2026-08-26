@@ -502,6 +502,7 @@ class PreSendGate:
         ctx: ToolContext,
         expected_load_ids: tuple[str, ...] | None = None,
         noa_request_expected: bool = False,
+        withheld_loads: tuple[str, ...] = (),
     ) -> GateResult:
         """Run all checks.
 
@@ -528,6 +529,7 @@ class PreSendGate:
             self._check_deduction_disclosure(draft, email),
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
+            self._check_withheld_acknowledged(draft, withheld_loads),
             self._check_carrier_consistency(draft, email, ctx),
             self._check_change_acknowledgment(
                 draft, email, noa_request_expected, change_announced=self._change_announced(email, ctx)
@@ -790,6 +792,44 @@ class PreSendGate:
                 detail=f"reply body names internal tools: {mentioned}",
             )
         return GateCheck(name="tool_mentions", passed=True, detail="no tool names in the reply")
+
+    def _check_withheld_acknowledged(
+        self, draft: SubmitDraftOutput, withheld_loads: tuple[str, ...]
+    ) -> GateCheck:
+        """A load the sender named and this reply will not cover must be named as not covered.
+
+        `_withheld_line` puts that instruction in the intake, and an instruction is all it
+        was — nothing checked the draft obeyed it. Live on a Trans 99 statement listing loads
+        2494074 and 2543747: the second was denied, the intake said to say so, and the reply
+        answered the first and never mentioned the second. The sender had no way to tell.
+
+        `_check_coverage` cannot catch this. It polices the loads the agent was ASKED to
+        answer, and a withheld load is by definition not one of them — it was removed before
+        the skill was chosen.
+
+        Presence only. The reply must contain the id; what it may say ABOUT it is the
+        intake's business, and disclosure beyond that is what the other checks police.
+        """
+
+        missing = [lid for lid in withheld_loads if lid not in draft.reply_body]
+        if missing:
+            return GateCheck(
+                name="withheld_acknowledged",
+                passed=False,
+                detail=(
+                    "the sender named these loads and the reply neither covers nor "
+                    f"mentions them: {', '.join(missing)}"
+                ),
+            )
+        return GateCheck(
+            name="withheld_acknowledged",
+            passed=True,
+            detail=(
+                f"withheld load(s) named in the reply: {', '.join(withheld_loads)}"
+                if withheld_loads
+                else "no withheld loads to acknowledge"
+            ),
+        )
 
     def _check_coverage(
         self, draft: SubmitDraftOutput, expected_load_ids: tuple[str, ...] | None

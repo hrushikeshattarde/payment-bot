@@ -620,6 +620,28 @@ def _factor_names_match(configured_name: str, on_file: str) -> bool:
 #: unrelated words, and the whole point of this match is that the sender proves something.
 _CARRIER_NAME_MIN_CHARS = 6
 
+#: Words in a carrier's legal name that say WHERE it is incorporated, not WHO it is.
+#:
+#: Kept apart from _STOPWORDS because they are not industry furniture — they are
+#: geography, and geography is what a carrier leaves out of its own mailbox. "Trans 99
+#: Logistics Usa Inc" delivered load 2543747 and wrote from accountsteam1@trans99.net;
+#: requiring EVERY distinctive token meant "usa" had to appear in the address, and it never
+#: does. The load was denied and the reply did not mention it.
+#:
+#: State abbreviations are here for the "(NC)" and "Inc Of Texas" spellings the back office
+#: records. Two-letter tokens carry no weight on their own anyway — the minimum length
+#: applies to the joined form — so this only stops them BLOCKING an otherwise clear match.
+_CARRIER_PLACE_TOKENS = frozenset(
+    {
+        "usa", "us", "usinc", "america", "american", "national", "international", "intl",
+        "north", "south", "east", "west", "of",
+        "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in",
+        "ia", "ks", "ky", "la", "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv",
+        "nh", "nj", "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri", "sc", "sd", "tn",
+        "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy",
+    }
+)  # fmt: skip
+
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -636,7 +658,9 @@ def _name_keys(carrier_company: str) -> tuple[str, list[str]]:
 
     normalised = _normalize_company_name(carrier_company)
     tokens = [t for t in normalised.split() if t not in _CORPORATE_SUFFIXES]
-    distinctive = [t for t in tokens if t not in _STOPWORDS]
+    distinctive = [
+        t for t in tokens if t not in _STOPWORDS and t not in _CARRIER_PLACE_TOKENS
+    ]
     return "".join(tokens), distinctive
 
 

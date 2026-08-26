@@ -134,3 +134,31 @@ def test_a_name_match_never_reaches_a_sender_the_record_already_denies_for_cause
     )
 
     assert out.decision is AuthDecision.DENY
+
+
+@pytest.mark.parametrize(
+    ("carrier", "sender"),
+    [
+        # Live on load 2543747: delivered, billing complete, and denied anyway.
+        ("Trans 99 Logistics Usa Inc", "accountsteam1@trans99.net"),
+        ("MIR Trans Inc (NC)", "accounting@mirtrans.com"),
+        ("Reliable Freight Of America", "reliablefreight@gmail.com"),
+    ],
+)
+def test_geography_in_a_legal_name_does_not_block_a_match(carrier: str, sender: str) -> None:
+    """A carrier leaves "Usa" and "(NC)" out of its own mailbox, and it should not have to.
+
+    Requiring EVERY distinctive token meant "usa" had to appear in the address. Trans 99
+    Logistics Usa Inc delivered 2543747 and wrote from trans99.net; the load was denied and
+    the reply never mentioned it. `usa` is not industry furniture so `_STOPWORDS` did not
+    cover it, which is why `_CARRIER_PLACE_TOKENS` exists separately.
+    """
+
+    assert _match(carrier, sender) is not None
+
+
+def test_a_place_name_alone_still_authorises_nobody() -> None:
+    """Geography stops BLOCKING a match; it never becomes evidence for one."""
+
+    assert _match("USA Trucking Inc", "usa@gmail.com") is None
+    assert _match("North American Transport LLC", "north@gmail.com") is None

@@ -1141,3 +1141,55 @@ def test_the_sentence_that_blocked_load_2458412_is_still_blocked(
     assert _checks(
         PreSendGate().evaluate(draft=_draft(body=silent), email=asked, ctx=grounded_ctx)
     )["change_acknowledgment"] is True
+
+
+@pytest.mark.unit
+def test_a_withheld_load_must_be_named_in_the_reply(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The intake asks for it; until now nothing checked the draft obeyed.
+
+    Live on a Trans 99 statement listing 2494074 and 2543747: the second was denied, the
+    intake said to name it as not covered, and the reply answered the first and never
+    mentioned the second. `_withheld_line` is a prompt instruction, and a prompt instruction
+    is advisory. _check_coverage cannot catch this -- it polices the loads the agent was
+    ASKED to answer, and a withheld load was removed before the skill was chosen.
+    """
+
+    result = PreSendGate().evaluate(
+        draft=_draft(),
+        email=sample_email,
+        ctx=grounded_ctx,
+        withheld_loads=("2543747",),
+    )
+
+    assert not result.allowed
+    assert _checks(result)["withheld_acknowledged"] is False
+    assert any("2543747" in r for r in result.reasons)
+
+
+@pytest.mark.unit
+def test_naming_the_withheld_load_satisfies_the_check(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Presence only. What the reply may SAY about it is the intake's business."""
+
+    body = _GOOD_BODY + " Load 2543747 is not addressed here."
+    result = PreSendGate().evaluate(
+        draft=_draft(body=body),
+        email=sample_email,
+        ctx=grounded_ctx,
+        withheld_loads=("2543747",),
+    )
+
+    assert _checks(result)["withheld_acknowledged"] is True, result.reasons
+
+
+@pytest.mark.unit
+def test_no_withheld_loads_is_not_a_failure(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    result = PreSendGate().evaluate(draft=_draft(), email=sample_email, ctx=grounded_ctx)
+
+    assert _checks(result)["withheld_acknowledged"] is True
+    assert result.allowed, result.reasons

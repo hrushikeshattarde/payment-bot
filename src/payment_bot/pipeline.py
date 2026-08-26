@@ -614,6 +614,7 @@ class PaymentBotPipeline:
             ctx,
             skill.id,
             noa_request_expected=bool(prenoa_loads),
+            withheld_loads=tuple(withheld_named),
         )
 
     # -- gate → approval → send, shared by every draft path -------------------
@@ -626,6 +627,7 @@ class PaymentBotPipeline:
         ctx: ToolContext,
         skill_id: str,
         noa_request_expected: bool = False,
+        withheld_loads: tuple[str, ...] = (),
     ) -> PipelineResult:
         """Run the gate, then approval, then send or leave the draft for review.
 
@@ -644,6 +646,7 @@ class PaymentBotPipeline:
             email=email,
             ctx=ctx,
             expected_load_ids=expected,
+            withheld_loads=withheld_loads,
             noa_request_expected=noa_request_expected,
         )
         if not gate_result.allowed:
@@ -699,6 +702,7 @@ class PaymentBotPipeline:
                 email=email,
                 ctx=ctx,
                 expected_load_ids=expected,
+                withheld_loads=withheld_loads,
             )
             if not regate.allowed:
                 return self._escalate(

@@ -352,6 +352,28 @@ def _age(hours: float) -> str:
     return f"{hours / 24:.0f}d old"
 
 
+#: The verb a Prev/Next button on the tracker invokes. Same handler as the date chips; the
+#: page rides alongside the bucket in the parameters.
+ACTION_QUEUE_PAGE = "queue_page"
+
+
+def _page_button(label: str, bucket: str, offset: int, action_url: str) -> dict[str, Any]:
+    return {
+        "text": label,
+        "onClick": {
+            "action": {
+                # Same add-ons rule as every other button here: `function` is the endpoint.
+                "function": action_url or ACTION_QUEUE_PAGE,
+                "parameters": [
+                    {"key": "action", "value": ACTION_QUEUE_PAGE},
+                    {"key": "bucket", "value": bucket},
+                    {"key": "offset", "value": str(max(offset, 0))},
+                ],
+            }
+        },
+    }
+
+
 def bucket_of(hours_old: float) -> str:
     """Which date bucket an entry of this age belongs to."""
 
@@ -370,17 +392,20 @@ _QUEUE_ROWS = 90
 
 #: Bytes of serialised card the tracker will fill before it stops adding rows.
 #:
-#: Chat rejects a card over roughly 32KB outright, so this is a real limit and not a taste
-#: decision — but it is a limit on SIZE, and the row count was being capped at twelve, which
-#: measured out at 6KB. Five sixths of the allowance went unused and a 96-entry queue showed
-#: twelve rows and "84 more". Measured on the live queue: 60 rows is 26.7KB, 80 rows is
-#: 35.6KB and over the line. 28KB leaves headroom for the response envelope and for a subject
-#: longer than any currently in the queue.
+#: 28KB was set from the documented ~32KB message limit and is wrong: Chat refuses these
+#: updates well below it. Measured against a live 234-entry queue, from a reviewer clicking
+#: each chip in turn — 14.0KB rendered, 28.2KB and 28.3KB both failed with "unable to process
+#: your request". So the true ceiling is somewhere in between and the documented figure is not
+#: it. 16KB sits just above the largest card confirmed to work, with room for a subject longer
+#: than any in the queue.
+#:
+#: The consequence is paging rather than a shorter list: see ``offset``. A budget this size
+#: holds roughly 35 rows, and a single day now routinely runs past a hundred.
 #:
 #: Budget rather than a row count because rows are not a fixed size — a load list and a long
 #: subject can be triple a bare one — so any count safe for the worst case wastes most of the
 #: card in the normal one.
-_CARD_BUDGET = 28_000
+_CARD_BUDGET = 16_000
 
 
 def queue_card(
@@ -392,6 +417,7 @@ def queue_card(
     rows: int = _QUEUE_ROWS,
     budget: int = _CARD_BUDGET,
     bucket: str = "all",
+    offset: int = 0,
     action_url: str = "",
     interactive: bool = False,
 ) -> dict[str, Any]:
@@ -452,6 +478,11 @@ def queue_card(
 
     selected = bucket if bucket in counts else "all"
     shown = aged if selected == "all" else [p for p in aged if bucket_of(p[0]) == selected]
+    # An offset past the end means the queue shrank between the render and the click —
+    # entries approved or expired underneath the reviewer. Reset to the top rather than
+    # clamping to the last row, which would strand them on a page of one.
+    start = 0 if offset >= len(shown) else max(offset, 0)
+    page = shown[start:]
 
     expiring = sum(1 for hours, _ in aged if cutoff_hours and hours >= cutoff_hours - 24)
     widgets: list[dict[str, Any]] = []
@@ -480,7 +511,7 @@ def queue_card(
                     + (
                         ""
                         if selected == "all"
-                        else f"<br>Showing <b>{len(shown)}</b> from "
+                        else f"<br><b>{len(shown)}</b> from "
                         f"{ {k: la for k, la, _ in QUEUE_BUCKETS}[selected].lower()}"
                     )
                 ),
@@ -498,7 +529,7 @@ def queue_card(
             }
         )
 
-    if aged and not shown:
+    if aged and not page:
         widgets.append(
             {
                 "decoratedText": {
@@ -518,7 +549,7 @@ def queue_card(
     spent = overhead
     listed = 0
 
-    for hours, entry in shown[:rows]:
+    for hours, entry in page[:rows]:
         left = cutoff_hours - hours
         when = (
             "EXPIRED"
@@ -551,28 +582,30 @@ def queue_card(
         spent += cost
         listed += 1
 
-    if len(shown) > listed:
-        # Only reachable when a single view genuinely cannot fit, which after the budget
-        # change means the unfiltered card on a large queue. The date chips are the way
-        # through it — each bucket is a fraction of the whole and fits on its own — so the
-        # line points at them rather than just reporting a shortfall.
-        remaining = len(shown) - listed
+    # Where this page sits in the bucket, and the buttons to move through it. A day now runs
+    # to over a hundred drafts and a card holds about thirty-five, so "84 more" was the whole
+    # remainder of the queue reported as a footnote with no way to reach it.
+    if listed and len(shown) > listed:
+        first, last = start + 1, start + listed
         widgets.append(
             {
                 "decoratedText": {
-                    "topLabel": "Not listed",
-                    "text": (
-                        f"{remaining} more, all newer than those above. "
-                        + (
-                            "Tap a date above to see them — each day fits on its own."
-                            if selected == "all"
-                            else "This day is larger than one card."
-                        )
-                    ),
+                    "topLabel": "This page",
+                    "text": f"Showing <b>{first}–{last}</b> of <b>{len(shown)}</b>, oldest first.",
                     "wrapText": True,
                 }
             }
         )
+        if interactive:
+            buttons = []
+            if start > 0:
+                buttons.append(
+                    _page_button("◀ Newer", selected, max(start - listed, 0), action_url)
+                )
+            if last < len(shown):
+                buttons.append(_page_button("Older ▶", selected, last, action_url))
+            if buttons:
+                widgets.append({"buttonList": {"buttons": buttons}})
 
     return {
         "cardId": "approval-queue-tracker",

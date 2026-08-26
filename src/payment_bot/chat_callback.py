@@ -47,6 +47,7 @@ from payment_bot.clients.google_chat import (
     ACTION_APPROVE,
     ACTION_MOVE,
     ACTION_QUEUE_FILTER,
+    ACTION_QUEUE_PAGE,
     ACTION_REJECT,
     approval_card,
     queue_card,
@@ -438,7 +439,7 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
         return _respond_text("Misconfigured: no state bucket. Nothing was done.", addons)
     store = S3ApprovalStore(bucket)
 
-    if action == ACTION_QUEUE_FILTER:
+    if action in (ACTION_QUEUE_FILTER, ACTION_QUEUE_PAGE):
         # A date chip on the tracker. Nothing is claimed and nothing is sent — the card is
         # redrawn filtered to one day. Still behind the roster check: one pinned message
         # serves the whole space, so narrowing it changes what everyone sees.
@@ -456,7 +457,12 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
         # dependency CloudFormation refuses outright (tried, rejected, 2026-08-24). The host
         # header is the same value, already parsed above for audience verification.
         own_url = f"https://{host}/" if host else settings.chat_action_url
-        return _queue_response(store, settings, chosen, addons, action_url=own_url)
+        # A date chip resets to the top of its bucket; a page button carries where to resume.
+        page, _ = _click_param(chat_event, "offset")
+        offset = int(page) if page.isdigit() else 0
+        return _queue_response(
+            store, settings, chosen, addons, action_url=own_url, offset=offset
+        )
 
     if not entry_id:
         return _respond_text("That button carried no entry — repost the card.", addons)
@@ -759,6 +765,7 @@ def _queue_response(
     addons: bool,
     *,
     action_url: str = "",
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Redraw the tracker filtered to one date bucket.
 
@@ -782,6 +789,7 @@ def _queue_response(
         # itself. queue_card now drops the chips entirely rather than draw dead ones.
         action_url=action_url or settings.chat_action_url,
         interactive=True,
+        offset=offset,
     )
     return _replace_card(card, addons)
 

@@ -112,16 +112,17 @@ def test_an_overdue_entry_reads_as_expired_not_as_negative_hours() -> None:
 
 
 @pytest.mark.unit
-def test_a_long_queue_is_capped_and_says_how_many_it_left_out() -> None:
+def test_a_capped_card_says_where_the_page_sits_in_the_whole() -> None:
     """Chat rejects an oversized card, so the cap is real — but it must never read as a
-    shorter queue than there is. The count line is always the true total."""
+    shorter queue than there is. The count line is always the true total, and the page line
+    says which slice of it this is."""
 
     entries = [_entry(f"e{i}", hours_old=50 - i, to=f"a{i}@c.com") for i in range(30)]
     card = queue_card(entries, now=NOW, expiry_days=3, rows=12)
 
     assert "<b>30</b> drafted replies" in _texts(card)[0]
-    assert "18 more" in _texts(card)[-1]
-    # lead + 12 rows + the "not listed" line
+    assert "Showing <b>1–12</b> of <b>30</b>" in _texts(card)[-1]
+    # lead + 12 rows + the page line
     assert len(_texts(card)) == 14
 
 
@@ -294,10 +295,19 @@ def _settings():
 
 
 def _buttons(card: dict) -> list[dict]:
+    """The date chips — the FIRST button list on the card."""
+
     for w in card["card"]["sections"][0]["widgets"]:
         if "buttonList" in w:
             return w["buttonList"]["buttons"]
     return []
+
+
+def _page_buttons(card: dict) -> list[dict]:
+    """The Newer/Older buttons — the LAST button list, below the rows."""
+
+    lists = [w for w in card["card"]["sections"][0]["widgets"] if "buttonList" in w]
+    return lists[-1]["buttonList"]["buttons"] if len(lists) > 1 else []
 
 
 @pytest.mark.unit
@@ -329,7 +339,7 @@ def test_selecting_a_day_shows_only_that_day_and_says_so() -> None:
     assert "today@c.com" not in body
     # The true total still leads, so a filtered card can never read as the whole queue.
     assert "<b>2</b> drafted replies" in _texts(card)[0]
-    assert "Showing <b>1</b> from yesterday" in _texts(card)[0]
+    assert "<b>1</b> from yesterday" in _texts(card)[0]
 
 
 @pytest.mark.unit
@@ -410,9 +420,17 @@ def test_a_chip_click_reads_the_queue_fresh_and_redraws_in_place() -> None:
     from payment_bot.chat_callback import _queue_response
     from payment_bot.config import Settings
 
+    # _queue_response reads the real clock, so these ages must be relative to it — anchoring
+    # them to NOW made the test pass on the day it was written and silently mis-bucket after.
+    real_now = datetime.now(UTC)
     store = InMemoryApprovalStore()
-    store.put_pending(_entry("fresh", hours_old=1, to="fresh@c.com"))
-    store.put_pending(_entry("old", hours_old=60, to="old@c.com"))
+    for entry_id, hours, to in (("fresh", 1, "fresh@c.com"), ("old", 60, "old@c.com")):
+        store.put_pending(
+            replace(
+                _entry(entry_id, hours_old=0, to=to),
+                created_at=(real_now - timedelta(hours=hours)).isoformat(),
+            )
+        )
 
     body = json.loads(_queue_response(store, Settings(_env_file=None), "older", False)["body"])
 
@@ -710,8 +728,7 @@ def test_rows_stop_at_the_byte_budget_not_at_a_row_count() -> None:
     assert len(json.dumps(card)) < 16_000, "budget must bound the card"
     listed = len([t for t in _labels(card) if "old" in t])
     assert 0 < listed < 90
-    tail = _texts(card)[-1]
-    assert f"{90 - listed} more" in tail
+    assert f"of <b>90</b>" in _texts(card)[-1]
 
 
 @pytest.mark.unit
@@ -726,18 +743,79 @@ def test_one_row_is_always_listed_even_if_it_alone_exceeds_the_budget() -> None:
 
 
 @pytest.mark.unit
-def test_the_unfiltered_tail_points_at_the_date_chips() -> None:
-    """When one view genuinely cannot fit, the chips are the way through it — each bucket is
-    a fraction of the whole. Reporting a shortfall without saying that leaves the reviewer
-    with no next step."""
+def test_a_bucket_larger_than_one_card_is_paged_not_truncated() -> None:
+    """A day now runs past a hundred drafts and a card holds about thirty-five, so the old
+    "84 more, all newer than those above" reported the bulk of the queue as a footnote with
+    no way to reach it."""
 
-    entries = [_entry(f"e{i}", hours_old=70 - i * 0.5, to=f"a{i}@carrier.example.com") for i in range(120)]
+    entries = [_entry(f"e{i}", hours_old=70 - i * 0.2, to=f"a{i}@carrier.example.com") for i in range(120)]
 
-    unfiltered = queue_card(entries, now=NOW, expiry_days=3)
-    assert "Tap a date above" in _texts(unfiltered)[-1]
+    first = queue_card(entries, now=NOW, expiry_days=3, action_url="https://cb/", interactive=True)
+    page_line = next(t for t in _texts(first) if "Showing" in t)
+    assert "of <b>120</b>" in page_line
+    assert "Showing <b>1–" in page_line
 
-    # A filtered view that still cannot fit says so plainly instead of pointing at the
-    # chips the reviewer has already used. Budget forced small so the case is reachable.
-    narrowed = queue_card(entries, now=NOW, expiry_days=3, bucket="older", budget=4_000)
-    assert "larger than one card" in _texts(narrowed)[-1]
-    assert "Tap a date above" not in _texts(narrowed)[-1]
+    labels = [b["text"] for b in _page_buttons(first)]
+    assert "Older ▶" in labels
+    assert "◀ Newer" not in labels, "no Newer on the first page"
+
+    second = queue_card(
+        entries, now=NOW, expiry_days=3, offset=30, action_url="https://cb/", interactive=True
+    )
+    assert "Showing <b>31–" in next(t for t in _texts(second) if "Showing" in t)
+    assert "◀ Newer" in [b["text"] for b in _page_buttons(second)]
+
+
+@pytest.mark.unit
+def test_every_page_stays_under_the_size_chat_actually_accepts() -> None:
+    """The measurement that set the budget: on a live 234-entry queue a reviewer clicked each
+    chip in turn — 14.0KB rendered, 28.2KB and 28.3KB both failed with "unable to process
+    your request". 28KB came from the documented ~32KB message limit, which is not the real
+    ceiling for these updates."""
+
+    entries = [
+        replace(
+            _entry(f"e{i}", hours_old=70 - i * 0.2, to=f"someone.long{i}@carrier.example.com"),
+            subject="Re: Payment Status - A CARRIER NAME INC MC#1234567 INVDHV0458 Load#2506698",
+        )
+        for i in range(240)
+    ]
+
+    for offset in (0, 35, 70, 200):
+        card = queue_card(
+            entries, now=NOW, expiry_days=3, offset=offset,
+            action_url="https://cb/", interactive=True,
+        )
+        assert len(json.dumps(card)) < 20_000, f"offset {offset} too large"
+
+
+@pytest.mark.unit
+def test_an_offset_past_the_end_returns_to_the_top() -> None:
+    """The queue moves under the reviewer — entries get approved and expired between the
+    render and the click. Landing them on a stranded page of one is worse than starting over.
+    """
+
+    entries = [_entry(f"e{i}", hours_old=60 - i, to=f"a{i}@c.com") for i in range(5)]
+    card = queue_card(entries, now=NOW, expiry_days=3, offset=500)
+
+    rows = [t for t in _labels(card) if "old" in t]
+    assert len(rows) == 5
+    assert not [t for t in _texts(card) if "Showing" in t], "all five fit; no page line"
+
+
+@pytest.mark.unit
+def test_page_buttons_carry_the_bucket_and_the_offset() -> None:
+    """Paging inside a filtered day must not silently drop back to the unfiltered queue."""
+
+    entries = [_entry(f"e{i}", hours_old=30 + i * 0.1, to=f"a{i}@carrier.example.com") for i in range(80)]
+    card = queue_card(
+        entries, now=NOW, expiry_days=3, bucket="yesterday",
+        action_url="https://cb/", interactive=True,
+    )
+    older = next(b for b in _page_buttons(card) if b["text"] == "Older ▶")
+    params = {p["key"]: p["value"] for p in older["onClick"]["action"]["parameters"]}
+
+    assert params["action"] == "queue_page"
+    assert params["bucket"] == "yesterday"
+    assert int(params["offset"]) > 0
+    assert older["onClick"]["action"]["function"] == "https://cb/"

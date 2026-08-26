@@ -17,6 +17,11 @@ authors = [{ name = "Circle Delivers — Payments" }]
 dependencies = [
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
+    # ZoneInfo reads the SYSTEM tz database, and Windows has none — every zone raised
+    # ZoneInfoNotFoundError locally and fell back to the UTC system date, silently, while
+    # Amazon Linux has tzdata and behaved correctly. A dependency that only shows up as a
+    # platform difference is worse than one that costs 500KB, so it is pinned here.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

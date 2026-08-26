@@ -96,6 +96,21 @@ class Settings(BaseSettings):
     rollout_phase: RolloutPhase = RolloutPhase.APPROVE
     log_level: str = "INFO"
 
+    #: IANA zone the bot reckons "today" in. Every date in this domain is Eastern: pay runs
+    #: are Mon/Thu Eastern, a settlement date on a load is Eastern, and a carrier asking
+    #: "when do I get paid" means their calendar, not UTC.
+    #:
+    #: It existed as a CloudFormation parameter and reached nothing — no env var, no field,
+    #: no reader. The pipeline took `date.today()`, which in Lambda is UTC, so from 20:00
+    #: Eastern the bot believed it was already tomorrow. Four gate checks reason about today:
+    #: tense consistency decides whether a date is past or upcoming, and
+    #: compute_scheduled_pay_date walks the Mon/Thu rule forward from it. At the :00/:15/:30/:45
+    #: cadence roughly a sixth of runs land in that window.
+    #:
+    #: An unknown or unset zone falls back to the system date rather than failing: a bad zone
+    #: string should not take the inbox down.
+    timezone: str = "America/New_York"
+
     # --- Mailbox -------------------------------------------------------------
     mailbox: str = "paystatus@circledelivers.com"
 

@@ -20,7 +20,8 @@ Anything unexpected escalates rather than sends: the system fails closed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from enum import StrEnum
 
 from payment_bot.agent import (
@@ -83,6 +84,26 @@ _BULK_PORTAL_SKILL_ID = "bulk_portal"
 #: Set to the same 50 that bounds `agent_max_iterations` in configuration, so a derived
 #: budget can never exceed what an operator could have set by hand.
 ITERATION_CEILING = 50
+
+
+def _today_in(tz_name: str) -> date:
+    """Today's date in ``tz_name``, falling back to the system date.
+
+    `date.today()` is UTC in Lambda, and every date this bot reasons about is Eastern. From
+    20:00 Eastern that made "today" tomorrow: `_check_tense_consistency` would read a payment
+    dated today as already past, and `compute_scheduled_pay_date` would walk the Mon/Thu rule
+    from the wrong day. Roughly a sixth of runs at the current cadence.
+
+    Falls back rather than raising. A misspelt zone is a configuration slip, and taking the
+    inbox down over one would be a worse failure than a date that is off by hours — which is
+    exactly what the fallback restores.
+    """
+
+    try:
+        return datetime.now(ZoneInfo(tz_name)).date()
+    except Exception:  # unknown zone, or no tzdata on the platform
+        _log.warning("timezone_unusable", extra={"timezone": tz_name})
+        return date.today()
 
 
 def _group_by_reason(entries: list[tuple[str, str]]) -> str:
@@ -178,7 +199,7 @@ class PaymentBotPipeline:
         # render a date under one day and judge its tense under the next. Injectable because
         # fixture data has fixed dates: a test asserting "Thursday, August 6, 2026" is only
         # meaningful against a pinned today.
-        self._today = today or date.today()
+        self._today = today or _today_in((settings or get_settings()).timezone)
         # Optional and defaulted so every existing caller — the demo runner, the local
         # runner, the integration tests — keeps working without a CargoTel client. Unset,
         # 6-digit loads behave exactly as they did before this path existed.

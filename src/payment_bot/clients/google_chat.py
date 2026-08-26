@@ -352,6 +352,71 @@ def _age(hours: float) -> str:
     return f"{hours / 24:.0f}d old"
 
 
+#: What the bot knows about whether a queued reply has been dealt with, and how each reads
+#: on the card. The colour carries the same meaning as the words, for scanning rather than
+#: reading — Chat's card HTML supports ``<font color>`` and little else.
+#:
+#: ``handled`` is the one worth having. A colleague replying straight from Gmail leaves no
+#: trace in the approval store, so the row sat on the board looking outstanding and expired
+#: three days later as though nobody had touched it — and anyone working the queue would chase
+#: a carrier who had already been answered. ``drafting`` is deliberately NOT that: a draft in
+#: the thread means somebody started, not that the carrier heard back.
+QUEUE_STATES: dict[str, tuple[str, str]] = {
+    "open": ("UNANSWERED", "#A32D2D"),
+    "handled": ("ANSWERED IN GMAIL", "#854F0B"),
+    "drafting": ("DRAFT IN GMAIL", "#185FA5"),
+}
+
+
+def _state_label(state: str) -> str:
+    """The coloured tag for a row, or ``""`` for a state with nothing to say."""
+
+    text, colour = QUEUE_STATES.get(state, QUEUE_STATES["open"])
+    return f'<font color="{colour}"><b>{text}</b></font>'
+
+
+def queue_page(
+    entries: list[PendingApproval],
+    *,
+    now: datetime,
+    bucket: str = "all",
+    offset: int = 0,
+) -> list[PendingApproval]:
+    """The entries a card would list, in order, before the size budget trims them.
+
+    Shared with the caller so it can establish per-row state for the rows that will actually
+    be shown, rather than for the whole queue: the state check costs a Gmail call each, and
+    the board is two hundred deep against a thirty-row card.
+
+    A superset, not the exact page — the budget decides the final cut, and duplicating that
+    walk here to save a few calls would be two implementations of one rule.
+    """
+
+    aged = sorted(
+        (((now - _created(entry, now)).total_seconds() / 3600.0, entry) for entry in entries),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    shown = aged if bucket not in {k for k, _, _ in QUEUE_BUCKETS} or bucket == "all" else [
+        pair for pair in aged if bucket_of(pair[0]) == bucket
+    ]
+    start = 0 if offset >= len(shown) else max(offset, 0)
+    return [entry for _, entry in shown[start:]]
+
+
+def _created(entry: PendingApproval, fallback: datetime) -> datetime:
+    """When the entry was queued. An unparseable stamp reads as "just now".
+
+    Never as "ancient": a bad timestamp must not hide the row, and must not fabricate an
+    expiry that puts it at the top of a queue sorted by urgency.
+    """
+
+    try:
+        return datetime.fromisoformat(entry.created_at)
+    except ValueError:
+        return fallback
+
+
 #: The verb a Prev/Next button on the tracker invokes. Same handler as the date chips; the
 #: page rides alongside the bucket in the parameters.
 ACTION_QUEUE_PAGE = "queue_page"
@@ -452,6 +517,7 @@ def queue_cards(
     offset: int = 0,
     action_url: str = "",
     interactive: bool = False,
+    states: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """The standing tracker: every drafted reply still waiting for a click.
 
@@ -485,13 +551,7 @@ def queue_cards(
     cutoff_hours = max(expiry_days, 0) * 24
     aged: list[tuple[float, PendingApproval]] = []
     for entry in entries:
-        try:
-            created = datetime.fromisoformat(entry.created_at)
-        except ValueError:
-            # An unparseable stamp must not hide the entry; treat it as brand new, which
-            # sorts it last and never fabricates urgency.
-            created = now
-        aged.append(((now - created).total_seconds() / 3600.0, entry))
+        aged.append(((now - _created(entry, now)).total_seconds() / 3600.0, entry))
     aged.sort(key=lambda pair: pair[0], reverse=True)
 
     # Chips without an endpoint are dead controls, and they fail in the worst way: the
@@ -595,11 +655,12 @@ def queue_cards(
         who = _esc(_trim(entry.to, 60))
         primary = f'<a href="{card_link}">{who}</a>' if card_link else who
         secondary = f' · <a href="{_gmail_link(entry.message_id)}">email</a>'
+        tag = _state_label((states or {}).get(entry.entry_id, "open"))
         row = {
             "decoratedText": {
                 "topLabel": f"{_age(hours)} · {when}",
                 "text": (
-                    f"{primary} · {_esc(loads)}{secondary}"
+                    f"{tag} {primary} · {_esc(loads)}{secondary}"
                     f"<br>{_esc(_trim(entry.subject or '(no subject)', 90))}"
                 ),
                 "wrapText": True,

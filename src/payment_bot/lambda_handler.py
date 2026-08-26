@@ -47,6 +47,7 @@ from payment_bot.clients.google_chat import (
     approval_card,
     build_google_chat_client,
     queue_cards,
+    queue_page,
 )
 from payment_bot.config import Settings, get_settings
 from payment_bot.local_runner import _Clients, process_inbox
@@ -390,6 +391,86 @@ def _sweep_approvals(
             )
 
 
+#: How many of the board's rows get their Gmail thread checked per refresh.
+#:
+#: One API call each, and the queue runs two hundred deep against a thirty-row card, so
+#: checking all of them would spend most of an invocation establishing state for rows nobody
+#: is about to see. 45 covers the visible page with room for the size budget to trim.
+_STATE_CHECK_ROWS = 45
+
+
+def _queue_states(
+    store: S3ApprovalStore, gmail: Any, entries: list[Any], settings: Settings
+) -> dict[str, str]:
+    """Per-row state for the rows about to be shown, retiring the ones already answered.
+
+    A colleague replying straight from Gmail leaves no trace in the approval store, so the row
+    stayed on the board looking outstanding and expired three days later as though nobody had
+    touched it — while anyone working the queue would chase a carrier who had already been
+    answered. This closes that: an answered thread gets a terminal record here, so the row
+    leaves the queue and stops counting toward the total.
+
+    Only a real reply retires a row. A draft in the thread means a colleague started and may
+    not finish, so it is labelled and kept — retiring it is how a carrier ends up with neither
+    a reply nor a record that one was owed.
+
+    Failure is always ``open``: an unreadable thread must never retire anything, and a label
+    is not worth failing a mail run over.
+    """
+
+    states: dict[str, str] = {}
+    checker = getattr(gmail, "thread_state", None)
+    if checker is None:
+        return states
+
+    for entry in entries[:_STATE_CHECK_ROWS]:
+        if not entry.thread_id:
+            continue
+        try:
+            state = str(checker(entry.thread_id))
+        except Exception as exc:
+            _log.info(
+                "queue_state_unavailable",
+                extra={"entry_id": entry.entry_id, "error": str(exc)},
+            )
+            continue
+        states[entry.entry_id] = state
+        if state != "handled":
+            continue
+        # Retire it. Recorded with its own status rather than reusing "sent": nothing was
+        # sent from here, and an audit that says otherwise is worse than none.
+        try:
+            store.put_result(
+                entry.entry_id,
+                {
+                    "status": "answered_elsewhere",
+                    "at": datetime.now(UTC).isoformat(),
+                    "by": "gmail-thread",
+                    "thread_id": entry.thread_id,
+                },
+            )
+            _log.info(
+                "approval_answered_elsewhere",
+                extra={
+                    "entry_id": entry.entry_id,
+                    "thread_id": entry.thread_id,
+                    "to": entry.to,
+                },
+            )
+        except Exception as exc:
+            # Swallowed so a storage blip cannot fail a completed mail run — but logged with
+            # the error, because the visible symptom is only that a handled row keeps sitting
+            # on the board, which reads as the feature not working at all.
+            _log.warning(
+                "approval_answered_elsewhere_failed",
+                extra={
+                    "entry_id": entry.entry_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+    return states
+
+
 #: Failed edits tolerated on the tracker before it is abandoned and reposted.
 #:
 #: Four is an hour at the current cadence. High enough that a Chat outage or a transient 503
@@ -401,7 +482,7 @@ _TRACKER_GIVE_UP_AFTER = 4
 
 
 def _refresh_queue_tracker(
-    store: S3ApprovalStore, slack: SlackClient, settings: Settings
+    store: S3ApprovalStore, slack: SlackClient, settings: Settings, gmail: Any = None
 ) -> None:
     """Rewrite the standing "drafts awaiting approval" card. Bookkeeping; never fatal.
 
@@ -420,6 +501,19 @@ def _refresh_queue_tracker(
         return
     try:
         entries = store.live_entries()
+        # Establish state for the rows that will actually be listed, and retire any whose
+        # thread a colleague has already answered. Done before the render so a retired row
+        # never appears as outstanding, and so the counts on the chips are honest.
+        states = _queue_states(
+            store,
+            gmail,
+            queue_page(entries, now=datetime.now(UTC)),
+            settings,
+        )
+        if states:
+            retired = {eid for eid, st in states.items() if st == "handled"}
+            if retired:
+                entries = [e for e in entries if e.entry_id not in retired]
         cards = queue_cards(
             entries,
             now=datetime.now(UTC),
@@ -430,6 +524,7 @@ def _refresh_queue_tracker(
             bucket="all",
             action_url=settings.chat_action_url,
             interactive=chat.interactive,
+            states=states,
         )
         _log.info(
             "chat_tracker_rendered",
@@ -540,7 +635,7 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
             _sweep_approvals(approval_store, clients.slack, settings)
             # After the sweep, so the card shows this run's expiries, and after the mail run,
             # so it shows the drafts it just queued.
-            _refresh_queue_tracker(approval_store, clients.slack, settings)
+            _refresh_queue_tracker(approval_store, clients.slack, settings, clients.gmail)
     finally:
         # Saved even when the run raises or is cut off mid-batch: blocks recorded before
         # the interruption must count, or a timeout-looping run never spends its budget.

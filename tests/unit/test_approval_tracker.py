@@ -911,3 +911,135 @@ def test_the_default_budget_is_what_a_click_response_survives() -> None:
                 action_url="https://cb/", interactive=True,
             )
             assert len(json.dumps(cards)) <= 15_000, f"{bucket}@{offset} would be refused"
+
+
+# --- answered / unanswered labels -------------------------------------------
+#
+# A colleague replying straight from Gmail leaves no trace in the approval store. The row sat
+# on the board looking outstanding, expired at three days as though nobody had touched it, and
+# meanwhile anyone working the queue would chase a carrier who had already been answered.
+
+
+@pytest.mark.unit
+def test_every_row_carries_a_coloured_state_tag() -> None:
+    from payment_bot.clients.google_chat import QUEUE_STATES
+
+    entries = [
+        _entry("open", hours_old=10, to="open@c.com"),
+        _entry("done", hours_old=20, to="done@c.com"),
+        _entry("draft", hours_old=30, to="draft@c.com"),
+    ]
+    cards = queue_cards(
+        entries, now=NOW, expiry_days=3,
+        states={"done": "handled", "draft": "drafting"},
+    )
+    body = "\n".join(_texts(cards))
+
+    for state, (text, colour) in QUEUE_STATES.items():
+        assert text in body, state
+        assert colour in body, state
+    # The colour is inside a font tag Chat actually renders, not loose text.
+    assert '<font color="#A32D2D"><b>UNANSWERED</b></font>' in body
+
+
+@pytest.mark.unit
+def test_a_row_with_no_known_state_reads_as_unanswered() -> None:
+    """Failing open is the only safe default: a thread we could not read must look like work
+    still owed, never like work already done."""
+
+    cards = queue_cards([_entry("e", hours_old=5, to="a@c.com")], now=NOW, expiry_days=3)
+
+    assert "UNANSWERED" in _texts(cards)[1]
+
+
+@pytest.mark.unit
+def test_only_the_rows_about_to_be_shown_are_checked() -> None:
+    """One Gmail call per row against a two-hundred-deep queue and a thirty-row card: checking
+    all of them would spend the invocation on rows nobody is about to see."""
+
+    from payment_bot.clients.google_chat import queue_page
+
+    entries = [_entry(f"e{i}", hours_old=70 - i * 0.2, to=f"a{i}@c.com") for i in range(200)]
+    page = queue_page(entries, now=NOW)
+
+    assert [e.entry_id for e in page[:3]] == ["e0", "e1", "e2"], "oldest first"
+    assert len(page) == 200, "queue_page orders and filters; the budget does the trimming"
+
+    only_today = queue_page(entries, now=NOW, bucket="today")
+    assert all(e.entry_id not in {"e0", "e1"} for e in only_today)
+
+    resumed = queue_page(entries, now=NOW, offset=50)
+    assert resumed[0].entry_id == "e50"
+
+
+@pytest.mark.unit
+def test_an_answered_thread_is_retired_and_an_open_one_is_not() -> None:
+    from payment_bot.lambda_handler import _queue_states
+
+    class Gmail:
+        def __init__(self) -> None:
+            self.asked: list[str] = []
+
+        def thread_state(self, thread_id: str) -> str:
+            self.asked.append(thread_id)
+            return {"t-done": "handled", "t-draft": "drafting"}.get(thread_id, "open")
+
+    store = InMemoryApprovalStore()
+    entries = []
+    for entry_id, thread in (("open", "t-open"), ("done", "t-done"), ("draft", "t-draft")):
+        entry = replace(_entry(entry_id, hours_old=10, to=f"{entry_id}@c.com"), thread_id=thread)
+        store.put_pending(entry)
+        entries.append(entry)
+
+    gmail = Gmail()
+    states = _queue_states(store, gmail, entries, _settings())
+
+    assert states == {"open": "open", "done": "handled", "draft": "drafting"}
+    assert gmail.asked == ["t-open", "t-done", "t-draft"]
+
+    # Only the answered one leaves the queue.
+    assert store.result("done") == {
+        "status": "answered_elsewhere",
+        "at": store.result("done")["at"],
+        "by": "gmail-thread",
+        "thread_id": "t-done",
+    }
+    assert store.result("open") is None
+    assert store.result("draft") is None, "a draft is not an answer"
+    assert {e.entry_id for e in store.live_entries()} == {"open", "draft"}
+
+
+@pytest.mark.unit
+def test_a_gmail_failure_never_retires_a_row() -> None:
+    """The expensive mistake would be recording a carrier as answered because a read failed."""
+
+    from payment_bot.lambda_handler import _queue_states
+
+    class Broken:
+        def thread_state(self, thread_id: str) -> str:
+            raise RuntimeError("gmail is unwell")
+
+    store = InMemoryApprovalStore()
+    entry = replace(_entry("e", hours_old=10, to="a@c.com"), thread_id="t")
+    store.put_pending(entry)
+
+    states = _queue_states(store, Broken(), [entry], _settings())
+
+    assert states == {}
+    assert store.result("e") is None
+    assert [e.entry_id for e in store.live_entries()] == ["e"]
+
+
+@pytest.mark.unit
+def test_an_entry_with_no_thread_id_is_left_alone() -> None:
+    from payment_bot.lambda_handler import _queue_states
+
+    class Gmail:
+        def thread_state(self, thread_id: str) -> str:
+            raise AssertionError("must not be asked without a thread id")
+
+    store = InMemoryApprovalStore()
+    entry = replace(_entry("e", hours_old=10, to="a@c.com"), thread_id="")
+    store.put_pending(entry)
+
+    assert _queue_states(store, Gmail(), [entry], _settings()) == {}

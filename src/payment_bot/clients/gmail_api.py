@@ -370,6 +370,45 @@ class GmailApiClient:
             "Accept": "application/json",
         }
 
+    def thread_state(self, thread_id: str) -> str:
+        """``"handled"``, ``"drafting"`` or ``"open"`` for one thread.
+
+        The tracker's labels come from here. ``fetch_new`` already collapses all three into
+        "skip it" via :meth:`_thread_reply_target`, which is right for intake and too coarse
+        for a board: the reason a row can be ignored is exactly what a reviewer needs to see.
+
+        **The two are kept apart because only one of them means the carrier heard back.** A
+        reply from our side is an answer and retires the row. A draft sitting in the thread
+        means a colleague started and may never finish, so that row stays in the queue — and
+        retiring it would be how a carrier ends up with no reply at all and no record that one
+        was owed.
+
+        Ownership is decided by :meth:`_is_ours`, so a colleague on our domain and a
+        configured group member both count, and the group address itself does not — that is a
+        carrier arriving through the group, not us writing out.
+
+        Any read failure answers ``"open"``: an unreadable thread must never retire a row.
+        """
+
+        try:
+            thread = self._get(
+                f"/users/{self._quoted_user()}/threads/{urllib.parse.quote(thread_id)}",
+                {"format": "metadata", "metadataHeaders": "From"},
+            )
+        except Exception as exc:
+            _log.info("gmail_thread_state_unavailable", extra={"thread_id": thread_id, "error": str(exc)})
+            return "open"
+
+        messages = [m for m in (thread.get("messages") or []) if isinstance(m, dict)]
+        drafting = False
+        for message in messages:
+            if "DRAFT" in (message.get("labelIds") or []):
+                drafting = True
+                continue
+            if self._is_ours(_header_value(message, "From")):
+                return "handled"
+        return "drafting" if drafting else "open"
+
     def _thread_reply_target(self, thread_id: str) -> str | None:
         """The id of the message to answer in this thread, or ``None`` if none needs it.
 

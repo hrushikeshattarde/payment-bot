@@ -21,8 +21,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from zoneinfo import ZoneInfo
 from enum import StrEnum
+from zoneinfo import ZoneInfo
 
 from payment_bot.agent import (
     AgentLoop,

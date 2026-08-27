@@ -162,3 +162,28 @@ def test_a_place_name_alone_still_authorises_nobody() -> None:
 
     assert _match("USA Trucking Inc", "usa@gmail.com") is None
     assert _match("North American Transport LLC", "north@gmail.com") is None
+
+
+def test_a_plus_tagged_platform_sender_matches_its_untagged_entry() -> None:
+    """Dorado Finance reaches us as dorado-finance+<token>@prod.peruseml.com.
+
+    The identity is the LOCAL PART and the tag is per-message, so an entry carrying a tag
+    would authorise one email and never match again. Without stripping, the only workable
+    entry was the bare prod.peruseml.com -- a platform already rostered bare for Single Point
+    Capital, which would then have vouched for a second factor.
+    """
+
+    from payment_bot.tools.shared import _roster_entry_matches as matches
+
+    entry = "dorado-finance@prod.peruseml.com"
+    for sender in (
+        "dorado-finance+6a9078fa-abc@prod.peruseml.com",
+        "dorado-finance@prod.peruseml.com",
+    ):
+        assert matches(entry, sender, sender.split("@")[-1]), sender
+
+    # A different tenant on the same platform, and the same local part elsewhere, both refused.
+    assert not matches(entry, "single-point+x@prod.peruseml.com", "prod.peruseml.com")
+    assert not matches(entry, "dorado-finance@evil.com", "evil.com")
+    # Stripping must not soften the free-mail refusal.
+    assert not matches("gmail.com", "a+b@gmail.com", "gmail.com")

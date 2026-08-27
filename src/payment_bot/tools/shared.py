@@ -799,7 +799,19 @@ def _roster_entry_matches(entry: object, sender: str, domain: str) -> bool:
     if value.startswith("@"):  # "@acmefactoring.com" — a domain, written with the at
         value = value[1:]
     elif "@" in value:  # "billing@gmail.com" — a whole address
-        return value == sender
+        # Plus-addressing is stripped before comparing, so ONE entry covers a platform that
+        # tags every message. Dorado Finance reaches us as
+        # dorado-finance+6a9078fa-…@prod.peruseml.com: the identity is in the local part, the
+        # tag is per-message, and the domain is a platform already rostered bare for Single
+        # Point Capital. Without this the only workable entry was that bare domain, widening
+        # one platform to vouch for a second factor; with it, "dorado-finance@prod.peruseml.com"
+        # names exactly one tenant. Same granularity the subdomain form gives on FactorGenie.
+        #
+        # The tag is discarded rather than matched: it is a token, so an entry carrying one
+        # would authorise a single email and never match again.
+        local, _, sender_domain = sender.partition("@")
+        untagged = f"{local.split('+', 1)[0]}@{sender_domain}" if local else sender
+        return value in (sender, untagged)
     return value not in _FREE_MAIL_DOMAINS and value == domain
 
 

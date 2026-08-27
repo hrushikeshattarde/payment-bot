@@ -32,6 +32,8 @@
   "CargoTelReplies": "true",
   "CargoTelCookieBucket": "circle-bot-cookies",
   "CargoTelCookieKey": "rubicon/cargotel.json",
+  "CargoTelReferralContacts": "[]",
+  "_CargoTelReferralContacts": "JSON list of \"Name <address>\" entries. Non-empty: every 6-digit-only email gets a deterministic hand-off reply naming these people, Cc'ing them — no scrape, no cross-checks, no model call. Wins over CargoTelReplies for 6-digit-only mail; mixed emails keep existing behaviour. Empty = today's behaviour (and the rollback).",
   "_CargoTelCookieBucket": "The login bot's bucket, not ours. The stack grants read on this one key only. If it is in another AWS account, that account must also allow this role — see README.md.",
 
   "AllowFactoring": "true",

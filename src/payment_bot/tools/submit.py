@@ -90,6 +90,11 @@ class SubmitDraftOutput(BaseModel):
     to: str
     load_ids: list[str]
     citations: list[Citation]
+    #: Additional Cc recipients for THIS draft, on top of the configured ``reply_cc``.
+    #: Deliberately absent from :class:`SubmitDraftInput`: the agent never chooses
+    #: recipients — only code-authored paths (the CargoTel referral) populate it, and
+    #: the values come from configuration.
+    extra_cc: list[str] = Field(default_factory=list)
 
 
 class SubmitDraft(Tool):

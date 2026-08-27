@@ -219,6 +219,15 @@ Parameters:
     Description: >
       §3.1 P9 recommends enabling in Stage 1: it is off by default, and parallel running is
       the cheapest way to learn the 6-digit path's real failure rate before humans rely on it.
+  CargoTelReferralContacts:
+    Type: String
+    Default: "[]"
+    Description: >
+      JSON list of "Name <address>" entries. Non-empty, every 6-digit-only email gets a
+      deterministic hand-off reply naming these people, with them Cc'd — no CargoTel
+      scrape, no cross-checks, no model call; the reply discloses nothing about the load.
+      Takes precedence over CargoTelReplies for 6-digit-only mail. Empty keeps today's
+      behaviour, which is also the rollback.
   SensitiveBankReplies:
     Type: String
     Default: "true"
@@ -518,6 +527,7 @@ Resources:
           PAYBOT_TP_USERNAME: !Ref TransportProUsername
 
           PAYBOT_CARGOTEL_REPLIES: !Ref CargoTelReplies
+          PAYBOT_CARGOTEL_REFERRAL_CONTACTS: !Ref CargoTelReferralContacts
           PAYBOT_CARGOTEL_COOKIE_BUCKET: !Ref CargoTelCookieBucket
           PAYBOT_CARGOTEL_COOKIE_KEY: !Ref CargoTelCookieKey
 

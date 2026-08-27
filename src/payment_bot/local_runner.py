@@ -170,7 +170,10 @@ def _save_draft(
         return None
 
     try:
-        return gmail.create_draft(email, result.draft.reply_body, settings.reply_cc)
+        # Configured Cc plus the draft's own (the CargoTel referral names its contacts
+        # and copies them; "they are copied on this email" must be true when it sends).
+        cc = settings.reply_cc + tuple(result.draft.extra_cc)
+        return gmail.create_draft(email, result.draft.reply_body, cc)
     except Exception as exc:
         # A failed draft save must not look like a failed run — and must never kill the
         # emails still queued behind it: the draft text is already in the console report
@@ -205,7 +208,7 @@ def _store_pending_approval(
         message_id=email.message_id,
         thread_id=email.thread_id,
         to=email.from_email,
-        cc=settings.reply_cc,
+        cc=settings.reply_cc + tuple(result.draft.extra_cc),
         reply_to=settings.reply_to,
         subject=reply_subject(email.subject),
         body=result.draft.reply_body,

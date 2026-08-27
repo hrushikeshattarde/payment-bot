@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from email.utils import parseaddr
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
@@ -76,6 +77,26 @@ _log = get_logger("pipeline")
 #: no model runs — but `_is_auto_sendable` keys off the skill id, and this must never match
 #: PAYMENT_STATUS_SKILL.id, or a bulk reply could auto-send in Phase 2.
 _BULK_PORTAL_SKILL_ID = "bulk_portal"
+
+_CARGOTEL_REFERRAL_SKILL_ID = "cargotel_referral"
+
+#: The CargoTel hand-off reply (``Settings.cargotel_referral_contacts``). Code-authored
+#: like the bulk portal body, and for the same reason: there is nothing to reason about,
+#: and it deliberately states nothing about the load — no status, no amount, no date —
+#: so it has nothing to ground, nothing to disclose, and nothing authorization would
+#: need to protect. The named colleagues are Cc'd on the draft, so "they are copied
+#: here" is true the moment it sends.
+_CARGOTEL_REFERRAL_BODY = """Thank you for reaching out. The load you asked about is handled directly by:
+
+{contacts}
+
+They are copied on this email and will have the most up-to-date information for you.
+
+{signature}"""
+
+#: Deterministic drafts name no load ids in their body on purpose, so the gate's
+#: coverage check (every requested load addressed) must not be applied to them.
+_NO_COVERAGE_SKILL_IDS = (_BULK_PORTAL_SKILL_ID, _CARGOTEL_REFERRAL_SKILL_ID)
 
 #: Absolute cap on a derived iteration budget, however many loads an email names.
 #:
@@ -414,6 +435,28 @@ class PaymentBotPipeline:
         # `System.QUICKBOOKS` is the §4.1 routing label for 6-digit ids. CargoTel is the
         # system that actually holds them; QuickBooks receives them downstream as bills.
         cgt_loads = [lid for lid, sys in routes.items() if sys is System.QUICKBOOKS]
+
+        # CargoTel referral (Settings.cargotel_referral_contacts): a 6-digit-only email
+        # gets the deterministic hand-off reply naming the colleagues who work these
+        # loads, with them Cc'd — no scrape, no cross-checks, no model call. Checked
+        # BEFORE cargotel availability on purpose: the referral needs neither the cookie
+        # nor the policy switch, and it must also win over the escalate-when-unavailable
+        # branch below. Sensitive-change mail never reaches here (escalated above), and a
+        # mixed email falls through to the existing spans-both-systems handling.
+        if cgt_loads and not tp_loads and self._settings.cargotel_referral_contacts:
+            _log.info(
+                "cargotel_referral",
+                extra={"correlation_id": correlation_id, "loads": cgt_loads},
+            )
+            return self._finalize(
+                email,
+                self._cargotel_referral_draft(email),
+                cgt_loads,
+                correlation_id,
+                ctx,
+                _CARGOTEL_REFERRAL_SKILL_ID,
+            )
+
         cargotel_available = self._cargotel is not None and self._settings.cargotel_replies
 
         if not cargotel_available:
@@ -661,7 +704,7 @@ class PaymentBotPipeline:
         # The bulk portal reply is code-authored and deliberately names no load, so it
         # carries no expected-coverage list; an agent draft must address every load the
         # intake handed it.
-        expected = None if skill_id == _BULK_PORTAL_SKILL_ID else tuple(load_ids)
+        expected = None if skill_id in _NO_COVERAGE_SKILL_IDS else tuple(load_ids)
         gate_result = self._gate.evaluate(
             draft=draft,
             email=email,
@@ -690,7 +733,9 @@ class PaymentBotPipeline:
             intents=(skill_id,),
             load_ids=tuple(load_ids),
             key_facts=(f"loads={load_ids}", f"gate=passed({len(gate_result.checks)} checks)"),
-            cc=self._settings.reply_cc,
+            # Per-draft recipients (the CargoTel referral's contacts) shown beside the
+            # configured Cc, so the reviewer sees exactly who the send will copy.
+            cc=self._settings.reply_cc + tuple(draft.extra_cc),
         )
         self._slack.post_approval(
             self._settings.slack_approval_channel, summary, draft.reply_body, correlation_id
@@ -875,6 +920,36 @@ class PaymentBotPipeline:
             to=email.from_email,
             load_ids=[],  # nothing about any load is disclosed — see the docstring
             citations=[],
+        )
+
+    def _cargotel_referral_draft(self, email: InboundEmail) -> SubmitDraftOutput:
+        """Build the 6-digit hand-off reply — see ``_CARGOTEL_REFERRAL_BODY``.
+
+        Same honesty contract as the bulk portal draft above: empty ``load_ids`` and a
+        body naming no load, no amount, no date — the gate has nothing to object to
+        because nothing is disclosed. The configured contacts land in the body by name
+        and in ``extra_cc`` by address, so the reply's own claim ("they are copied on
+        this email") is enforced by construction rather than hoped for.
+        """
+
+        contacts = []
+        addresses = []
+        for entry in self._settings.cargotel_referral_contacts:
+            name, address = parseaddr(entry)
+            if not address:
+                continue
+            contacts.append(f"- {name} ({address})" if name else f"- {address}")
+            addresses.append(address)
+        body = _CARGOTEL_REFERRAL_BODY.format(
+            contacts="\n".join(contacts),
+            signature=self._settings.reply_signature,
+        )
+        return SubmitDraftOutput(
+            reply_body=body,
+            to=email.from_email,
+            load_ids=[],  # nothing about any load is disclosed — same as the portal reply
+            citations=[],
+            extra_cc=addresses,
         )
 
     def _is_auto_sendable(self, skill_id: str, load_ids: list[str]) -> bool:

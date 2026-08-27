@@ -363,6 +363,81 @@ def test_without_a_store_chat_mode_keeps_drafting_to_gmail() -> None:
     assert len(gmail.drafts) == 1
 
 
+# --- CargoTel referral mode ---------------------------------------------------
+REFERRAL_CONTACTS = (
+    "Ashley Wolf <ashley.wolf@circledelivers.com>",
+    "Elizabeth Haussmann <ehaussmann@circledelivers.com>",
+)
+
+
+def _six_digit_email(body: str = "Can you tell me the payment status for load 245953?"):
+    from payment_bot.models import InboundEmail
+
+    return InboundEmail(
+        message_id="msg-cgt-245953",
+        thread_id="t-cgt",
+        from_email="billing@carrier.test",
+        subject="Payment status for load 245953",
+        body=body,
+    )
+
+
+@pytest.mark.integration
+def test_cargotel_referral_hands_off_without_model_or_scrape() -> None:
+    """A 6-digit-only email gets the deterministic hand-off: contacts named in the
+    body, contacts Cc'd on the draft, and — enforced by the empty LLM script, which
+    would crash on any call — no model invocation and no CargoTel client at all."""
+
+    gmail = MockGmailClient(inbox=[_six_digit_email()])
+    settings = _settings(cargotel_referral_contacts=REFERRAL_CONTACTS)
+
+    results = process_inbox(settings, clients=_clients(gmail, NullSlackClient(), turns=0))
+
+    assert results[0].outcome is Outcome.AWAITING_REVIEW
+    assert gmail.sent == []
+    draft = gmail.drafts[0]
+    assert "Ashley Wolf (ashley.wolf@circledelivers.com)" in draft.body
+    assert "Elizabeth Haussmann (ehaussmann@circledelivers.com)" in draft.body
+    assert "Thank you for reaching out" in draft.body
+    assert "Circle Delivers Payments" in draft.body
+    # Nothing about the load is disclosed — no status, no amount, no date.
+    assert "245953" not in draft.body
+    # Configured Cc plus both contacts: "they are copied on this email" must be true.
+    assert draft.cc == CC + (
+        "ashley.wolf@circledelivers.com",
+        "ehaussmann@circledelivers.com",
+    )
+
+
+@pytest.mark.integration
+def test_cargotel_referral_never_answers_past_a_sensitive_change() -> None:
+    """Bank-change wording on a 6-digit load escalates BEFORE the referral branch —
+    the hand-off must not paper over mail a human has to scrutinise."""
+
+    gmail = MockGmailClient(
+        inbox=[_six_digit_email("Please update our bank account and routing number for load 245953.")]
+    )
+    settings = _settings(cargotel_referral_contacts=REFERRAL_CONTACTS)
+
+    results = process_inbox(settings, clients=_clients(gmail, NullSlackClient(), turns=0))
+
+    assert results[0].outcome is Outcome.ESCALATED
+    assert gmail.drafts == []
+
+
+@pytest.mark.integration
+def test_without_contacts_six_digit_mail_escalates_as_before() -> None:
+    """Empty contacts is the rollback: the referral branch never fires and the
+    6-digit email takes the pre-existing escalate path (no CargoTel configured)."""
+
+    gmail = MockGmailClient(inbox=[_six_digit_email()])
+
+    results = process_inbox(_settings(), clients=_clients(gmail, NullSlackClient(), turns=0))
+
+    assert results[0].outcome is Outcome.ESCALATED
+    assert gmail.drafts == []
+
+
 # --- CLI --------------------------------------------------------------------
 @pytest.mark.integration
 def test_check_reports_missing_configuration(capsys: pytest.CaptureFixture[str]) -> None:

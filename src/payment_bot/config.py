@@ -348,6 +348,24 @@ class Settings(BaseSettings):
             and self.cargotel_cookie_key
         )
 
+    #: Hand 6-digit / CargoTel enquiries to named colleagues instead of answering them.
+    #:
+    #: Entries are ``"Name <address>"``. Non-empty, every email whose loads are ALL
+    #: 6-digit gets a deterministic, code-authored reply: thank the sender, name these
+    #: people as the contacts for the load, and Cc them — no CargoTel scrape, no
+    #: cross-checks, no model call. The reply discloses nothing about the load (no
+    #: status, no amounts, no dates), which is what lets it skip authorization honestly,
+    #: exactly like the bulk portal deflection. It still takes the same gate → approval
+    #: path as every other draft; a human still clicks send.
+    #:
+    #: Takes precedence over ``cargotel_replies`` for 6-digit-only mail: the referral
+    #: needs no cookie, no scrape, and none of the CargoTel failure modes. Mixed
+    #: emails (6- and 7-digit loads together) keep their existing behaviour. Sensitive
+    #: -change mail still escalates before this branch is ever reached.
+    #:
+    #: Empty (the default) changes nothing — the safe rollback is clearing the value.
+    cargotel_referral_contacts: tuple[str, ...] = ()
+
     #: Answer carrier mail about 6-digit / CargoTel loads at all.
     #:
     #: A deliberate policy switch in the spirit of ``allow_factoring``, defaulting to the

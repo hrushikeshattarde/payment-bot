@@ -96,6 +96,26 @@ REQUIRED_FOR_PAYMENT: tuple[DocCategory, ...] = (
     DocCategory.RATE_AGREEMENT,
 )
 
+#: An earning line that names a Truck Order Not Used, however the tenant writes it.
+_TONU_RE = re.compile(r"\btruck\s+order\s+not\s+used\b|\btonu\b", re.I)
+
+
+def tonu_only(earning_titles: Iterable[str]) -> bool:
+    """True when every earning on the load is a Truck Order Not Used.
+
+    A TONU pays a carrier for a truck that was ordered and never loaded — no freight
+    moved, so no BOL or proof of delivery can exist and none should be demanded. The
+    ALL-earnings test is what keeps this honest on re-dispatched loads: a load whose
+    first carrier earned a TONU and whose second earned the line haul DID move freight,
+    and its POD is still owed. Empty titles contribute nothing; a load with no earnings
+    at all is not TONU-only (there is no evidence either way, and the stricter reading
+    wins).
+    """
+
+    titles = [t for t in earning_titles if t and t.strip()]
+    return bool(titles) and all(_TONU_RE.search(t) for t in titles)
+
+
 #: A cancel confirmation is recorded in a comment, not a type — and it escalates (§3.2).
 #:
 #: Searched against the file type and the comment SEPARATELY, never against the two joined by

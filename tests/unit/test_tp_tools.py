@@ -149,3 +149,48 @@ def test_an_unknown_required_document_fails_loudly(ctx: ToolContext) -> None:
     )
     with pytest.raises(ToolError, match="unknown document category"):
         TpGetFileHistory().run(LoadIdInput(load_id="2462934"), bad)
+
+
+# --- TONU loads: no freight moved, no BOL/POD owed ------------------------------
+@pytest.mark.unit
+def test_file_history_waives_pod_on_a_tonu_only_load(
+    ctx: ToolContext, tp_client
+) -> None:
+    """Every earning a TONU means no delivery happened: proof of delivery drops out
+    of the required list, and the output says why, so the draft can explain it."""
+
+    from payment_bot.clients.transport_pro import LoadFixture
+    from payment_bot.domain.documents import DocCategory, classify
+
+    base = tp_client.get_load("2462934")
+    tonu_load = base.model_copy(
+        update={
+            "load_id": 2999001,
+            "earnings": [
+                base.earnings[0].model_copy(update={"title": "TRUCK ORDER NOT USED"})
+            ],
+        }
+    )
+    # Carry over only the invoice: no BOL on file, which is exactly the TONU shape.
+    invoice_only = [
+        f
+        for f in tp_client.get_file_history("2462934")
+        if classify(f.file_type, f.file_type_id) is DocCategory.CARRIER_INVOICE
+    ]
+    tp_client.add(LoadFixture(load=tonu_load, files=invoice_only))
+
+    out = TpGetFileHistory().run(LoadIdInput(load_id="2999001"), ctx)
+
+    assert out.proof_of_delivery_waived_tonu is True
+    assert "proof_of_delivery" not in out.missing_documents
+    assert "rate_agreement" in out.missing_documents  # everything else is still chased
+    assert out.has_bol_or_pod is False  # factual, even though not required
+
+
+@pytest.mark.unit
+def test_file_history_keeps_pod_required_on_a_mixed_tonu_load(ctx: ToolContext) -> None:
+    """The sample load pays a TONU beside a line haul - freight moved, POD stays owed."""
+
+    out = TpGetFileHistory().run(LoadIdInput(load_id="2462934"), ctx)
+
+    assert out.proof_of_delivery_waived_tonu is False

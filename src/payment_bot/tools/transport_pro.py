@@ -13,11 +13,14 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 from payment_bot.domain import compute_carrier_rate
-from payment_bot.domain.documents import DocCategory, assess_documents
+from payment_bot.domain.documents import DocCategory, assess_documents, tonu_only
 from payment_bot.errors import ClientError, ToolError
+from payment_bot.logging import get_logger
 from payment_bot.models import Deduction, DispatchRow, Earning, SettlementEntry
 from payment_bot.tools.base import Tool, ToolContext
 from payment_bot.tools.shared import LoadIdStr
+
+_log = get_logger("tools.transport_pro")
 
 _BILLED_STATUSES = frozenset({"billed"})
 
@@ -339,6 +342,10 @@ class TpFileHistoryOutput(BaseModel):
     #: The question this tool exists to answer: required paperwork not on file.
     missing_documents: list[str] = Field(default_factory=list)
     all_required_present: bool = True
+    #: True when proof of delivery was dropped from the required list because every
+    #: earning on the load is a Truck Order Not Used: no freight moved, so no BOL/POD
+    #: can exist and the carrier must not be asked for one.
+    proof_of_delivery_waived_tonu: bool = False
     #: One row per document category, so a load with four rate agreements reads as one line.
     on_file: list[CategoryCount] = Field(default_factory=list)
     has_carrier_invoice: bool = False
@@ -376,10 +383,14 @@ class TpGetFileHistory(Tool):
         "proof of delivery/BOL, rate agreement), plus a per-category count of what is on "
         "file and whether a CANCEL LOAD confirmation exists. Read `missing_documents` — "
         "do not infer it yourself. A driver_upload row is a driver-app photo, not the "
-        "signed BOL: it never satisfies proof of delivery. A cancel confirmation escalates, "
-        "UNLESS `cancel_confirmation_superseded` is true: the load was then re-dispatched and "
-        "delivered, and the cancellation belongs to `canceled_carriers` — a different carrier "
-        "from `delivered_carrier`, whose leg ran normally."
+        "signed BOL: it never satisfies proof of delivery. On a TONU load (every earning "
+        "is Truck Order Not Used) no freight moved, so proof of delivery is not required "
+        "and never appears in `missing_documents` — `proof_of_delivery_waived_tonu` says "
+        "when that applied; do not ask a TONU carrier for a BOL or POD. A cancel "
+        "confirmation escalates, UNLESS `cancel_confirmation_superseded` is true: the load "
+        "was then re-dispatched and delivered, and the cancellation belongs to "
+        "`canceled_carriers` — a different carrier from `delivered_carrier`, whose leg ran "
+        "normally."
     )
     input_model = LoadIdInput
 
@@ -400,6 +411,31 @@ class TpGetFileHistory(Tool):
                 f"PAYBOT_REQUIRED_DOCUMENTS contains an unknown document category: {exc}. "
                 f"Valid values: {[c.value for c in DocCategory]}"
             ) from exc
+
+        # A TONU-only load moved no freight, so no BOL/POD exists and none is owed —
+        # chasing one told a carrier to produce paperwork for a delivery that never
+        # happened. The ALL-earnings test in `tonu_only` keeps re-dispatched loads
+        # honest: TONU for the canceled truck beside a line haul means freight DID
+        # move, and the POD stays required. The payables read is the same cached
+        # ``payment_information`` response the load summary already fetched, so this
+        # costs no extra call on any run where the agent looked at the load — and an
+        # unreadable payables answer waives nothing: requiring too much is recoverable,
+        # telling a carrier their POD is not needed when it is, is not.
+        pod_waived = False
+        if DocCategory.PROOF_OF_DELIVERY in required:
+            try:
+                payables = ctx.tp.get_load_payables(load_id)
+            except (ClientError, ToolError):
+                payables = []
+            titles = [e.title for p in payables for e in p.earnings]
+            if tonu_only(titles):
+                required = tuple(c for c in required if c is not DocCategory.PROOF_OF_DELIVERY)
+                pod_waived = True
+                _log.info(
+                    "tonu_pod_waived",
+                    extra={"correlation_id": ctx.correlation_id, "load_id": load_id},
+                )
+
         status, _classified = assess_documents(
             ((d.file_type, d.file_type_id, d.upload_date or d.index_date, d.comments) for d in docs),
             load_id=load_id,
@@ -439,6 +475,7 @@ class TpGetFileHistory(Tool):
             document_count=status.document_count,
             missing_documents=[c.value for c in status.missing],
             all_required_present=status.is_complete,
+            proof_of_delivery_waived_tonu=pod_waived,
             on_file=[
                 CategoryCount(category=s.category.value, count=s.count, latest=s.latest)
                 for s in status.by_category

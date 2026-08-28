@@ -64,6 +64,11 @@ class _Tp:
         self._raises = raises
         self.dispatch_calls = 0
 
+    def get_load_payables(self, load_id):
+        # The TONU waiver reads the payables; nothing here is a TONU, and an
+        # unreadable answer waives nothing anyway — either suits these tests.
+        raise ClientError("payables not stubbed")
+
     def get_file_history(self, load_id):
         class _Doc:
             def __init__(self, file_type, type_id, uploaded, comments):

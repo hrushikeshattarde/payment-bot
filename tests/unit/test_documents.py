@@ -292,3 +292,20 @@ def test_empty_result_falls_back_to_the_internal_record_id() -> None:
 
     assert len(docs) == 11  # found under the internal id 1302556
     assert any("recordId=1302556" in u for u in transport.data_urls())
+
+
+# --- TONU: no freight moved, no POD owed --------------------------------------
+@pytest.mark.unit
+def test_tonu_only_requires_every_earning_to_be_a_tonu() -> None:
+    from payment_bot.domain.documents import tonu_only
+
+    assert tonu_only(["TRUCK ORDER NOT USED"]) is True
+    assert tonu_only(["Truck Order Not Used", "TONU Fee"]) is True
+    # Mixed earnings mean freight DID move (re-dispatched load): POD stays owed.
+    assert tonu_only(["TRUCK ORDER NOT USED", "Brokerage Line Haul"]) is False
+    assert tonu_only(["Brokerage Line Haul"]) is False
+    # No earnings is no evidence either way - the stricter reading wins.
+    assert tonu_only([]) is False
+    assert tonu_only(["", "  "]) is False
+    # Word boundaries: a title merely containing the letters must not match.
+    assert tonu_only(["Detention"]) is False

@@ -52,6 +52,7 @@ from pydantic import BaseModel
 
 from payment_bot.domain import route_load
 from payment_bot.domain.cargotel import BillingState, resolve_payment
+from payment_bot.domain.documents import mentions_tonu
 from payment_bot.errors import ClientError, ToolError
 from payment_bot.grounding import (
     extract_date_tokens,
@@ -412,6 +413,54 @@ def _paperwork_requests(text: str) -> list[str]:
     return labels
 
 
+#: Delivery-proof nouns only — the narrow slice of paperwork a TONU cannot produce.
+#: The carrier's INVOICE is deliberately absent: a TONU is still billed, so asking a
+#: TONU carrier for their invoice is legitimate and must stay sayable.
+_POD_NOUN = (
+    r"(?:signed\s+)?(?:bols?|pods?|proofs?\s+of\s+delivery|bills?\s+of\s+lading"
+    r"|delivery\s+receipts?)"
+)
+
+#: The same request shapes ``_PAPERWORK_REQUEST_PATTERNS`` uses, narrowed to delivery
+#: proof, plus the "is still missing" assertion the live failure actually used. The
+#: sentence-bounded gap and the cleared-span exemption carry over unchanged.
+_POD_REQUEST_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        rf"\b(?:send|resend|forward|email|provide|submit|upload|attach)\b"
+        rf"[^.!?\n]{{0,40}}?\b(?:{_POD_NOUN})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:awaiting|await|waiting\s+(?:on|for))\b[^.!?\n]{{0,40}}?\b(?:{_POD_NOUN})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:{_POD_NOUN})\b[^.!?\n]{{0,40}}?\b(?:is|are)\s+(?:still\s+)?"
+        rf"(?:missing|outstanding|required|needed)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:not|never|haven't|havent|don't|dont)\b[^.!?\n]{{0,20}}?"
+        rf"\b(?:received|receive|have|got)\b[^.!?\n]{{0,30}}?\b(?:{_POD_NOUN})\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _pod_requests(text: str) -> list[str]:
+    """Every way ``text`` puts delivery paperwork back on the sender, verbatim."""
+
+    cleared = _paperwork_cleared_spans(text)
+    found: list[str] = []
+    for pattern in _POD_REQUEST_PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if not any(start >= c_start and end <= c_end for c_start, c_end in cleared):
+                found.append(match.group(0))
+                break
+    return found
+
+
 #: Phrases that mean a sender is asking whether the payable is net of anything.
 #:
 #: Phrases, never bare words, and the reason is recorded in ``_RATE_SIGNALS``: bare "advance"
@@ -526,6 +575,7 @@ class PreSendGate:
             self._check_tense_consistency(draft, ctx),
             self._check_cargotel_payment_claim(draft),
             self._check_paperwork_request(draft, ctx),
+            self._check_tonu_paperwork_conflict(draft, email),
             self._check_deduction_disclosure(draft, email),
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
@@ -1162,6 +1212,50 @@ class PreSendGate:
             name="cargotel_payment_claim",
             passed=True,
             detail="reply makes no claim about whether a 6-digit load was paid",
+        )
+
+    def _check_tonu_paperwork_conflict(
+        self, draft: SubmitDraftOutput, email: InboundEmail
+    ) -> GateCheck:
+        """A draft may not chase delivery paperwork on a load the sender calls a TONU.
+
+        Live failure, load 2512198 (Allstate Truck Lines): the dispatcher recorded a
+        $150 Truck Order Not Used as a delivered "Brokerage Line Haul", so the record
+        looked like a normal load missing its BOL, and the reply asked the carrier to
+        email a signed POD for a truck that never loaded. The carrier's answer —
+        "We can not have POD. Invoice is for TONU. Please explain????" — is the exact
+        exchange this check exists to prevent.
+
+        The sender's TONU claim is deliberately trusted for NOTHING except stopping the
+        argument: it never waives a document (any carrier could dodge a POD that way) —
+        it only blocks the draft that demands one, so the conflict escalates to a human
+        who can see whether the load record needs a dispatcher's correction. Asking a
+        TONU carrier for their INVOICE stays sayable: a TONU is still billed.
+        """
+
+        if not mentions_tonu(email.combined_text):
+            return GateCheck(
+                name="tonu_paperwork_conflict",
+                passed=True,
+                detail="sender makes no TONU claim",
+            )
+        requests = _pod_requests(draft.reply_body)
+        if requests:
+            return GateCheck(
+                name="tonu_paperwork_conflict",
+                passed=False,
+                detail=(
+                    "the sender states this is a TONU (truck order not used) and the draft "
+                    f"asks for delivery paperwork ({requests[0][:60]!r}). A truck that was "
+                    "not used produced no BOL or POD. If the load record shows a delivered "
+                    "line haul, that is a data-entry error for a dispatcher to correct — "
+                    "not paperwork for the carrier to produce."
+                ),
+            )
+        return GateCheck(
+            name="tonu_paperwork_conflict",
+            passed=True,
+            detail="sender claims TONU; the draft asks for no delivery paperwork",
         )
 
     def _check_paperwork_request(self, draft: SubmitDraftOutput, ctx: ToolContext) -> GateCheck:

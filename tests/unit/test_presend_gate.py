@@ -1193,3 +1193,62 @@ def test_no_withheld_loads_is_not_a_failure(
 
     assert _checks(result)["withheld_acknowledged"] is True
     assert result.allowed, result.reasons
+
+
+# --- TONU vs delivery paperwork -------------------------------------------------
+def _tonu_email(body: str = "Please provide payment status for load 2462934. Invoice is for TONU (truck order not used).") -> InboundEmail:
+    return InboundEmail(
+        message_id="m-tonu",
+        thread_id="t-tonu",
+        from_email="billing@ideaexpedited.com",
+        subject="Payment status for load #2462934 invoice #12395-TONU",
+        body=body,
+    )
+
+
+@pytest.mark.unit
+def test_tonu_claim_blocks_a_draft_that_chases_delivery_paperwork(
+    grounded_ctx: ToolContext,
+) -> None:
+    """The load-2512198 shape: dispatcher recorded a TONU as a delivered line haul,
+    and the draft asked the carrier to email a signed POD for a truck never loaded."""
+
+    body = _GOOD_BODY + (
+        " Our records show that a proof of delivery (signed BOL) is still missing for "
+        "this load. Please email the signed POD to freightpay@circledelivers.com."
+    )
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=_tonu_email(), ctx=grounded_ctx)
+
+    assert not result.allowed
+    assert _checks(result)["tonu_paperwork_conflict"] is False
+    assert any("data-entry error" in r for r in result.reasons)
+
+
+@pytest.mark.unit
+def test_tonu_claim_still_allows_asking_for_the_invoice(grounded_ctx: ToolContext) -> None:
+    """A TONU is still billed: chasing the carrier INVOICE must stay sayable."""
+
+    body = _GOOD_BODY + " Please email your carrier invoice to freightpay@circledelivers.com."
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=_tonu_email(), ctx=grounded_ctx)
+
+    assert _checks(result)["tonu_paperwork_conflict"] is True
+
+
+@pytest.mark.unit
+def test_pod_requests_stay_sayable_when_nobody_claims_tonu(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    body = _GOOD_BODY + " Please email the signed BOL to freightpay@circledelivers.com."
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=sample_email, ctx=grounded_ctx)
+
+    assert _checks(result)["tonu_paperwork_conflict"] is True
+
+
+@pytest.mark.unit
+def test_tonu_claim_allows_saying_no_pod_is_needed(grounded_ctx: ToolContext) -> None:
+    """The assurance is the CORRECT reply to a TONU - it must never read as a request."""
+
+    body = _GOOD_BODY + " As this was a truck order not used, no POD is needed."
+    result = PreSendGate().evaluate(draft=_draft(body=body), email=_tonu_email(), ctx=grounded_ctx)
+
+    assert _checks(result)["tonu_paperwork_conflict"] is True

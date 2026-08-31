@@ -116,6 +116,20 @@ def tonu_only(earning_titles: Iterable[str]) -> bool:
     return bool(titles) and all(_TONU_RE.search(t) for t in titles)
 
 
+def mentions_tonu(text: str) -> bool:
+    """Does this text call something a TONU / Truck Order Not Used?
+
+    Exists for the gate's TONU-vs-paperwork check: when the SENDER's email says TONU,
+    that claim alone must not waive any document (anyone could dodge a POD that way),
+    but a draft that argues back by demanding delivery paperwork is wrong in a worse
+    way — observed live on load 2512198, where the dispatcher had recorded a $150 TONU
+    as a delivered 'Brokerage Line Haul' and the reply chased a signed BOL for a truck
+    that never loaded.
+    """
+
+    return bool(text) and _TONU_RE.search(text) is not None
+
+
 #: A cancel confirmation is recorded in a comment, not a type — and it escalates (§3.2).
 #:
 #: Searched against the file type and the comment SEPARATELY, never against the two joined by

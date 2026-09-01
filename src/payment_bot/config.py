@@ -531,6 +531,13 @@ class Settings(BaseSettings):
     #: factored to a DIFFERENT company is unaffected — that always stays per-load bound.
     factoring_prenoa_replies: bool = False
 
+    #: A payable whose single earning is at or under this amount is treated as a
+    #: possible TONU that a dispatcher entered as a line haul (two live incidents in
+    #: one week, both $150 — the company's flat TONU fee). A POD-chasing draft that
+    #: touches such a load must offer the TONU alternative or the gate blocks it.
+    #: 0 disables the suspicion entirely.
+    tonu_suspect_max_amount: int = Field(default=200, ge=0)
+
     #: Which document categories a draft may report as missing and request from the
     #: sender. Values are :class:`payment_bot.domain.documents.DocCategory` names, e.g.
     #: carrier_invoice, proof_of_delivery, rate_agreement. Config so the business can

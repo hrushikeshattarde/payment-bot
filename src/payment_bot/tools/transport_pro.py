@@ -13,7 +13,12 @@ from decimal import Decimal
 from pydantic import BaseModel, Field
 
 from payment_bot.domain import compute_carrier_rate
-from payment_bot.domain.documents import DocCategory, assess_documents, tonu_only
+from payment_bot.domain.documents import (
+    DocCategory,
+    assess_documents,
+    suspect_unrecorded_tonu,
+    tonu_only,
+)
 from payment_bot.errors import ClientError, ToolError
 from payment_bot.logging import get_logger
 from payment_bot.models import Deduction, DispatchRow, Earning, SettlementEntry
@@ -346,6 +351,11 @@ class TpFileHistoryOutput(BaseModel):
     #: earning on the load is a Truck Order Not Used: no freight moved, so no BOL/POD
     #: can exist and the carrier must not be asked for one.
     proof_of_delivery_waived_tonu: bool = False
+    #: True when some payable on the load has a single small earning — the shape of a
+    #: TONU a dispatcher entered as a line haul. Not proof, so nothing is waived; but
+    #: any request for the BOL/POD must offer the TONU alternative in the same breath
+    #: (the gate enforces this).
+    possible_unrecorded_tonu: bool = False
     #: One row per document category, so a load with four rate agreements reads as one line.
     on_file: list[CategoryCount] = Field(default_factory=list)
     has_carrier_invoice: bool = False
@@ -386,7 +396,11 @@ class TpGetFileHistory(Tool):
         "signed BOL: it never satisfies proof of delivery. On a TONU load (every earning "
         "is Truck Order Not Used) no freight moved, so proof of delivery is not required "
         "and never appears in `missing_documents` — `proof_of_delivery_waived_tonu` says "
-        "when that applied; do not ask a TONU carrier for a BOL or POD. A cancel "
+        "when that applied; do not ask a TONU carrier for a BOL or POD. When "
+        "`possible_unrecorded_tonu` is true, a payable on the load looks like a TONU that "
+        "was recorded as a line haul: any request for the BOL/POD MUST offer the "
+        "alternative in the same reply, e.g. 'If this truck was not used (TONU), just "
+        "reply and let us know — no POD applies.' A cancel "
         "confirmation escalates, UNLESS `cancel_confirmation_superseded` is true: the load "
         "was then re-dispatched and delivered, and the cancellation belongs to "
         "`canceled_carriers` — a different carrier from `delivered_carrier`, whose leg ran "
@@ -422,6 +436,7 @@ class TpGetFileHistory(Tool):
         # unreadable payables answer waives nothing: requiring too much is recoverable,
         # telling a carrier their POD is not needed when it is, is not.
         pod_waived = False
+        pod_suspect = False
         if DocCategory.PROOF_OF_DELIVERY in required:
             try:
                 payables = ctx.tp.get_load_payables(load_id)
@@ -435,6 +450,19 @@ class TpGetFileHistory(Tool):
                     "tonu_pod_waived",
                     extra={"correlation_id": ctx.correlation_id, "load_id": load_id},
                 )
+            elif ctx.settings.tonu_suspect_max_amount:
+                # Not proof, so nothing is waived — but a POD request on this load must
+                # offer the TONU alternative (the tool description says so, and the
+                # gate's tonu_paperwork_conflict check enforces it).
+                pod_suspect = suspect_unrecorded_tonu(
+                    ([(e.title, float(e.amount)) for e in p.earnings] for p in payables),
+                    max_amount=float(ctx.settings.tonu_suspect_max_amount),
+                )
+                if pod_suspect:
+                    _log.info(
+                        "tonu_suspect_payable",
+                        extra={"correlation_id": ctx.correlation_id, "load_id": load_id},
+                    )
 
         status, _classified = assess_documents(
             ((d.file_type, d.file_type_id, d.upload_date or d.index_date, d.comments) for d in docs),
@@ -476,6 +504,7 @@ class TpGetFileHistory(Tool):
             missing_documents=[c.value for c in status.missing],
             all_required_present=status.is_complete,
             proof_of_delivery_waived_tonu=pod_waived,
+            possible_unrecorded_tonu=pod_suspect,
             on_file=[
                 CategoryCount(category=s.category.value, count=s.count, latest=s.latest)
                 for s in status.by_category

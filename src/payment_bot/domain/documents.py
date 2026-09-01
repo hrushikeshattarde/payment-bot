@@ -116,6 +116,43 @@ def tonu_only(earning_titles: Iterable[str]) -> bool:
     return bool(titles) and all(_TONU_RE.search(t) for t in titles)
 
 
+def suspect_unrecorded_tonu(
+    payables_earnings: Iterable[Iterable[tuple[str, float]]],
+    *,
+    max_amount: float,
+) -> bool:
+    """Does any payable on this load look like a TONU that was entered as a line haul?
+
+    The data-entry pattern behind two live incidents in one week: dispatchers record
+    the company's flat TONU fee as a single small "Brokerage Line Haul" — load 2512198
+    ($150, dispatch even marked Delivered) and load 2518862 ($150 for the canceled
+    truck beside the $600 payable of the carrier that actually ran it). Nothing in the
+    record says TONU, so :func:`tonu_only` cannot fire and the reply chases a signed
+    BOL from a carrier whose truck never loaded.
+
+    The shape: a payable with EXACTLY ONE earning, at or under ``max_amount``, whose
+    title does not already say TONU (that case is the real waiver's, not a suspicion).
+    Deliberately per-payable, not per-load: on the re-dispatch shape the load as a
+    whole did move freight and its POD is genuinely owed — by the other carrier.
+
+    A hit does not waive anything. It obliges a POD-chasing draft to offer the TONU
+    alternative, so the mis-recorded carrier can say so instead of being told their
+    paperwork is holding up payment. The false-positive cost is one harmless sentence
+    on a genuinely small load; the false-negative cost is the incident this encodes.
+    """
+
+    for earnings in payables_earnings:
+        rows = [(title or "", amount) for title, amount in earnings]
+        if len(rows) != 1:
+            continue
+        title, amount = rows[0]
+        if _TONU_RE.search(title):
+            continue  # recorded honestly — the tonu_only waiver's territory
+        if 0 < amount <= max_amount:
+            return True
+    return False
+
+
 def mentions_tonu(text: str) -> bool:
     """Does this text call something a TONU / Truck Order Not Used?
 

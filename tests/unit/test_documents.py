@@ -309,3 +309,25 @@ def test_tonu_only_requires_every_earning_to_be_a_tonu() -> None:
     assert tonu_only(["", "  "]) is False
     # Word boundaries: a title merely containing the letters must not match.
     assert tonu_only(["Detention"]) is False
+
+
+@pytest.mark.unit
+def test_suspect_unrecorded_tonu_flags_the_single_small_line_haul() -> None:
+    from payment_bot.domain.documents import suspect_unrecorded_tonu
+
+    # Load 2512198: one payable, one $150 line haul on a load posted at $1,100.
+    assert suspect_unrecorded_tonu([[("Brokerage Line Haul", 150.0)]], max_amount=200.0)
+    # Load 2518862: the canceled truck's $150 beside the real hauler's $600.
+    assert suspect_unrecorded_tonu(
+        [[("Brokerage Line Haul", 150.0)], [("Brokerage Line Haul", 600.0)]],
+        max_amount=200.0,
+    )
+    # Honestly-titled TONU is the real waiver's territory, not a suspicion.
+    assert not suspect_unrecorded_tonu([[("TRUCK ORDER NOT USED", 150.0)]], max_amount=200.0)
+    # A payable with several earnings is a load that ran (TONU beside a line haul).
+    assert not suspect_unrecorded_tonu(
+        [[("TRUCK ORDER NOT USED", 150.0), ("Brokerage Line Haul", 4500.0)]], max_amount=200.0
+    )
+    # Over the threshold, or nothing at all: no suspicion.
+    assert not suspect_unrecorded_tonu([[("Brokerage Line Haul", 600.0)]], max_amount=200.0)
+    assert not suspect_unrecorded_tonu([], max_amount=200.0)

@@ -1252,3 +1252,55 @@ def test_tonu_claim_allows_saying_no_pod_is_needed(grounded_ctx: ToolContext) ->
     result = PreSendGate().evaluate(draft=_draft(body=body), email=_tonu_email(), ctx=grounded_ctx)
 
     assert _checks(result)["tonu_paperwork_conflict"] is True
+
+
+@pytest.mark.unit
+def test_suspect_tonu_load_requires_the_tonu_alternative_beside_a_pod_request(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The load-2518862 shape: the sender never says TONU, but their payable is a
+    single $150 line haul. A flat POD demand blocks; one offering the TONU
+    alternative passes."""
+
+    from payment_bot.clients.transport_pro import LoadFixture
+
+    base = grounded_ctx.tp.get_load("2462934")
+    suspect = base.model_copy(
+        update={
+            "load_id": 2999002,
+            "earnings": [base.earnings[1].model_copy(update={"amount": Decimal("150")})],
+        }
+    )
+    grounded_ctx.tp.add(LoadFixture(load=suspect))
+
+    flat_demand = _draft(
+        body="We are still missing the signed BOL for this load. Please email the "
+        "signed POD to freightpay@circledelivers.com.",
+        load_ids=["2999002"],
+    )
+    result = PreSendGate().evaluate(draft=flat_demand, email=sample_email, ctx=grounded_ctx)
+    assert _checks(result)["tonu_paperwork_conflict"] is False
+    assert any("TONU alternative" in r for r in result.reasons)
+
+    hedged = _draft(
+        body="We are still missing the signed BOL for this load. Please email the "
+        "signed POD to freightpay@circledelivers.com. If this truck was not used "
+        "(TONU), just reply and let us know - no POD applies.",
+        load_ids=["2999002"],
+    )
+    result = PreSendGate().evaluate(draft=hedged, email=sample_email, ctx=grounded_ctx)
+    assert _checks(result)["tonu_paperwork_conflict"] is True
+
+
+@pytest.mark.unit
+def test_a_two_earning_payable_is_not_suspect(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Load 2462934 pays a TONU beside a $4,500 line haul - it ran, and a flat POD
+    request needs no hedge."""
+
+    flat_demand = _draft(
+        body="Please email the signed BOL to freightpay@circledelivers.com."
+    )
+    result = PreSendGate().evaluate(draft=flat_demand, email=sample_email, ctx=grounded_ctx)
+    assert _checks(result)["tonu_paperwork_conflict"] is True

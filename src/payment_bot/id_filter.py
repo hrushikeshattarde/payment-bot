@@ -113,11 +113,21 @@ header above it in a table. Collections tables arrive flattened to one line, so 
 like "Carrier | Mot Car | Account | Invoice | Load" is followed by its values in the SAME
 ORDER. Line them up.
 
+On a statement or invoice the SENDER created, the column names mean the opposite of what
+they suggest: "Invoice #" and "Order #" carry the sender's OWN numbering (kind "invoice"),
+while the number that points at OUR load sits under "Reference #", "Ref", or "Load". A
+carrier statement reading "Order # 3040444 | Invoice # 3040444 | Reference # 2519649" is
+about load 2519649 — the number repeated across the sender's own columns is their paperwork
+chain, not our load. Never drop a Reference/Ref/Load-labelled candidate while keeping an
+Invoice/Order-labelled one from the same row.
+
 Rules:
 - Classify EVERY candidate you are given, exactly once, using the value verbatim.
 - Never report a number that is not in the candidate list.
-- When the email gives you nothing to go on, say "load". A load answered is recoverable;
-  a load silently dropped is a carrier who never gets a reply.
+- When the email gives you nothing to go on, say "load". And when you are torn between
+  "load" and anything else, say "load" too. The costs are not symmetric: a kept non-load
+  costs one lookup that comes back empty; a dropped load id is a carrier who never gets
+  a reply at all.
 """
 
 

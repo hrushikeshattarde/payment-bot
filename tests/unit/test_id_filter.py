@@ -224,3 +224,18 @@ def test_order_is_the_senders_not_the_models() -> None:
     verdicts = classify(_FakeLlm(_tool_response(rows)), candidates, "2462934 and 2481841")
 
     assert apply_filter(IdFilterMode.ENFORCE, candidates, verdicts) == candidates
+
+
+def test_prompt_teaches_the_statement_column_convention() -> None:
+    """Live failure, Delta Carrier Group statement (load 2519649, already PAID): the
+    model kept the sender's own Invoice/Order number 3040444 and dropped the load id
+    sitting under Reference # - the exact inversion. The prompt must carry the
+    convention and the drop-asymmetry rule; this pins both so a prompt edit cannot
+    silently lose them."""
+
+    from payment_bot.id_filter import _SYSTEM
+
+    assert "Reference #" in _SYSTEM
+    assert "sender's OWN numbering" in _SYSTEM
+    assert "Never drop a Reference/Ref/Load-labelled candidate" in _SYSTEM
+    assert "torn between" in _SYSTEM  # unsure -> load, because the costs are asymmetric

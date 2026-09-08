@@ -33,6 +33,10 @@ def _entry(entry_id: str = "", message_id: str = "<m1@x>", **overrides: Any) -> 
         "body": "Load 2462934 is BILLED.",
         "load_ids": ("2462934",),
         "chat_message": "spaces/S/messages/M1",
+        # Pinned: two _entry() calls must compare equal. Left to the default factory,
+        # equality rode on Windows' coarse clock handing both calls the same tick —
+        # which it usually, but not always, did (flaked 2026-09-08).
+        "created_at": "2026-08-20T12:00:00+00:00",
     }
     values.update(overrides)
     return PendingApproval(**values)

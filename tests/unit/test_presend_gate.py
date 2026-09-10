@@ -1304,3 +1304,61 @@ def test_a_two_earning_payable_is_not_suspect(
     )
     result = PreSendGate().evaluate(draft=flat_demand, email=sample_email, ctx=grounded_ctx)
     assert _checks(result)["tonu_paperwork_conflict"] is True
+
+
+# --- invented load ids ------------------------------------------------------------
+@pytest.mark.unit
+def test_a_draft_may_not_call_an_unextracted_number_a_load(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """The 2508860TONU shape: intake never extracted the id, the model read it off the
+    raw email, and the draft asserted 'no payable record' for a load that was PAID."""
+
+    body = _GOOD_BODY + (
+        " Regarding load 2508860, we are unable to locate a payable record under that "
+        "load number in our system."
+    )
+    result = PreSendGate().evaluate(
+        draft=_draft(body=body),
+        email=sample_email,
+        ctx=grounded_ctx,
+        expected_load_ids=("2462934",),
+        candidate_load_ids=("2462934",),
+    )
+    assert not result.allowed
+    assert _checks(result)["invented_load_ids"] is False
+    assert any("2508860" in r for r in result.reasons)
+
+
+@pytest.mark.unit
+def test_known_loads_and_unlabelled_numbers_stay_sayable(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    """Candidates cover the unlocatable ids a draft legitimately reports as not found,
+    and numbers not LABELLED a load - echoed invoice numbers, check numbers - are
+    grounded, ordinary quoting the check must not police."""
+
+    body = _GOOD_BODY + (
+        " Regarding load 2508860, we could not locate a payable record - please "
+        "double-check. Your invoice #126263 and check 795053 are on file."
+    )
+    result = PreSendGate().evaluate(
+        draft=_draft(body=body),
+        email=sample_email,
+        ctx=grounded_ctx,
+        expected_load_ids=("2462934",),
+        candidate_load_ids=("2462934", "2508860"),
+    )
+    assert _checks(result)["invented_load_ids"] is True
+
+
+@pytest.mark.unit
+def test_no_candidate_list_means_the_check_judges_nothing(
+    grounded_ctx: ToolContext, sample_email: InboundEmail
+) -> None:
+    result = PreSendGate().evaluate(
+        draft=_draft(body=_GOOD_BODY + " Also load 9999999 exists."),
+        email=sample_email,
+        ctx=grounded_ctx,
+    )
+    assert _checks(result)["invented_load_ids"] is True

@@ -447,6 +447,15 @@ _POD_REQUEST_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+#: A number the draft explicitly calls a load — "load 2510138", "Load #2508860",
+#: "load no. 2462934". Only the labelled form: check numbers, settlement ids and echoed
+#: invoice numbers are 6-7 digits too, and policing every digit run would block drafts
+#: for quoting their own grounded tool results.
+_LOAD_MENTION_RE = re.compile(
+    r"\bloads?\W{0,3}(?:#|no\.?|num(?:ber)?)?\W{0,3}(\d{6,7})(?!\d)", re.IGNORECASE
+)
+
+
 def _pod_requests(text: str) -> list[str]:
     """Every way ``text`` puts delivery paperwork back on the sender, verbatim."""
 
@@ -552,6 +561,7 @@ class PreSendGate:
         expected_load_ids: tuple[str, ...] | None = None,
         noa_request_expected: bool = False,
         withheld_loads: tuple[str, ...] = (),
+        candidate_load_ids: tuple[str, ...] | None = None,
     ) -> GateResult:
         """Run all checks.
 
@@ -561,6 +571,9 @@ class PreSendGate:
                 which deliberately name no load.
             noa_request_expected: True when the intake instructed the agent to ask the
                 sender for an NOA (the pre-NOA flow). Only then may the draft request one.
+            candidate_load_ids: Every id intake extracted from the email, pre-narrowing —
+                the universe the draft may call a "load". ``None`` skips the
+                invented-load check (callers that predate it).
         """
 
         checks = [
@@ -579,6 +592,9 @@ class PreSendGate:
             self._check_deduction_disclosure(draft, email),
             self._check_tool_mentions(draft),
             self._check_coverage(draft, expected_load_ids),
+            self._check_invented_load_ids(
+                draft, expected_load_ids, withheld_loads, candidate_load_ids
+            ),
             self._check_withheld_acknowledged(draft, withheld_loads),
             self._check_carrier_consistency(draft, email, ctx),
             self._check_change_acknowledgment(
@@ -915,6 +931,64 @@ class PreSendGate:
             )
         return GateCheck(
             name="coverage", passed=True, detail="every requested load is addressed"
+        )
+
+    def _check_invented_load_ids(
+        self,
+        draft: SubmitDraftOutput,
+        expected_load_ids: tuple[str, ...] | None,
+        withheld_loads: tuple[str, ...],
+        candidate_load_ids: tuple[str, ...] | None,
+    ) -> GateCheck:
+        """A draft may not call a number a load unless intake actually produced it.
+
+        Coverage's mirror image. Coverage asks whether every known load was addressed;
+        this asks whether every load the draft ADDRESSES is known. Observed live on an
+        RTS statement whose Load column read "2508860TONU": the fused suffix hid the id
+        from extraction, so the pipeline knew nothing of it — but the model could still
+        read the raw email, and the draft told the factor we were "unable to locate a
+        payable record" for a load that was real, billed, and PAID three weeks earlier.
+        Nothing else polices that sentence: it names no amount, no date, and no payment
+        state, so every other check waves it through.
+
+        The known universe is everything intake extracted (``candidate_load_ids``, which
+        includes the unlocatable ids a draft legitimately reports as not found) plus the
+        expected and withheld sets. Only numbers the draft explicitly LABELS a load are
+        policed — check numbers, settlement ids and echoed invoice numbers share the
+        6-7 digit shape and quoting them is grounded, ordinary work. ``None`` candidates
+        means the caller predates this check; it then judges nothing.
+        """
+
+        if candidate_load_ids is None:
+            return GateCheck(
+                name="invented_load_ids",
+                passed=True,
+                detail="no candidate list supplied; not judged",
+            )
+        known = set(candidate_load_ids) | set(expected_load_ids or ()) | set(withheld_loads)
+        invented = sorted(
+            {
+                m.group(1)
+                for m in _LOAD_MENTION_RE.finditer(draft.reply_body)
+                if m.group(1) not in known
+            }
+        )
+        if invented:
+            return GateCheck(
+                name="invented_load_ids",
+                passed=False,
+                detail=(
+                    f"the draft calls {invented} load(s), but intake never extracted "
+                    "them from the email — the model introduced them from raw text, and "
+                    "nothing it says about them is grounded. If the sender wrote the id "
+                    "fused to other characters, extraction missed it and a human must "
+                    "answer."
+                ),
+            )
+        return GateCheck(
+            name="invented_load_ids",
+            passed=True,
+            detail="every load the draft names came from intake",
         )
 
     def _check_carrier_consistency(

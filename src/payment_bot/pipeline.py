@@ -679,6 +679,7 @@ class PaymentBotPipeline:
             skill.id,
             noa_request_expected=bool(prenoa_loads),
             withheld_loads=tuple(withheld_named),
+            candidate_load_ids=tuple(identifiers.load_ids),
         )
 
     # -- gate → approval → send, shared by every draft path -------------------
@@ -692,12 +693,17 @@ class PaymentBotPipeline:
         skill_id: str,
         noa_request_expected: bool = False,
         withheld_loads: tuple[str, ...] = (),
+        candidate_load_ids: tuple[str, ...] | None = None,
     ) -> PipelineResult:
         """Run the gate, then approval, then send or leave the draft for review.
 
         Extracted so the deterministic bulk-portal reply takes the *same* route as an
         agent-produced draft. There is no second path to a sent email, and no draft that
         reaches a mailbox without passing §5.
+
+        ``candidate_load_ids`` is every id intake extracted from the email, pre-narrowing
+        — the universe of loads a draft may legitimately talk about. The gate's
+        invented-load check compares the draft's own "load N" mentions against it.
         """
 
         # 4. Pre-send gate (deterministic, §5) ------------------------------
@@ -712,6 +718,7 @@ class PaymentBotPipeline:
             expected_load_ids=expected,
             withheld_loads=withheld_loads,
             noa_request_expected=noa_request_expected,
+            candidate_load_ids=candidate_load_ids,
         )
         if not gate_result.allowed:
             return self._escalate(

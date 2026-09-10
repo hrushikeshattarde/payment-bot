@@ -1027,3 +1027,34 @@ def test_po_box_is_still_not_a_load_label(ctx: ToolContext) -> None:
 
     assert _LOAD_LABEL_RE.findall("Check Payments: PO Box 840267 Nashville TN") == []
     assert _LOAD_LABEL_RE.findall("PO # 2534728") == ["2534728"]
+
+
+# --- fused suffixes: the 2508860TONU shape ---------------------------------------
+@pytest.mark.unit
+def test_extracts_a_load_id_fused_to_a_trailing_suffix(ctx: ToolContext) -> None:
+    """Live failure: an RTS statement's Load column read '2508860TONU', the old \\b
+    boundary saw no edge between digits and letters, and a PAID load was reported as
+    'no payable record'. The id must be seen, and count as written by the sender."""
+
+    out = _run(ctx, body="GERGUN TRANSPORTATION INC 1033683 2508860TONU 7/21/2026 $150.00")
+    assert "2508860" in out.load_ids
+    assert "2508860" in out.written_load_ids
+
+
+@pytest.mark.unit
+def test_fused_prefixes_stay_invisible_on_purpose(ctx: ToolContext) -> None:
+    """The left edge stays strict: 'MC1510541' is a motor-carrier number and
+    'XTRA0010284352' a BOL - fused-prefix digits are the phantom shapes the guards
+    exist to fight, and the suffix relaxation must not admit them."""
+
+    out = _run(
+        ctx,
+        body="Carrier Kingsmen Logistics MC1510541, BOL XTRA0010284352, load 2568287",
+    )
+    assert out.load_ids == ["2568287"]
+
+
+@pytest.mark.unit
+def test_a_seven_digit_window_of_a_longer_number_is_still_refused(ctx: ToolContext) -> None:
+    out = _run(ctx, body="account 12345678, phone 9139345211")
+    assert out.load_ids == []

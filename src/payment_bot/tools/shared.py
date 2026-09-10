@@ -65,7 +65,21 @@ _FREE_MAIL_DOMAINS = frozenset(
     }
 )  # fmt: skip
 
-_LOAD_ID_RE = re.compile(r"\b\d{6,7}\b")
+#: 6-7 digit run with a strict LEFT edge and a right edge that tolerates a fused alpha
+#: suffix. The asymmetry is deliberate, one live incident per side:
+#:
+#: * RIGHT is relaxed because a sender glued a suffix onto the id — an RTS statement's
+#:   Load column read "2508860TONU", ``\b`` saw no boundary between the digits and the
+#:   letters, the load was never extracted, and the reply told a factor to double-check
+#:   a load number we had PAID three weeks earlier. ``(?!\d)`` still refuses to carve a
+#:   6-7 digit window out of a longer number.
+#: * LEFT stays strict because the fused-prefix shapes are exactly the phantoms the
+#:   guards fight: "MC1510541" is a motor-carrier number and "XTRA0010284352" a BOL,
+#:   and neither has a label the proximity guards could see once fused. A sender who
+#:   writes "INV2462934" is still missed — that is the cost, taken knowingly, because
+#:   admitting letter-digit junctions on the left would put an MC number on most rate
+#:   confirmations.
+_LOAD_ID_RE = re.compile(r"(?<!\w)\d{6,7}(?!\d)")
 
 
 def _coerce_id_to_str(value: object) -> object:

@@ -165,3 +165,20 @@ def test_quoted_history_does_not_decide_intent(ctx: ToolContext) -> None:
         ),
     )
     assert out.intents == [Intent.PAYMENT_STATUS]
+
+
+@pytest.mark.unit
+def test_payment_details_is_keyword_grounded(ctx: ToolContext) -> None:
+    """Pro Funding's collections template (load 2549000): 'Please provide payment
+    details for the load(s) listed below'. The ask is unmistakably payment status, but
+    it arrived via the load-id fallback (keyword_grounded=False) - and the same
+    template carries standing NEW-BANK remit boilerplate, so the combination escalated
+    in every policy configuration. The phrase must ground the intent."""
+
+    out = _run(
+        ctx,
+        email_subject="LOAD # 2549000 - NOT ON WEB",
+        email_body="Please provide payment details for the load(s) listed below: 2549000",
+    )
+    assert out.intents == [Intent.PAYMENT_STATUS]
+    assert out.keyword_grounded is True

@@ -2345,6 +2345,14 @@ _PAYMENT_SIGNALS = (
     # "Is the paperwork attached sufficient to pay?" — payment-readiness questions from the
     # same verification packets. "good to pay" is the direct sibling.
     "sufficient to pay", "good to pay",
+    # "Please provide payment details for the load(s) listed below" — Pro Funding's
+    # collections template (load 2549000). The ask is unmistakably payment status, but
+    # none of the forms above matched, so the intent arrived via the load-id fallback,
+    # keyword_grounded stayed False — and with the template's standing NEW-BANK remit
+    # boilerplate flagging bank_change, that combination escalates in EVERY policy
+    # configuration. One missing phrase turned an answerable status enquiry into a
+    # security escalation.
+    "payment details", "payment detail", "payment information",
 )  # fmt: skip
 _PAPERWORK_SIGNALS = ("pod", "bol", "proof of delivery", "bill of lading", "paperwork")
 

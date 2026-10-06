@@ -289,7 +289,11 @@ def test_the_handler_summarises_outcomes_and_honours_a_limit(
         return [
             PipelineResult(Outcome.AWAITING_REVIEW, "drafted", "c1"),
             PipelineResult(
-                Outcome.AWAITING_REVIEW, "drafted", "c2", follow_up_to="angelica@c.com"
+                Outcome.AWAITING_REVIEW,
+                "drafted",
+                "c2",
+                follow_up_to="angelica@c.com",
+                follow_up_action="handoff",
             ),
             PipelineResult(Outcome.ESCALATED, "not authorized", "c3"),
         ]
@@ -304,8 +308,8 @@ def test_the_handler_summarises_outcomes_and_honours_a_limit(
     assert summary == {
         "processed": 3,
         "outcomes": {"awaiting_review": 2, "escalated": 1},
-        # The subset that answered a carrier chasing a colleague's reply.
-        "follow_ups": {"awaiting_review": 1},
+        # The run's follow-ups, by what was done with them.
+        "follow_ups": {"handoff": 1},
     }
 
 

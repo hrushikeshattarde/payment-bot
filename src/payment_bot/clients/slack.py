@@ -33,6 +33,9 @@ class ApprovalSummary:
     #: The colleague whose reply this draft follows up on; blank for a first answer. Shown
     #: so the reviewer reads the draft against what that colleague already told the carrier.
     follow_up_to: str = ""
+    #: Why a follow-up was handed to a person instead of answered ("asked us to act
+    #: (fast track, over 90 days)"); blank for every other draft.
+    handoff: str = ""
 
 
 @dataclass(frozen=True, slots=True)

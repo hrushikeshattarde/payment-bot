@@ -51,6 +51,7 @@ from payment_bot.clients import (
 )
 from payment_bot.config import Settings, get_settings
 from payment_bot.errors import PaymentBotError
+from payment_bot.followups import FollowUpStore, InMemoryFollowUpStore
 from payment_bot.logging import (
     InMemoryAuditSink,
     configure_console_output,
@@ -325,6 +326,7 @@ def process_inbox(
     clients: _Clients | None = None,
     block_ledger: BlockLedger | None = None,
     approval_store: ApprovalStore | None = None,
+    followup_store: FollowUpStore | None = None,
 ) -> list[PipelineResult]:
     """Fetch mail and produce a reviewable draft for each answerable message.
 
@@ -343,6 +345,9 @@ def process_inbox(
             the draft-in-thread check can no longer provide once drafts stop living in
             the reading mailbox. ``None`` (local runs) keeps drafts in Gmail whatever
             the mode says, so chat mode cannot be half-on locally.
+        followup_store: Per-thread follow-up history (``payment_bot.followups``) — the one
+            automated status answer per thread, and whether a thread was handed off.
+            ``None`` (local runs) keeps it in memory for this run only.
     """
 
     # Force draft-only rather than trusting configuration: a local run must never send,
@@ -350,6 +355,7 @@ def process_inbox(
     resolved = (settings or get_settings()).model_copy(update={"draft_only": True})
     clients = clients or _build_clients(resolved, dry_run=dry_run)
     chat_mode = resolved.chat_approval_on and approval_store is not None
+    followups: FollowUpStore = followup_store or InMemoryFollowUpStore()
 
     # One read per run: the live pending set is small (bounded by the cards humans have
     # not clicked yet) and consulting S3 per email would be per-email latency for no
@@ -445,6 +451,7 @@ def process_inbox(
             approval_resolver=DeferredApprovalResolver(),
             settings=resolved,
             audit_sink=audit,
+            followup_store=followups,
         )
         result = pipeline.process_email(email)
         results.append(result)

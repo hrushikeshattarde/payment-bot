@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, Field
@@ -2401,14 +2403,87 @@ def asks_for_an_update(written: str) -> bool:
 
 
 def follow_up_asks(email: InboundEmail) -> bool:
-    """:func:`asks_for_an_update` on what ``email``'s sender wrote, quoted history stripped.
+    """True when what ``email``'s sender wrote (quotes stripped) asks for anything at all.
 
-    The one definition both readers use: the Gmail client, to keep a closing "thanks" from
-    taking a processing slot every run, and the pipeline, as the backstop for any other
-    intake path.
+    The Gmail client's filter, keeping a closing "thanks" from taking a processing slot every
+    run. Built on :func:`read_follow_up` rather than :func:`asks_for_an_update` alone, so a
+    bare "please expedite" — an action, not a status question — is not dropped as asking
+    nothing.
     """
 
-    return asks_for_an_update(strip_quoted(email.body))
+    return read_follow_up(strip_quoted(email.body)).ask is not FollowUpAsk.NONE
+
+
+#: A follow-up asking us to DO something about the payment, which no tool can do. Live, RTS
+#: Financial on load 2493116: "this invoice is over 90 days old. Can you please fast track
+#: payment and provide a status?" — and the bot restated the status it had given the day
+#: before, adding a refusal ("we are not able to expedite") that nobody had authorised.
+#: Phrases only, and verbs rather than adjectives: "urgent" and "ASAP" decorate ordinary
+#: status chases and would turn every one of them into a handoff.
+#: "Expedited" alone is a carrier name more often than a request — this inbox's own sample
+#: carrier is Idea Expedited, Inc — so only its request forms are listed.
+_ACTION_SIGNALS = (
+    "expedite", "expediting", "be expedited", "get this expedited", "get it expedited",
+    "have it expedited", "fast track", "fast-track", "fasttrack",
+    "speed up", "speed this up", "push this through", "push it through", "prioritize",
+    "prioritise", "release the payment", "release payment", "escalate", "escalating",
+    "past due", "overdue",
+)  # fmt: skip
+#: Ageing written as a count of days: "over 90 days old", "120+ days past due".
+_AGEING_RE = re.compile(
+    r"\b(?:over|more than|past|beyond|exceeding)\s+\d{2,3}\s+days\b|\b\d{2,3}\+?\s+days\s+"
+    r"(?:old|past|overdue|outstanding|late)\b",
+    re.IGNORECASE,
+)
+#: A follow-up that has become a dispute or a threat — "we will have to recourse this from
+#: our client". Never answered with a status; a person decides what happens next.
+_ESCALATION_SIGNALS = (
+    "recourse", "dispute", "disputing", "disputed", "legal action", "attorney", "lawyer",
+    "collections", "collection agency", "lien", "bond claim", "file a claim",
+)  # fmt: skip
+
+
+class FollowUpAsk(StrEnum):
+    """What a follow-up asks for, by what the sender wrote in it."""
+
+    #: "Any update?" — answerable with a fresh look at the records.
+    STATUS = "status"
+    #: Asks us to act — expedite, fast-track — or presses on the debt's age.
+    ACTION = "action"
+    #: A dispute, recourse or legal threat.
+    ESCALATION = "escalation"
+    #: Asks nothing ("thanks").
+    NONE = "none"
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpReading:
+    """:class:`FollowUpAsk` plus the phrases that decided it, for the card and the record."""
+
+    ask: FollowUpAsk
+    evidence: tuple[str, ...] = ()
+
+
+def read_follow_up(written: str) -> FollowUpReading:
+    """Classify what a follow-up asks for. ``written`` is this message, quotes stripped.
+
+    Escalation outranks action, which outranks status: "if you can expedite it, please do —
+    otherwise we will recourse" is a threat first, and a request to act before a question.
+    Only a STATUS ask is ever answered by re-reading the records; the others go to a person,
+    because nothing the bot can look up answers them.
+    """
+
+    text = written.lower()
+    escalation = tuple(p for p in _ESCALATION_SIGNALS if _matches_any(text, (p,)))
+    if escalation:
+        return FollowUpReading(FollowUpAsk.ESCALATION, escalation)
+    action = tuple(p for p in _ACTION_SIGNALS if _matches_any(text, (p,)))
+    action += tuple(m.group(0).lower() for m in _AGEING_RE.finditer(written))
+    if action:
+        return FollowUpReading(FollowUpAsk.ACTION, action)
+    if asks_for_an_update(written):
+        return FollowUpReading(FollowUpAsk.STATUS)
+    return FollowUpReading(FollowUpAsk.NONE)
 
 
 def _matches_any(text: str, phrases: tuple[str, ...]) -> bool:

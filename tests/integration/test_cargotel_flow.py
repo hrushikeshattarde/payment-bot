@@ -400,7 +400,7 @@ def test_the_prompt_requires_the_amount_and_forbids_a_breakdown() -> None:
     assert "Give each load's `amount`" in prompt
     assert "State it even when the load is not yet scheduled" in prompt
     assert "no line items" in prompt
-    assert CARGOTEL_PAYMENT_STATUS_SKILL.version == "1.4.0"
+    assert CARGOTEL_PAYMENT_STATUS_SKILL.version == "1.5.0"
 
 
 @pytest.mark.integration

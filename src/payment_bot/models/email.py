@@ -86,6 +86,9 @@ class PriorReply(BaseModel):
     #: From the message's own Date header, so it reads in the colleague's timezone.
     sent_at: datetime | None = None
     body: str = ""
+    #: Everyone on our side who wrote to the carrier in this thread, oldest first, this
+    #: reply's author included — who a handoff copies, because they know the conversation.
+    colleagues: tuple[str, ...] = ()
 
 
 class InboundEmail(BaseModel):

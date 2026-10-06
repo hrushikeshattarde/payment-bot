@@ -628,6 +628,17 @@ class Settings(BaseSettings):
     #: — outbound mail with the group Cc'd — stays theirs, and a bare "thanks" drafts nothing.
     followup_replies: bool = False
 
+    #: Who a follow-up HANDOFF copies, on top of the colleagues who already answered in the
+    #: thread. Entries are ``"Name <address>"`` or bare addresses.
+    #:
+    #: A follow-up is handed to a person, not answered from the records, when the carrier asks
+    #: us to act (expedite, fast-track), raises a dispute or recourse, or chases again after an
+    #: automated status answer. The handoff copies whoever answered the carrier before — but
+    #: when a colleague only ever approved the bot's drafts, copying them loops in nobody new.
+    #: This is the person who can actually move a payment. Empty, the handoff copies the
+    #: thread's colleagues alone; with neither, the follow-up escalates instead.
+    followup_handoff_cc: tuple[str, ...] = ()
+
     #: Gmail search syntax (not IMAP): ``is:unread``, ``newer_than:2d``, ``from:…``.
     gmail_query: str = "is:unread"
     gmail_fetch_limit: int = Field(default=10, ge=1, le=200)

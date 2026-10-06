@@ -51,6 +51,7 @@ from payment_bot.clients.google_chat import (
     queue_page,
 )
 from payment_bot.config import Settings, get_settings
+from payment_bot.followups import S3FollowUpStore
 from payment_bot.local_runner import _Clients, process_inbox
 from payment_bot.logging import configure_logging, get_logger
 from payment_bot.pipeline import Outcome, PipelineResult
@@ -710,6 +711,11 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
         else:
             _log.warning("chat_approval_without_bucket_falling_back_to_drafts")
 
+    # Every follow-up's record, per thread, under state/followups/ — what makes "one status
+    # answer, then a person" hold across runs. Without the bucket the cap lasts one run.
+    followup_bucket = os.environ.get("PAYBOT_ROSTER_BUCKET", "").strip()
+    followup_store = S3FollowUpStore(followup_bucket) if followup_bucket else None
+
     try:
         results: list[PipelineResult] = process_inbox(
             settings,
@@ -717,6 +723,7 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
             clients=clients,
             block_ledger=ledger,
             approval_store=approval_store,
+            followup_store=followup_store,
         )
         if approval_store is not None:
             _sweep_approvals(approval_store, clients.slack, settings)
@@ -734,9 +741,11 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
     for result in results:
         counts[result.outcome.value] = counts.get(result.outcome.value, 0) + 1
         if result.follow_up_to:
-            follow_ups[result.outcome.value] = follow_ups.get(result.outcome.value, 0) + 1
-    # `follow_ups` is the subset of `outcomes` that answered a carrier chasing a colleague's
-    # reply (Settings.followup_replies) — how many of a run's cards and escalations they were.
+            action = result.follow_up_action or result.outcome.value
+            follow_ups[action] = follow_ups.get(action, 0) + 1
+    # `follow_ups` counts the run's follow-ups (Settings.followup_replies) by what was done
+    # with them: status_update (answered from the records), handoff (passed to colleagues on
+    # Cc), notice (no email after a handoff), or the plain outcome.
     summary = {"processed": len(results), "outcomes": counts, "follow_ups": follow_ups}
 
     # A SENT in a draft-only deployment means one of the three guarantees has broken. Log it

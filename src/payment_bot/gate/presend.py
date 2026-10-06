@@ -523,6 +523,23 @@ def _deduction_questions(text: str) -> list[str]:
     ]
 
 
+#: A promise or refusal to speed a payment up — see `_check_action_commitments`. Three
+#: shapes: a modal or "able to" in front of the verb within one clause; the passive ("can be
+#: expedited"); and the process-limit refusal the live draft used ("beyond that process").
+_ACTION_VERB = r"(?:expedite|fast[- ]?track|prioriti[sz]e|speed up)"
+_ACTION_COMMITMENT_RE = re.compile(
+    # The escaped U+2019 below is the curly apostrophe mail clients and models write.
+    r"\b(?:can(?:not|'t|\u2019t)?|could(?:n't|n\u2019t)?|will|won't|won\u2019t|would|unable to|"
+    r"not able to|able to|try to|happy to|going to)\b[^.!?\n]{0,40}?\b"
+    + _ACTION_VERB
+    + r"\b"
+    r"|\b(?:be|been|being|get|got|getting)\s+(?:expedited|fast[- ]?tracked|prioriti[sz]ed|"
+    r"sped up)\b"
+    r"|\bbeyond (?:that|this|the|our) (?:process|queue|timeline)\b",
+    re.IGNORECASE,
+)
+
+
 class GateCheck(BaseModel):
     """Outcome of one named gate check."""
 
@@ -591,6 +608,7 @@ class PreSendGate:
             self._check_tonu_paperwork_conflict(draft, email, ctx),
             self._check_deduction_disclosure(draft, email),
             self._check_tool_mentions(draft),
+            self._check_action_commitments(draft),
             self._check_coverage(draft, expected_load_ids),
             self._check_invented_load_ids(
                 draft, expected_load_ids, withheld_loads, candidate_load_ids
@@ -858,6 +876,38 @@ class PreSendGate:
                 detail=f"reply body names internal tools: {mentioned}",
             )
         return GateCheck(name="tool_mentions", passed=True, detail="no tool names in the reply")
+
+    def _check_action_commitments(self, draft: SubmitDraftOutput) -> GateCheck:
+        """No promise to expedite a payment, and no refusal to.
+
+        Whether a payment can be fast-tracked is a person's decision, and no tool reports it.
+        Live, RTS Financial on load 2493116, a factor asked us to fast-track a 90-day-old
+        invoice and the draft said "we are not able to expedite the timeline beyond that
+        process" — a policy nobody had stated, sent to a factor who then raised recourse.
+        Grounding cannot see it: it names no amount and no date.
+
+        Keyed on a commitment ("will", "can't", "able to", "be expedited") in front of the
+        action, never on the bare word: carriers are called things like Idea Expedited, Inc.
+        "Rush" is left out for the same reason — Rush Trucking is a carrier, and "will be paid
+        to Rush Trucking" is a modal within reach of it.
+
+        In the live flow a person edits in Gmail, where this gate does not run, so a reviewer
+        who decides to expedite can still say so; only the bot cannot.
+        """
+
+        found = sorted({m.group(0).strip() for m in _ACTION_COMMITMENT_RE.finditer(draft.reply_body)})
+        if found:
+            return GateCheck(
+                name="action_commitments",
+                passed=False,
+                detail=(
+                    "draft promises or refuses an action only a person can decide: "
+                    f"{found}. Say only what the records show"
+                ),
+            )
+        return GateCheck(
+            name="action_commitments", passed=True, detail="no promise or refusal to expedite"
+        )
 
     def _check_withheld_acknowledged(
         self, draft: SubmitDraftOutput, withheld_loads: tuple[str, ...]

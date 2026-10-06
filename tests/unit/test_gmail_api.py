@@ -855,6 +855,8 @@ def test_a_chase_after_our_reply_is_answered_with_that_reply_attached() -> None:
     assert prior.from_name == "Angelica Baracao"
     assert "waiting on the signed POD" in prior.body
     assert prior.sent_at is not None and prior.sent_at.date().isoformat() == "2026-10-05"
+    # Who a handoff would copy.
+    assert prior.colleagues == (_COLLEAGUE,)
     # The thread read asked for every header the rule needs, one parameter each.
     thread_url = next(r["url"] for r in http.requests if "/threads/t1" in r["url"])
     for header in ("From", "To", "Cc", "Message-ID"):
@@ -959,6 +961,43 @@ def test_a_follow_up_whose_prior_reply_cannot_be_read_is_left_alone() -> None:
         ]
     )
     assert _follow_up_client(http).fetch_new() == []
+
+
+@pytest.mark.unit
+def test_every_colleague_who_answered_the_carrier_is_listed_for_a_handoff() -> None:
+    """Oldest first, once each — and not a colleague who only wrote to the group."""
+
+    other = "camil.meniano@circledelivers.com"
+    note_writer = "priya@circledelivers.com"
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "c6", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    _thread_message("c1", _CARRIER, "1000", to=_GROUP),
+                    _thread_message("r2", other, "2000", to=_CARRIER, cc=_GROUP),
+                    _thread_message("n3", note_writer, "3000", to=_GROUP),  # internal note
+                    _thread_message("c4", _CARRIER, "4000", to=_GROUP),
+                    _thread_message("r5", _COLLEAGUE, "5000", to=_CARRIER, cc=_GROUP),
+                    _thread_message("r5b", other, "5500", to=_CARRIER, cc=_GROUP),
+                    _thread_message("c6", _CARRIER, "6000", to=_GROUP),
+                ),
+            ),
+            ("/messages/c6", 200, {"id": "c6", "threadId": "t1", "raw": _b64(RAW_CHASE)}),
+            (
+                "/messages/r5b",
+                200,
+                {"id": "r5b", "threadId": "t1", "raw": _b64(RAW_COLLEAGUE_REPLY)},
+            ),
+        ]
+    )
+
+    [chase] = _follow_up_client(http).fetch_new()
+
+    assert chase.prior_reply is not None
+    assert chase.prior_reply.colleagues == (other, _COLLEAGUE)
 
 
 @pytest.mark.unit

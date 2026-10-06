@@ -91,6 +91,9 @@ REPLY
 - Ask for an NOA or billing paperwork ONLY when the intake message explicitly instructs
   it — never on your own, whatever the factoring situation looks like. When instructed,
   use the word "email", never "attach".
+- Never promise, offer or refuse to expedite, fast-track or prioritise a payment, and never
+  describe a process limit ("beyond that process"). Whether a payment can be sped up is a
+  person's decision; state only what the records show.
 - Write as a human teammate would. Never mention tools, checks, authorization or internal
   rules — no "you are authorized", no rule mechanics like "(Tuesday → Thursday same week)".
   State the date; never explain how it was computed.
@@ -162,7 +165,12 @@ PAYMENT_STATUS_SKILL = Skill(
     # carrier is owed, who it WILL go to is a remit instruction §7 forbids agreeing to. The
     # intake now says which kind of email this is, from the gate's own detector, so the
     # instruction and the check cannot disagree.
-    version="1.13.0",
+    #
+    # 1.14.0: never promise or refuse to expedite. RTS Financial asked us to fast-track a
+    # 90-day-old invoice on load 2493116 and the draft answered "we are not able to expedite
+    # the timeline beyond that process" — a policy nobody had stated. The gate's
+    # action_commitments check now blocks it; this keeps the model from writing it.
+    version="1.14.0",
     system_prompt=_PAYMENT_STATUS_PROMPT,
     allowed_tools=PAYMENT_STATUS_TOOLS,
 )
@@ -221,6 +229,9 @@ REPLY
 - Asking for an NOA is a different thing and is still forbidden unless the intake message
   explicitly instructs it — never on your own, whatever the factoring situation looks
   like. When instructed, use the word "email", never "attach".
+- Never promise, offer or refuse to expedite, fast-track or prioritise a payment, and never
+  describe a process limit ("beyond that process"). Whether a payment can be sped up is a
+  person's decision; state only what the records show.
 - Write as a human teammate would. Never mention tools, checks, authorization or internal
   rules — no "you are authorized", no rule mechanics. State facts; never explain how they
   were verified.
@@ -308,7 +319,9 @@ RATE_VERIFICATION_SKILL = Skill(
     # 1.13.0: the same past-tense rule and the same silence when the sender asked us to
     # confirm where payments go — see payment_status 1.13.0. Both prompts gained the pay-to
     # instruction in 1.12.0, so both could write the sentence the gate blocks.
-    version="1.13.0",
+    #
+    # 1.14.0: never promise or refuse to expedite — see payment_status 1.14.0.
+    version="1.14.0",
     system_prompt=_RATE_VERIFICATION_PROMPT,
     allowed_tools=RATE_VERIFICATION_TOOLS,
 )
@@ -381,6 +394,9 @@ REPLY
   delivery date or the payment terms yourself.
 - Citations go only in submit_draft's citations field. Never write tool names or bracketed
   markers in the reply text.
+- Never promise, offer or refuse to expedite, fast-track or prioritise a payment, and never
+  describe a process limit ("beyond that process"). Whether a payment can be sped up is a
+  person's decision; state only what the records show.
 - Write as a human teammate would. Never mention tools, checks, authorization, CargoTel, or
   any internal system or screen.
 - End with the exact sign-off given in the intake message. Never sign as the sender or
@@ -474,7 +490,9 @@ CARGOTEL_PAYMENT_STATUS_SKILL = Skill(
     # draft: "SJC is set up as the factor for this carrier" tripped the gate's
     # change_acknowledgment check, because a setup verb beside "factor" is how a reply that
     # just changed remittance reads. The fact was fine; the verb was not.
-    version="1.4.0",
+    #
+    # 1.5.0: never promise or refuse to expedite — see payment_status 1.14.0.
+    version="1.5.0",
     system_prompt=_CARGOTEL_PAYMENT_STATUS_PROMPT,
     allowed_tools=CARGOTEL_PAYMENT_STATUS_TOOLS,
 )
@@ -601,7 +619,7 @@ def _follow_up_lines(email: InboundEmail) -> list[str]:
         "changed since that reply; what the records say today is the answer.",
         "- If the records now differ from what that reply said, say plainly what has changed "
         "(the paperwork arrived, a pay date is now set, the payment has gone out). If nothing "
-        "has changed, say where things stand now without repeating the whole history.",
+        "has changed, say so in one or two sentences — do not restate that reply.",
         "- That reply is not a source. State no amount, date or status from it that a tool did "
         "not return in this run, do not quote it, and do not comment on it or on its author.",
     ]

@@ -81,6 +81,8 @@ class _ReplyTarget:
     #: Gmail id of the colleague's reply that a follow-up answers. ``None`` for a thread
     #: nobody here has written in — the ordinary case.
     prior_reply_id: str | None = None
+    #: Addresses on our side that wrote to the carrier in the thread, oldest first.
+    colleagues: tuple[str, ...] = ()
 
 
 class SendingDisabledError(ClientError):
@@ -254,7 +256,7 @@ class GmailApiClient:
                         extra={"id": target.message_id, "thread_id": inbound.thread_id},
                     )
                     continue
-                prior = self._prior_reply(target.prior_reply_id)
+                prior = self._prior_reply(target.prior_reply_id, target.colleagues)
                 if prior is None:
                     # Without the reply it follows up on, the draft would answer blind and
                     # could contradict it. Leave the thread with whoever answered, as before.
@@ -321,7 +323,9 @@ class GmailApiClient:
             group_address=self._group or None,
         )
 
-    def _prior_reply(self, message_id: str) -> PriorReply | None:
+    def _prior_reply(
+        self, message_id: str, colleagues: tuple[str, ...] = ()
+    ) -> PriorReply | None:
         """The reply of ours that a follow-up answers, or ``None`` when it cannot be read."""
 
         fetched = self._fetch_raw(message_id)
@@ -338,6 +342,7 @@ class GmailApiClient:
             from_name=parsed.from_name,
             sent_at=sent_at,
             body=parsed.body,
+            colleagues=colleagues,
         )
 
     def _fetch_raw(self, message_id: str) -> tuple[dict[str, Any], Message] | None:
@@ -541,7 +546,18 @@ class GmailApiClient:
                 "after_reply_from": _header_value(prior, "From")[:80],
             },
         )
-        return _ReplyTarget(newest_id, prior_reply_id=str(prior.get("id") or "") or None)
+        colleagues: list[str] = []
+        for message in ours:
+            if not self._addressed_outside(message):
+                continue  # a note to the group is not someone who answered the carrier
+            address = parseaddr(_header_value(message, "From"))[1].strip().lower()
+            if address and address not in colleagues:
+                colleagues.append(address)
+        return _ReplyTarget(
+            newest_id,
+            prior_reply_id=str(prior.get("id") or "") or None,
+            colleagues=tuple(colleagues),
+        )
 
     def _followed_up_reply(self, messages: list[dict[str, Any]]) -> dict[str, Any] | None:
         """Our reply that the thread's newest message follows up on, or ``None``.

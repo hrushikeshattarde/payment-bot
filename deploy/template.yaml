@@ -272,6 +272,16 @@ Parameters:
       colleague's reply is given to the agent as context; the draft goes to approval like any
       other and is never auto-sent. Only carrier-started threads whose latest message of ours
       went to the carrier qualify, and a follow-up that asks nothing ("thanks") drafts nothing.
+  FollowupHandoffCc:
+    Type: String
+    Default: "[]"
+    Description: >
+      JSON list of "Name <address>" entries copied on every follow-up HANDOFF, on top of the
+      colleagues who already answered in the thread. A follow-up is handed to a person rather
+      than answered from the records when the carrier asks us to act (expedite, fast-track),
+      raises a dispute or recourse, or chases again after one automated status answer. This
+      is who can actually move a payment. Empty, a handoff copies the thread's colleagues
+      alone.
   CarrierNameMatch:
     Type: String
     Default: shadow
@@ -555,6 +565,7 @@ Resources:
           PAYBOT_AGENT_ESCALATION_RETRY_LIMIT: !Ref AgentEscalationRetryLimit
           PAYBOT_AUTO_ADD_FACTORING_DOMAINS: !Ref AutoAddFactoringDomains
           PAYBOT_FOLLOWUP_REPLIES: !Ref FollowupReplies
+          PAYBOT_FOLLOWUP_HANDOFF_CC: !Ref FollowupHandoffCc
 
           PAYBOT_REPLY_SIGNATURE: !Ref ReplySignature
           PAYBOT_REPLY_CC: !Ref ReplyCc

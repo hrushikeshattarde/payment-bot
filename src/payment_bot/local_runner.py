@@ -243,6 +243,8 @@ def _render(
         f"FROM    {email.from_name or ''} <{email.from_email}>",
         f"ID      {email.message_id}",
     ]
+    if email.prior_reply is not None:
+        lines.append(f"FOLLOWUP chasing {email.prior_reply.from_email}'s reply")
 
     lines.append(_rule("TOOL TRAIL (§8.1)"))
     for entry in audit.for_correlation(result.correlation_id):
@@ -512,6 +514,9 @@ def _summarise(results: list[PipelineResult]) -> None:
     print(_rule("SUMMARY"))
     for outcome, count in sorted(counts.items(), key=lambda kv: kv[0].value):
         print(f"  {count:>3} x {_OUTCOME_LABEL.get(outcome, outcome.value)}")
+    follow_ups = sum(1 for r in results if r.follow_up_to)
+    if follow_ups:
+        print(f"  ({follow_ups} of these were follow-ups to a colleague's reply)")
     if any(r.outcome is Outcome.SENT for r in results):  # pragma: no cover - defensive
         print("  ⚠ Something reported SENT in a draft-only run — investigate immediately.")
 

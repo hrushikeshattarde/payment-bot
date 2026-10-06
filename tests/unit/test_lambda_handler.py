@@ -288,7 +288,9 @@ def test_the_handler_summarises_outcomes_and_honours_a_limit(
         calls["limit"] = limit
         return [
             PipelineResult(Outcome.AWAITING_REVIEW, "drafted", "c1"),
-            PipelineResult(Outcome.AWAITING_REVIEW, "drafted", "c2"),
+            PipelineResult(
+                Outcome.AWAITING_REVIEW, "drafted", "c2", follow_up_to="angelica@c.com"
+            ),
             PipelineResult(Outcome.ESCALATED, "not authorized", "c3"),
         ]
 
@@ -299,7 +301,12 @@ def test_the_handler_summarises_outcomes_and_honours_a_limit(
     summary = lambda_handler.handler({"limit": 1}, None)
 
     assert calls["limit"] == 1
-    assert summary == {"processed": 3, "outcomes": {"awaiting_review": 2, "escalated": 1}}
+    assert summary == {
+        "processed": 3,
+        "outcomes": {"awaiting_review": 2, "escalated": 1},
+        # The subset that answered a carrier chasing a colleague's reply.
+        "follow_ups": {"awaiting_review": 1},
+    }
 
 
 def test_the_handler_falls_back_to_the_configured_fetch_limit(

@@ -97,6 +97,7 @@ def test_a_chase_is_answered_with_the_colleagues_reply_in_the_agents_hands() -> 
     result = pipeline.process_email(_follow_up("Any update on this? We sent the POD Monday."))
 
     assert result.outcome is Outcome.SENT, result.detail
+    assert result.follow_up_to == _COLLEAGUE  # what the run summary counts follow-ups by
     prompt = llm.calls[0]["messages"][0].content[0].text  # type: ignore[attr-defined]
     assert "FOLLOW-UP" in prompt
     assert "Angelica Baracao <angelica.baracao@circledelivers.com>" in prompt
@@ -120,6 +121,7 @@ def test_a_follow_up_that_asks_nothing_drafts_nothing() -> None:
     result = pipeline.process_email(email)
 
     assert result.outcome is Outcome.NO_ACTION
+    assert result.follow_up_to == _COLLEAGUE
     assert _COLLEAGUE in result.detail
     assert llm.calls == []  # type: ignore[attr-defined]
     assert audit.for_correlation(email.message_id) == []
@@ -138,6 +140,7 @@ def test_the_same_thanks_without_a_prior_reply_is_unchanged() -> None:
     result = pipeline.process_email(email)
 
     assert result.outcome is not Outcome.NO_ACTION
+    assert result.follow_up_to == ""
     assert llm.calls  # type: ignore[attr-defined]
 
 
@@ -153,6 +156,7 @@ def test_a_follow_up_is_never_auto_sent() -> None:
     result = pipeline.process_email(_follow_up("Any update?"))
 
     assert result.outcome is Outcome.REJECTED, result.detail
+    assert result.follow_up_to == _COLLEAGUE
     assert len(slack.approvals) == 1
     assert gmail.sent == []
 

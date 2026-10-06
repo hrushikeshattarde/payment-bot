@@ -730,9 +730,14 @@ def handler(event: dict[str, Any] | None = None, context: Any = None) -> dict[st
         save_chat_post_ledger(chat_ledger, chat_ledger_bucket)
 
     counts: dict[str, int] = {}
+    follow_ups: dict[str, int] = {}
     for result in results:
         counts[result.outcome.value] = counts.get(result.outcome.value, 0) + 1
-    summary = {"processed": len(results), "outcomes": counts}
+        if result.follow_up_to:
+            follow_ups[result.outcome.value] = follow_ups.get(result.outcome.value, 0) + 1
+    # `follow_ups` is the subset of `outcomes` that answered a carrier chasing a colleague's
+    # reply (Settings.followup_replies) — how many of a run's cards and escalations they were.
+    summary = {"processed": len(results), "outcomes": counts, "follow_ups": follow_ups}
 
     # A SENT in a draft-only deployment means one of the three guarantees has broken. Log it
     # at error so the RunFailures alarm catches it; do not raise, because the drafts this run

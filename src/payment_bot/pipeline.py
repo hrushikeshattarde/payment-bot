@@ -196,6 +196,10 @@ class PipelineResult:
     #: one load, up to fifty for five. A budget counted in attempts prices those the same,
     #: which is what made the expensive one worth three of them.
     after_agent: bool = False
+    #: The colleague whose reply this email was chasing; blank for first contact. Stamped by
+    #: ``process_email`` on every outcome, so a run can say how many of its drafts and
+    #: escalations were follow-ups — nothing else in the result tells them apart.
+    follow_up_to: str = ""
 
 
 class PaymentBotPipeline:
@@ -259,12 +263,28 @@ class PaymentBotPipeline:
     def process_email(self, email: InboundEmail) -> PipelineResult:
         correlation_id = email.message_id
         try:
-            return self._process(email, correlation_id)
+            result = self._process(email, correlation_id)
         except PaymentBotError as exc:  # expected-but-unhandled → fail closed
-            return self._escalate(email, "review", f"unhandled error: {exc}", (), correlation_id)
+            result = self._escalate(email, "review", f"unhandled error: {exc}", (), correlation_id)
         except Exception as exc:  # last-resort safety net; never send on a bug
             _log.exception("pipeline_crash", extra={"correlation_id": correlation_id})
-            return self._escalate(email, "security", f"pipeline crash: {exc}", (), correlation_id)
+            result = self._escalate(
+                email, "security", f"pipeline crash: {exc}", (), correlation_id
+            )
+        if email.prior_reply is not None:
+            # Here, once, rather than at each of the many returns in `_process`: every
+            # outcome of a follow-up gets the stamp and the one searchable log line.
+            result.follow_up_to = email.prior_reply.from_email
+            _log.info(
+                "follow_up_outcome",
+                extra={
+                    "correlation_id": correlation_id,
+                    "outcome": result.outcome.value,
+                    "follow_up_to": result.follow_up_to,
+                    "detail": result.detail[:300],
+                },
+            )
+        return result
 
     # -- internal flow -------------------------------------------------------
     def _process(self, email: InboundEmail, correlation_id: str) -> PipelineResult:

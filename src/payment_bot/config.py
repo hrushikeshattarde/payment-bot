@@ -640,8 +640,12 @@ class Settings(BaseSettings):
     #: said, asks how we work, or sends new information. The handoff copies whoever answered
     #: the carrier before — but
     #: when a colleague only ever approved the bot's drafts, copying them loops in nobody new.
-    #: This is the person who can actually move a payment. Empty, the handoff copies the
-    #: thread's colleagues alone; with neither, the follow-up escalates instead.
+    #: This is the person who can actually move a payment.
+    #:
+    #: Empty (the default), NO handoff email is sent. The reply promises the copied people
+    #: "will follow up with you directly", and with no owner that is a promise nobody keeps —
+    #: half the chases after a bot-drafted reply were never answered by anyone. The follow-up
+    #: goes to the team as a Chat card instead. Naming an owner here turns the email on.
     followup_handoff_cc: tuple[str, ...] = ()
 
     #: Gmail search syntax (not IMAP): ``is:unread``, ``newer_than:2d``, ``from:…``.

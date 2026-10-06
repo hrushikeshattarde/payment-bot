@@ -51,14 +51,28 @@ def _entry(message_id: str = "<m1@carrier.test>") -> PendingApproval:
 class FakeGmail:
     """Records what a click did in whose mailbox; the assertions read the raw MIME."""
 
-    def __init__(self, clicker: str, *, fail: bool = False) -> None:
+    def __init__(
+        self,
+        clicker: str,
+        *,
+        fail: bool = False,
+        answered_by: str = "",
+        thread_unreadable: bool = False,
+    ) -> None:
         self.clicker = clicker
         self.fail = fail
+        self.answered_by = answered_by
+        self.thread_unreadable = thread_unreadable
         self.sent: list[tuple[bytes, str]] = []
         self.drafted: list[tuple[bytes, str]] = []
 
     def resolve_thread(self, message_id: str) -> str:
         return "t-clicker-copy"
+
+    def answered_after(self, thread_id: str, message_id: str, group: str) -> str:
+        if self.thread_unreadable:
+            raise RuntimeError("could not check the thread for an earlier reply: HTTP 503")
+        return self.answered_by
 
     def send(self, raw: bytes, thread_id: str) -> str:
         if self.fail:
@@ -187,6 +201,118 @@ def test_failed_send_releases_the_claim_for_a_retry() -> None:
     )
     assert len(ok.sent) == 1
     assert store.result(entry.entry_id)["status"] == "sent"
+
+
+# --- never a second answer to a thread someone already answered ---------------------------
+# The worker never drafts after a reply of ours, and the queue tracker retires a card whose
+# thread was answered — but only on its next refresh. A colleague who answers from Gmail in
+# between, and then (or a teammate) clicks Approve, would send the carrier a second reply.
+def test_approve_sends_nothing_when_someone_already_replied_in_gmail() -> None:
+    store, entry = _store_with_entry()
+    fake = FakeGmail("priya@circledelivers.com", answered_by="camil@circledelivers.com")
+
+    response = _act(
+        _settings(), store, entry.entry_id, "approve", "priya@circledelivers.com",
+        gmail_factory=lambda clicker: fake,
+    )
+
+    assert fake.sent == [] and fake.drafted == []
+    result = store.result(entry.entry_id)
+    assert result is not None
+    assert (result["status"], result["by"]) == ("answered_elsewhere", "camil@circledelivers.com")
+    assert "Not sent" in response["body"] and "camil@circledelivers.com" in response["body"]
+
+
+def test_the_same_person_cannot_answer_twice_either() -> None:
+    """Camil replied by hand, forgot the card, then clicked Approve on it."""
+
+    store, entry = _store_with_entry()
+    camil = "priya@circledelivers.com"
+    fake = FakeGmail(camil, answered_by=camil)
+
+    _act(_settings(), store, entry.entry_id, "approve", camil, gmail_factory=lambda c: fake)
+
+    assert fake.sent == []
+    assert store.result(entry.entry_id)["status"] == "answered_elsewhere"
+
+
+def test_move_to_drafts_is_refused_too_when_already_answered() -> None:
+    store, entry = _store_with_entry()
+    fake = FakeGmail("priya@circledelivers.com", answered_by="camil@circledelivers.com")
+
+    _act(
+        _settings(), store, entry.entry_id, "move_to_drafts", "priya@circledelivers.com",
+        gmail_factory=lambda clicker: fake,
+    )
+
+    assert fake.drafted == []
+    assert store.result(entry.entry_id)["status"] == "answered_elsewhere"
+
+
+def test_a_thread_that_cannot_be_checked_is_not_sent_into() -> None:
+    """Fail closed, but retryable: the claim is released and the card stays live."""
+
+    store, entry = _store_with_entry()
+    fake = FakeGmail("priya@circledelivers.com", thread_unreadable=True)
+
+    response = _act(
+        _settings(), store, entry.entry_id, "approve", "priya@circledelivers.com",
+        gmail_factory=lambda clicker: fake,
+    )
+
+    assert fake.sent == []
+    assert store.result(entry.entry_id) is None
+    assert "try again" in response["body"]
+
+
+class _ThreadTransport:
+    def __init__(self, messages: list[dict[str, Any]], status: int = 200) -> None:
+        self.messages = messages
+        self.status = status
+
+    def request(self, method: str, url: str, **_: Any) -> Any:
+        from payment_bot.clients.http import HttpResponse
+
+        return HttpResponse(self.status, json.dumps({"messages": self.messages}).encode())
+
+
+def _meta(sender: str, at: int, rfc_id: str = "", labels: tuple[str, ...] = ()) -> dict[str, Any]:
+    headers = [{"name": "From", "value": sender}]
+    if rfc_id:
+        headers.append({"name": "Message-ID", "value": rfc_id})
+    return {"internalDate": str(at), "labelIds": list(labels), "payload": {"headers": headers}}
+
+
+def _clicker_gmail(messages: list[dict[str, Any]], status: int = 200) -> Any:
+    gmail = chat_callback.ClickerGmail.__new__(chat_callback.ClickerGmail)
+    gmail._clicker = "priya@circledelivers.com"
+    gmail._transport = _ThreadTransport(messages, status)
+    gmail._timeout = 5.0
+    gmail._headers = lambda: {}  # type: ignore[method-assign]
+    return gmail
+
+
+def test_the_live_check_reads_only_what_came_after_the_carriers_message() -> None:
+    group = "paystatus@circledelivers.com"
+    thread = [
+        _meta("Camil <camil@circledelivers.com>", 1000),  # our first answer — before the chase
+        _meta("Jake <jake@carrier.test>", 2000, rfc_id="<chase@carrier.test>"),
+        _meta(f"Jake via Payment Status <{group}>", 2500),  # DMARC-rewritten carrier mail
+        _meta("Camil <camil@circledelivers.com>", 2800, labels=("DRAFT",)),  # unsent
+        _meta("Someone <someone@other.test>", 2900),
+    ]
+    gmail = _clicker_gmail(thread)
+    assert gmail.answered_after("t", "<chase@carrier.test>", group) == ""
+
+    thread.append(_meta("Camil Meniano <camil@circledelivers.com>", 3000))
+    assert gmail.answered_after("t", "<chase@carrier.test>", group) == "camil@circledelivers.com"
+    # The carrier's message not in the thread at all: nothing to compare against.
+    assert gmail.answered_after("t", "<other@carrier.test>", group) == ""
+
+
+def test_the_live_check_raises_when_the_thread_cannot_be_read() -> None:
+    with pytest.raises(RuntimeError, match="could not check"):
+        _clicker_gmail([], status=503).answered_after("t", "<m>", "paystatus@circledelivers.com")
 
 
 def test_missing_entry_is_a_message_not_a_crash() -> None:

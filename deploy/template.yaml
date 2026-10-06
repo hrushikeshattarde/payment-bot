@@ -280,9 +280,9 @@ Parameters:
       colleagues who already answered in the thread. A follow-up is handed to a person rather
       than answered from the records when it presses for payment (aging, expedite,
       recourse), says a payment never arrived, disputes what we said, asks how we work, or
-      sends new information. This
-      is who can actually move a payment. Empty, a handoff copies the thread's colleagues
-      alone.
+      sends new information. This is who can actually move a payment. Empty (the default),
+      no handoff email goes to the carrier — the follow-up is a Chat card for the team —
+      because "they will follow up with you" is a promise only a named owner can keep.
   CarrierNameMatch:
     Type: String
     Default: shadow

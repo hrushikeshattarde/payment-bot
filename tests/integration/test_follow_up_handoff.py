@@ -321,19 +321,36 @@ def test_a_re_run_reuses_the_verdict_instead_of_asking_again() -> None:
 
 
 @pytest.mark.integration
-def test_a_handoff_with_nobody_to_copy_escalates_instead() -> None:
-    """ "They are copied" must be true, or the reply cannot be sent."""
+def test_with_no_owner_named_a_handoff_is_a_card_and_no_email() -> None:
+    """ "They will follow up with you directly" is a promise only a named owner can keep."""
 
-    pipeline, slack, _ = _pipeline(InMemoryFollowUpStore(), _reader("pressure"), handoff_cc=())
-    email = _jake(_FAST_TRACK).model_copy(
-        update={"prior_reply": PriorReply(from_email=_CAMIL, body=_CAMIL_REPLY)}
+    store = InMemoryFollowUpStore()
+    pipeline, slack, llm = _pipeline(
+        store, _reader("pressure", "Wants the invoice fast-tracked."), handoff_cc=()
     )
 
-    result = pipeline.process_email(email)
+    result = pipeline.process_email(_jake(_FAST_TRACK))
 
     assert result.outcome is Outcome.ESCALATED
-    assert "nobody to copy" in result.detail and "FollowupHandoffCc" in result.detail
-    assert slack.approvals == []
+    assert result.follow_up_action == ACTION_HANDOFF
+    assert result.draft is None and slack.approvals == []
+    assert len(slack.escalations) == 1
+    assert "needs a person" in result.detail and "Wants the invoice fast-tracked" in result.detail
+    assert "Last reply (Camil Meniano on Mon Oct 5)" in result.detail
+    assert _CAMIL in result.detail and "No email sent" in result.detail
+    assert llm.calls == []
+    assert store.history(_THREAD)[0].action == ACTION_HANDOFF
+
+
+@pytest.mark.integration
+def test_the_card_says_how_many_times_they_have_chased() -> None:
+    store = InMemoryFollowUpStore()
+    pipeline, _, _ = _pipeline(store, _reader("pressure", "Still waiting."), handoff_cc=())
+
+    pipeline.process_email(_jake(_FAST_TRACK))
+    second = pipeline.process_email(_jake(_RECOURSE, "<chase2@rtsfinancial.com>"))
+
+    assert "Follow-up #2 in this thread" in second.detail
 
 
 @pytest.mark.integration

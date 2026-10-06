@@ -35,6 +35,7 @@ import json
 import os
 import time
 import urllib.parse
+from email.utils import parseaddr
 from typing import Any
 
 from payment_bot.approvals import ApprovalStore, PendingApproval, S3ApprovalStore
@@ -294,6 +295,52 @@ class ClickerGmail:
             return str(messages[0].get("threadId") or "")
         return ""
 
+    def answered_after(self, thread_id: str, message_id: str, group: str) -> str:
+        """Who on our side already replied after ``message_id`` in this thread, or ``""``.
+
+        Read live, at the click, from the clicker's own copy of the thread: a colleague's
+        reply Cc's the group, so it lands there, and the clicker's own reply sits in it as
+        Sent mail. Ours means the clicker's domain, minus the group address itself — a
+        DMARC-rewritten carrier arrives From the group and is not an answer. Drafts are not
+        answers either. ``""`` when nothing of ours follows the carrier's message, or the
+        message is not in the thread at all (nothing to compare against).
+
+        Raises when the thread cannot be read: sending into a thread nobody could check is
+        exactly the duplicate this exists to prevent, so the click fails and can be retried.
+        """
+
+        fields = "&".join(f"metadataHeaders={h}" for h in ("From", "Message-ID"))
+        response = self._transport.request(
+            "GET",
+            f"{GMAIL_API_BASE}/users/{self._user()}/threads/"
+            f"{urllib.parse.quote(thread_id)}?format=metadata&{fields}",
+            headers=self._headers(),
+            timeout=self._timeout,
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"could not check the thread for an earlier reply: HTTP {response.status}"
+            )
+        data = response.json()
+        messages = [
+            m for m in (data.get("messages") if isinstance(data, dict) else None) or []
+            if isinstance(m, dict)
+        ]
+        messages.sort(key=lambda m: int(m.get("internalDate") or 0))
+        domain = self._clicker.rsplit("@", 1)[-1].lower()
+        wanted = message_id.strip()
+        seen_carrier = False
+        for message in messages:
+            if not seen_carrier:
+                seen_carrier = _header(message, "Message-ID").strip() == wanted
+                continue
+            if "DRAFT" in (message.get("labelIds") or []):
+                continue
+            sender = parseaddr(_header(message, "From"))[1].strip().lower()
+            if sender and sender != group.lower() and sender.endswith(f"@{domain}"):
+                return sender
+        return ""
+
     def send(self, raw_rfc822: bytes, thread_id: str) -> str:
         """``messages.send`` as the clicker. Returns the sent message id. Raises on failure."""
 
@@ -516,6 +563,34 @@ def _act(
         factory = gmail_factory or _default_gmail_factory(settings)
         gmail: ClickerGmail = factory(clicker)
         thread_id = gmail.resolve_thread(raw.message_id)
+
+        # Has someone already answered this by hand? The worker never drafts after a reply
+        # of ours, and the queue tracker retires a card whose thread was answered — but only
+        # on its next refresh, and it trusts a checked state for half an hour. A colleague
+        # who replies from Gmail meanwhile, and then (or a teammate) clicks Approve, would
+        # send the carrier a second answer — the same person answering twice, as the carrier
+        # sees it. So the thread is read once more, live, at the click.
+        answered_by = (
+            gmail.answered_after(thread_id, raw.message_id, settings.mailbox)
+            if thread_id
+            else ""
+        )
+        if answered_by:
+            store.put_result(
+                entry_id, {"status": "answered_elsewhere", "by": answered_by, "at": now}
+            )
+            _log.info(
+                "approval_already_answered",
+                extra={"entry_id": entry_id, "clicker": clicker, "answered_by": answered_by},
+            )
+            return _update_card_response(
+                store,
+                entry_id,
+                f"Not sent — {answered_by} already replied to this in Gmail.",
+                entry=raw,
+                addons=addons,
+            )
+
         mime = _reply_mime(raw, clicker)
 
         if action == ACTION_MOVE:
@@ -831,6 +906,16 @@ def _update_card_response(
         message_id=entry.message_id,
     )
     return _replace_cards([card], addons)
+
+
+def _header(message: dict[str, Any], name: str) -> str:
+    """One header from a ``format=metadata`` message, case-insensitively."""
+
+    wanted = name.lower()
+    for header in (message.get("payload") or {}).get("headers") or []:
+        if isinstance(header, dict) and str(header.get("name", "")).lower() == wanted:
+            return str(header.get("value") or "")
+    return ""
 
 
 def _now_iso() -> str:

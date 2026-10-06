@@ -1261,8 +1261,10 @@ class PaymentBotPipeline:
 
         * already handed off — no email; a notice card for the people who have it. The
           carrier was told who is on it, and telling them again is a repeat;
-        * anything else — a handoff reply copying the colleagues, who can do what the records
-          cannot: reissue, expedite, settle a dispute, take in new paperwork.
+        * anything else, with ``followup_handoff_cc`` naming an owner — a handoff reply
+          copying the colleagues and the owner, who can do what the records cannot:
+          reissue, expedite, settle a dispute, take in new paperwork;
+        * anything else, with no owner named — a card for the people, and no email at all.
         """
 
         prior = email.prior_reply
@@ -1286,6 +1288,28 @@ class PaymentBotPipeline:
             return None
 
         reason = f"they {asked}"
+        if not self._settings.followup_handoff_cc:
+            # No named owner, so no email. The handoff reply tells the carrier the people
+            # copied "will follow up with you directly", and with nobody assigned that is a
+            # promise nobody keeps: on 300 real chases, half of those after a bot-drafted
+            # reply were never answered by anyone. Until FollowupHandoffCc names someone who
+            # can act, the follow-up goes to the people as a card and the carrier hears from
+            # a person, or not at all — never a holding line followed by silence.
+            chases = 1 + sum(1 for h in history if h.message_id != email.message_id)
+            result = self._escalate(
+                email,
+                "review",
+                f"follow-up needs a person — {reason}. Last reply ({_who(prior)}{_when(prior)}):"
+                f" {_excerpt(prior.body)}. In the thread: "
+                f"{', '.join(prior.colleagues) or prior.from_email}"
+                + (f". Follow-up #{chases} in this thread" if chases > 1 else "")
+                + ". No email sent.",
+                tuple(load_ids),
+                correlation_id,
+            )
+            result.follow_up_action = ACTION_HANDOFF
+            return result
+
         cc = self._handoff_cc(email)
         if not cc:
             result = self._escalate(

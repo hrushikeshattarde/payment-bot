@@ -2,10 +2,10 @@
 
 A follow-up is a carrier writing again in a thread someone on our side already answered
 (``Settings.followup_replies``). Deciding what to do with one needs memory a single email
-does not carry: has this thread already had an automated status answer, and has it already
-been handed to a person? Without it, live on an RTS Financial thread about load 2493116, the
-bot restated the same "pending, no pay date" three times in eighteen hours to a factor who
-had stopped asking for the status and started asking us to expedite.
+does not carry: has this thread already been handed to a person, and what did the reader
+make of this message last time it ran? Live, on an RTS Financial thread about load 2493116,
+the bot restated the same "pending, no pay date" three times in eighteen hours to a factor
+who had stopped asking for the status and started asking us to expedite.
 
 One small JSON object per thread, in the config bucket under the worker's existing
 ``state/*`` grant — no new IAM. It doubles as the audit trail of every automated follow-up:
@@ -40,11 +40,6 @@ ACTION_HANDOFF = "handoff"
 #: A chase after a handoff: no email, a card for the people who have it.
 ACTION_NOTICE = "notice"
 
-#: Automated status answers one thread may receive. One, because the second is the repeat:
-#: if the first did not satisfy the carrier, re-reading unchanged records will not either,
-#: and a person has to look.
-MAX_STATUS_UPDATES = 1
-
 #: Outcomes that put a draft in front of a reviewer. A blocked or escalated attempt drafted
 #: nothing the carrier could have received, so it does not count toward the cap.
 _DRAFTED = frozenset({"awaiting_review", "sent", "rejected"})
@@ -59,10 +54,14 @@ class FollowUpRecord:
     """One follow-up and what the bot did with it."""
 
     message_id: str
+    #: The reader's kind (``followup_reader.FollowUpKind``) for this message.
     ask: str
     action: str
     outcome: str
     at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    #: The reader's one-line account of what the sender wants. Kept so a re-run of the same
+    #: message reuses the verdict instead of paying for the model again.
+    summary: str = ""
     after_reply_from: str = ""
     evidence: tuple[str, ...] = ()
     loads: tuple[str, ...] = ()
@@ -85,6 +84,7 @@ class FollowUpRecord:
             action=str(data.get("action") or ""),
             outcome=str(data.get("outcome") or ""),
             at=str(data.get("at") or ""),
+            summary=str(data.get("summary") or ""),
             after_reply_from=str(data.get("after_reply_from") or ""),
             evidence=tuple(str(v) for v in data.get("evidence") or ()),
             loads=tuple(str(v) for v in data.get("loads") or ()),
@@ -98,10 +98,74 @@ class FollowUpRecord:
         return self.outcome in _DRAFTED
 
 
-def status_updates(history: list[FollowUpRecord]) -> int:
-    """Automated status answers this thread has already been given."""
+#: --- "does this draft say anything new?" ---------------------------------------------
+#:
+#: Replaces a cap of one automated status answer per thread, which stood in for the real rule
+#: and missed it both ways: it allowed the first repeat (RTS Financial, load 2493116, was sent
+#: "pending, no pay date" while asking us to expedite), and it would refuse a second answer
+#: that genuinely carried news. The rule is now direct — compare the draft with the reply it
+#: follows up on, and send nothing if nothing a carrier can act on has changed.
+#:
+#: "Something a carrier can act on" is a date, a check number or a payment method: what
+#: appears when a load is scheduled, paid or settled. Amounts barely move and status words
+#: arrive negated ("not yet billed"), so neither counts — except that a draft giving figures
+#: after a reply that gave none (the portal link, a "let me check") IS news.
 
-    return sum(1 for r in history if r.action == ACTION_STATUS_UPDATE and r.drafted)
+_MONTHS = {
+    m: i + 1
+    for i, m in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+    )
+}
+_DATE_WORDS_RE = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b",
+    re.IGNORECASE,
+)
+_DATE_SLASH_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/\d{2,4})?\b")
+_DATE_ISO_RE = re.compile(r"\b\d{4}-(\d{2})-(\d{2})\b")
+_CHECK_NO_RE = re.compile(r"\bcheck\s*(?:#|no\.?|number)?\s*:?\s*(\d{4,})", re.IGNORECASE)
+_METHOD_RE = re.compile(
+    r"\b(direct deposit|ach|wire(?: transfer)?|comdata|efs|zelle|(?:by|via) check)\b",
+    re.IGNORECASE,
+)
+_AMOUNT_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{2}))?")
+
+
+def _signals(text: str) -> set[str]:
+    """Dates (month-day), check numbers and payment methods in ``text``."""
+
+    found: set[str] = set()
+    for month, day in _DATE_WORDS_RE.findall(text):
+        found.add(f"date {_MONTHS[month[:3].lower()]}/{int(day)}")
+    for month, day in _DATE_SLASH_RE.findall(text):
+        if 1 <= int(month) <= 12 and 1 <= int(day) <= 31:
+            found.add(f"date {int(month)}/{int(day)}")
+    for month, day in _DATE_ISO_RE.findall(text):
+        found.add(f"date {int(month)}/{int(day)}")
+    found |= {f"check #{n}" for n in _CHECK_NO_RE.findall(text)}
+    for method in _METHOD_RE.findall(text):
+        name = method.lower().replace("by ", "").replace("via ", "")
+        found.add(f"paid by {'wire' if name.startswith('wire') else name}")
+    return found
+
+
+def _amounts(text: str) -> set[str]:
+    return {f"${whole.replace(',', '')}.{cents or '00'}" for whole, cents in _AMOUNT_RE.findall(text)}
+
+
+def new_facts(draft: str, prior: str) -> list[str]:
+    """What ``draft`` tells the carrier that ``prior`` (our last reply) did not. Empty means
+    the draft is a repeat and must not be sent.
+
+    ``prior`` should be what we wrote, quoted history stripped — the carrier's own figures
+    quoted beneath our reply are not things we told them.
+    """
+
+    fresh = _signals(draft) - _signals(prior)
+    prior_amounts = _amounts(prior)
+    if not prior_amounts:
+        fresh |= _amounts(draft)
+    return sorted(fresh)
 
 
 def handed_off(history: list[FollowUpRecord]) -> bool:

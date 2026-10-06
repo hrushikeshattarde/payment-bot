@@ -608,13 +608,25 @@ def _follow_up_lines(email: InboundEmail) -> list[str]:
     written = strip_quoted(prior.body).strip()
     if len(written) > _PRIOR_REPLY_CHARS:
         written = written[:_PRIOR_REPLY_CHARS].rstrip() + " [...]"
-    return [
+    lines = [
         "",
         f"This is a FOLLOW-UP. {who} on our team already replied in this thread{when}, and "
         "the sender has written again (the Body above). Our earlier reply, for context only:",
         '"""',
         written or "(no text)",
         '"""',
+    ]
+    if prior.ask_summary:
+        lines.append(f"- What they want now: {prior.ask_summary}")
+    if prior.ask_kind == "payment_proof":
+        lines.append(
+            "- They are asking for payment details. If the records show the load paid, give "
+            "the payment method, the check number when there is one, the amount and the date. "
+            "If it is not paid, say so plainly. You cannot attach a remittance document; do "
+            "not offer one."
+        )
+    return [
+        *lines,
         "- Check every load again with the tools now. Status, paperwork and dates may have "
         "changed since that reply; what the records say today is the answer.",
         "- If the records now differ from what that reply said, say plainly what has changed "

@@ -266,20 +266,21 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: >
-      Draft a fresh update when a carrier chases ("any update?") in a thread a colleague
-      already answered. Off, any message from our side retires a thread for good and the
-      follow-up waits for whoever answered first. On, the loads are re-checked live and the
-      colleague's reply is given to the agent as context; the draft goes to approval like any
-      other and is never auto-sent. Only carrier-started threads whose latest message of ours
-      went to the carrier qualify, and a follow-up that asks nothing ("thanks") drafts nothing.
+      Handle a carrier writing again in a thread a colleague already answered. Off, any
+      message from our side retires a thread for good. On, the model reads the follow-up next
+      to our last reply: a status or payment-details ask is re-checked live and drafted only
+      if the draft says something new; pressure, a missing payment, a dispute, a process
+      question or new information is handed to the colleagues on Cc; thanks drafts nothing.
+      Every draft goes to approval and is never auto-sent. Carrier-started threads only.
   FollowupHandoffCc:
     Type: String
     Default: "[]"
     Description: >
       JSON list of "Name <address>" entries copied on every follow-up HANDOFF, on top of the
       colleagues who already answered in the thread. A follow-up is handed to a person rather
-      than answered from the records when the carrier asks us to act (expedite, fast-track),
-      raises a dispute or recourse, or chases again after one automated status answer. This
+      than answered from the records when it presses for payment (aging, expedite,
+      recourse), says a payment never arrived, disputes what we said, asks how we work, or
+      sends new information. This
       is who can actually move a payment. Empty, a handoff copies the thread's colleagues
       alone.
   CarrierNameMatch:

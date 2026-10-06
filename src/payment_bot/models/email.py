@@ -89,6 +89,11 @@ class PriorReply(BaseModel):
     #: Everyone on our side who wrote to the carrier in this thread, oldest first, this
     #: reply's author included — who a handoff copies, because they know the conversation.
     colleagues: tuple[str, ...] = ()
+    #: What the follow-up wants, filled by the pipeline from ``payment_bot.followup_reader``
+    #: (a ``FollowUpKind`` value and a one-line summary) so the agent's intake can say what
+    #: was asked. Blank until the pipeline has read the follow-up.
+    ask_kind: str = ""
+    ask_summary: str = ""
 
 
 class InboundEmail(BaseModel):

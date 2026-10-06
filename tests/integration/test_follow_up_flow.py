@@ -22,6 +22,7 @@ from payment_bot.clients import (
     ScriptedApprovalResolver,
 )
 from payment_bot.clients.google_chat import approval_card
+from payment_bot.clients.llm import LlmResponse, ScriptedLlmClient, ToolUseBlock
 from payment_bot.config import RolloutPhase, Settings
 from payment_bot.logging import InMemoryAuditSink
 from payment_bot.models import InboundEmail, PriorReply
@@ -35,7 +36,7 @@ from payment_bot.tools.base import ToolContext
 from payment_bot.tools.shared import (
     ExtractIdentifiers,
     ExtractIdentifiersInput,
-    asks_for_an_update,
+    follow_up_asks,
 )
 
 _COLLEAGUE = "angelica.baracao@circledelivers.com"
@@ -70,9 +71,27 @@ def _follow_up(written: str) -> InboundEmail:
     )
 
 
+def _reader(kind: str, summary: str = "they want an update") -> ScriptedLlmClient:
+    """The follow-up reader's verdict, scripted — the model's side of it is evaluated on
+    real mail separately; these tests are about what the pipeline does with each verdict."""
+
+    verdict = LlmResponse(
+        stop_reason="tool_use",
+        content=[
+            ToolUseBlock(
+                tool_use_id="r1",
+                name="report_follow_up",
+                input={"kind": kind, "summary": summary},
+            )
+        ],
+    )
+    return ScriptedLlmClient(responses=[verdict] * 5)
+
+
 def _pipeline(
     resolver: ScriptedApprovalResolver,
     settings: Settings | None = None,
+    kind: str = "status",
 ) -> tuple[PaymentBotPipeline, MockSlackClient, MockGmailClient, object, InMemoryAuditSink]:
     gmail, slack, audit = MockGmailClient(), MockSlackClient(), InMemoryAuditSink()
     llm = scripted_payment_status_llm()
@@ -84,6 +103,7 @@ def _pipeline(
         approval_resolver=resolver,
         audit_sink=audit,
         settings=settings,
+        followup_reader_llm=_reader(kind),
     )
     return pipeline, slack, gmail, llm, audit
 
@@ -135,7 +155,7 @@ def test_a_follow_up_that_asks_nothing_drafts_nothing() -> None:
     """A "thanks" after the colleague's answer closes the conversation."""
 
     pipeline, slack, gmail, llm, audit = _pipeline(
-        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE))
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE)), kind="thanks"
     )
     email = _follow_up("Thank you, appreciate it.")
 
@@ -246,25 +266,29 @@ def test_first_contact_intake_carries_no_follow_up_lines() -> None:
     "written",
     [
         "Any update?",
-        "Following up on this one.",
-        "We still haven't received payment for this load",
-        "When will this be paid",
-        "Please advise.",
-        "Status please",
-        "Can you check again",
+        "Thank you! I have attached our voided check. Please provide payment details.",
+        "Hello team\nBoth loads were invoiced already.\n\nThank you,\nCrystal",
+        "Thanks, can you check again?",
+        "Good morning,",  # nothing written: the reader calls it empty
     ],
 )
-def test_these_follow_ups_ask_for_something(written: str) -> None:
-    assert asks_for_an_update(written)
+def test_everything_but_a_bare_thank_you_reaches_the_reader(written: str) -> None:
+    assert follow_up_asks(_follow_up("").model_copy(update={"body": written}))
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "written",
-    ["Thank you!", "Received, thanks.", "Noted, appreciate it", "Got it", "", "Attached."],
+    [
+        "Thank you!",
+        "Received, thank you!",
+        "Thank you for the update.",
+        "Got it",
+        "Received, thank you!\n\nThanks,\nBob",
+    ],
 )
-def test_these_follow_ups_close_the_conversation(written: str) -> None:
-    assert not asks_for_an_update(written)
+def test_a_bare_thank_you_never_takes_a_slot(written: str) -> None:
+    assert not follow_up_asks(_follow_up("").model_copy(update={"body": written}))
 
 
 @pytest.mark.unit

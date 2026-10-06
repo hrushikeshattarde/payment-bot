@@ -616,24 +616,29 @@ class Settings(BaseSettings):
     #: Draft an update when a carrier follows up on a reply a colleague already sent.
     #:
     #: The shape: a carrier writes in, someone here answers them, and days later the carrier
-    #: writes again in the same thread — "any update?". Off, any message from our side
-    #: anywhere in a thread retires it for good, so that follow-up waits for whoever answered
-    #: first. On, the follow-up is answered like fresh mail — the loads are re-checked live,
-    #: so the draft carries what the records say NOW — with the colleague's reply handed to
-    #: the agent as context, never as a source. Still a human-approved draft; never auto-sent.
+    #: writes again in the same thread. Off, any message from our side anywhere in a thread
+    #: retires it for good, so the follow-up waits for whoever answered first. On, a model
+    #: reads the follow-up next to the reply it answers (``payment_bot.followup_reader``) and
+    #: the pipeline routes it:
     #:
-    #: Narrow on purpose. It applies only when the CARRIER started the thread, our latest
-    #: message in it was addressed to them (internal chatter is not an answer), nothing of ours
-    #: came after it, and what they just wrote asks for something. A thread a colleague started
-    #: — outbound mail with the group Cc'd — stays theirs, and a bare "thanks" drafts nothing.
+    #: * a status or payment-details ask is re-checked live and drafted — only if the draft
+    #:   says something the last reply did not (``followups.new_facts``); otherwise a card;
+    #: * pressure, a missing payment, a dispute, a process question or new information is
+    #:   handed to the colleagues, copied on a code-authored reply;
+    #: * a thank-you, or nothing, drafts nothing.
+    #:
+    #: Every draft is human-approved and none is ever auto-sent. Only CARRIER-started threads
+    #: qualify, where our latest message went to the carrier (internal chatter is not an
+    #: answer) and nothing of ours came after it; a thread a colleague started stays theirs.
     followup_replies: bool = False
 
     #: Who a follow-up HANDOFF copies, on top of the colleagues who already answered in the
     #: thread. Entries are ``"Name <address>"`` or bare addresses.
     #:
-    #: A follow-up is handed to a person, not answered from the records, when the carrier asks
-    #: us to act (expedite, fast-track), raises a dispute or recourse, or chases again after an
-    #: automated status answer. The handoff copies whoever answered the carrier before — but
+    #: A follow-up is handed to a person, not answered from the records, when it presses for
+    #: payment (aging, expedite, recourse), says a payment never arrived, disputes what we
+    #: said, asks how we work, or sends new information. The handoff copies whoever answered
+    #: the carrier before — but
     #: when a colleague only ever approved the bot's drafts, copying them loops in nobody new.
     #: This is the person who can actually move a payment. Empty, the handoff copies the
     #: thread's colleagues alone; with neither, the follow-up escalates instead.

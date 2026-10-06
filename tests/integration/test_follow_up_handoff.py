@@ -1,13 +1,18 @@
-"""Integration tests: a follow-up is answered by what it ASKS, and never twice the same way.
+"""Integration tests: a follow-up is answered by what it WANTS, and never with a repeat.
 
-Replays the live failure. RTS Financial asked about load 2493116; Camil's (bot-drafted) reply
-said pending, no pay date. Jake then wrote "over 90 days old — can you fast track payment and
-provide a status?" and got the same status plus "we are not able to expedite", then "we
-will have to recourse this" and got the same status a third time.
+The follow-up reader (``payment_bot.followup_reader``) decides what a chase wants; its
+accuracy is measured separately against 80 hand-labelled real chases. These tests script
+its verdict and check what the pipeline does with each one:
 
-Now: an ask to act, a dispute, or a second chase goes to a person — a code-authored handoff
-copying the colleagues — and a chase after a handoff sends nothing more. Every decision is
-recorded per thread.
+* a status or payment-details ask is answered from the records — but only if the draft says
+  something the last reply did not;
+* everything else is handed to the colleagues, copied on a code-authored reply;
+* a chase after a handoff, or after a code-authored reply the carrier already has, sends
+  nothing more;
+* a thank-you, or nothing at all, drafts nothing.
+
+Replays the live failure that started this: RTS Financial, load 2493116, asked us to fast
+track a 90-day-old invoice and then raised recourse, and was sent the same status each time.
 """
 
 from __future__ import annotations
@@ -24,7 +29,14 @@ from payment_bot.clients import (
     MockGmailClient,
     MockSlackClient,
 )
+from payment_bot.clients.llm import (
+    LlmResponse,
+    ScriptedLlmClient,
+    TextBlock,
+    ToolUseBlock,
+)
 from payment_bot.config import Settings
+from payment_bot.followup_reader import FollowUpKind, FollowUpRoute, read_follow_up_with_model
 from payment_bot.followups import (
     ACTION_HANDOFF,
     ACTION_NOTICE,
@@ -32,6 +44,7 @@ from payment_bot.followups import (
     FollowUpRecord,
     InMemoryFollowUpStore,
     S3FollowUpStore,
+    new_facts,
 )
 from payment_bot.gate.presend import PreSendGate
 from payment_bot.logging import InMemoryAuditSink
@@ -43,7 +56,6 @@ from payment_bot.sample_data import (
     sample_transport_pro_client,
     scripted_payment_status_llm,
 )
-from payment_bot.tools.shared import FollowUpAsk, follow_up_asks, read_follow_up
 from payment_bot.tools.submit import SubmitDraftOutput
 
 _CAMIL = "camil.meniano@circledelivers.com"
@@ -56,7 +68,6 @@ _CAMIL_REPLY = (
     "status and has not yet been paid - no payment date is scheduled at this time.\n\n"
     "Circle Delivers Payments"
 )
-
 _FAST_TRACK = (
     "Ok but this invoice is over 90 days old. Can you please fast track payment and "
     "provide a status?"
@@ -65,6 +76,21 @@ _RECOURSE = (
     "Unfortunately, then we will have to recourse this from our client. If you can "
     "expedite it, please do."
 )
+
+
+def _verdict(kind: str, summary: str) -> LlmResponse:
+    return LlmResponse(
+        stop_reason="tool_use",
+        content=[
+            ToolUseBlock(
+                tool_use_id="r1", name="report_follow_up", input={"kind": kind, "summary": summary}
+            )
+        ],
+    )
+
+
+def _reader(kind: str, summary: str = "they want this looked at") -> ScriptedLlmClient:
+    return ScriptedLlmClient(responses=[_verdict(kind, summary)] * 5)
 
 
 def _jake(written: str, message_id: str = "<chase1@rtsfinancial.com>") -> InboundEmail:
@@ -77,6 +103,7 @@ def _jake(written: str, message_id: str = "<chase1@rtsfinancial.com>") -> Inboun
         body=f"{written}\n\nOn Mon, Oct 5, 2026 at 4:31 PM Camil wrote:\n> {_CAMIL_REPLY}",
         prior_reply=PriorReply(
             from_email=_CAMIL,
+            from_name="Camil Meniano",
             sent_at=datetime(2026, 10, 5, 16, 31, tzinfo=timezone(timedelta(hours=-4))),
             body=_CAMIL_REPLY,
             colleagues=(_CAMIL,),
@@ -84,10 +111,22 @@ def _jake(written: str, message_id: str = "<chase1@rtsfinancial.com>") -> Inboun
     )
 
 
+def _status_chase(prior_body: str, message_id: str = "<status@x>") -> InboundEmail:
+    return sample_payment_status_email().model_copy(
+        update={
+            "message_id": message_id,
+            "body": "Any update on this?",
+            "prior_reply": PriorReply(from_email=_CAMIL, body=prior_body, colleagues=(_CAMIL,)),
+        }
+    )
+
+
 def _pipeline(
     store: InMemoryFollowUpStore,
+    reader: ScriptedLlmClient,
     handoff_cc: tuple[str, ...] = (f"Billing Lead <{_BILLING}>",),
-) -> tuple[PaymentBotPipeline, MockSlackClient, Any]:
+    **settings: Any,
+) -> tuple[PaymentBotPipeline, MockSlackClient, ScriptedLlmClient]:
     llm = scripted_payment_status_llm()
     slack = MockSlackClient()
     pipeline = PaymentBotPipeline(
@@ -100,23 +139,33 @@ def _pipeline(
         settings=Settings(
             followup_handoff_cc=handoff_cc,
             reply_cc=("paystatus@circledelivers.com",),
+            **settings,
         ),
         followup_store=store,
+        followup_reader_llm=reader,
     )
     return pipeline, slack, llm
 
 
+def _summary(slack: MockSlackClient) -> ApprovalSummary:
+    summary = slack.approvals[0]["summary"]
+    assert isinstance(summary, ApprovalSummary)
+    return summary
+
+
 # --- the RTS thread, replayed ----------------------------------------------------
 @pytest.mark.integration
-def test_fast_track_on_a_90_day_invoice_is_handed_off_not_restated() -> None:
+def test_pressure_is_handed_off_not_restated() -> None:
     store = InMemoryFollowUpStore()
-    pipeline, slack, llm = _pipeline(store)
+    pipeline, slack, llm = _pipeline(
+        store, _reader("pressure", "Wants the 90-day-old invoice fast-tracked and a status.")
+    )
 
     result = pipeline.process_email(_jake(_FAST_TRACK))
 
     assert result.outcome is Outcome.AWAITING_REVIEW, result.detail
     assert result.follow_up_action == ACTION_HANDOFF
-    assert llm.calls == [], "no agent run: nothing it can look up answers 'fast track'"
+    assert llm.calls == [], "no agent run: nothing in the records answers 'fast track'"
     draft = result.draft
     assert draft is not None
     # Answers the ask, copies the people who can act, and states nothing about the load.
@@ -124,24 +173,24 @@ def test_fast_track_on_a_90_day_invoice_is_handed_off_not_restated() -> None:
     assert "copied" in draft.reply_body
     assert draft.extra_cc == [_CAMIL, _BILLING]
     assert "$" not in draft.reply_body and "2493116" not in draft.reply_body
-    assert draft.load_ids == []
-    # The reviewer sees why.
-    summary: ApprovalSummary = slack.approvals[0]["summary"]  # type: ignore[assignment]
-    assert "fast track" in summary.handoff and "over 90 days" in summary.handoff
+    # The reviewer sees why, and what was said last.
+    summary = _summary(slack)
+    assert "press for payment" in summary.handoff and "fast-tracked" in summary.handoff
+    assert "Last reply (Camil Meniano on Mon Oct 5)" in summary.follow_up_note
     assert _BILLING in summary.cc
-    # And it is on the thread's record, reply text included.
+    # And it is on the thread's record, the reader's verdict and the reply text included.
     [entry] = store.history(_THREAD)
-    assert (entry.ask, entry.action, entry.outcome) == ("action", "handoff", "awaiting_review")
-    assert entry.cc == (_CAMIL, _BILLING)
+    assert (entry.ask, entry.action, entry.outcome) == ("pressure", "handoff", "awaiting_review")
+    assert entry.summary.startswith("Wants the 90-day-old invoice")
     assert entry.reply == draft.reply_body
 
 
 @pytest.mark.integration
-def test_recourse_after_the_handoff_sends_nothing_more() -> None:
-    """Telling Jake again who has it is the repeat being fixed. The colleagues get a card."""
+def test_a_chase_after_the_handoff_sends_nothing_more() -> None:
+    """Telling Jake again who has it would be the repeat. The colleagues get a card."""
 
     store = InMemoryFollowUpStore()
-    pipeline, slack, llm = _pipeline(store)
+    pipeline, slack, llm = _pipeline(store, _reader("pressure", "Threatens recourse."))
     pipeline.process_email(_jake(_FAST_TRACK))
 
     result = pipeline.process_email(_jake(_RECOURSE, "<chase2@rtsfinancial.com>"))
@@ -149,83 +198,133 @@ def test_recourse_after_the_handoff_sends_nothing_more() -> None:
     assert result.outcome is Outcome.ESCALATED
     assert result.follow_up_action == ACTION_NOTICE
     assert result.draft is None
-    assert "handed off" in result.detail and "recourse" in result.detail
+    assert "handed off" in result.detail and "Threatens recourse" in result.detail
     assert _CAMIL in result.detail
     assert len(slack.approvals) == 1, "only the handoff's card — no second draft"
-    assert len(slack.escalations) == 1
     assert llm.calls == []
     assert [e.action for e in store.history(_THREAD)] == [ACTION_HANDOFF, ACTION_NOTICE]
 
 
 @pytest.mark.integration
-def test_recourse_as_the_first_chase_is_handed_off_too() -> None:
-    store = InMemoryFollowUpStore()
-    pipeline, _, _ = _pipeline(store)
+@pytest.mark.parametrize(
+    ("kind", "line"),
+    [
+        ("pressure", "I have passed your request to our team to review."),
+        ("not_received", "I have passed this to our team to look into."),
+        ("dispute", "I have passed your message to our team to review."),
+        ("process_question", "I have passed your question to our team."),
+        ("new_info", "I have passed this to our team."),
+    ],
+)
+def test_every_kind_a_person_must_handle_is_handed_off(kind: str, line: str) -> None:
+    pipeline, _, llm = _pipeline(InMemoryFollowUpStore(), _reader(kind))
 
-    result = pipeline.process_email(_jake(_RECOURSE))
+    result = pipeline.process_email(_jake("whatever they wrote"))
 
     assert result.follow_up_action == ACTION_HANDOFF
-    assert result.draft is not None
-    assert "passed your message to our team" in result.draft.reply_body
+    assert result.draft is not None and line in result.draft.reply_body
+    assert llm.calls == []
 
 
-# --- one status answer per thread ---------------------------------------------------
+# --- answered from the records, only when it is news ----------------------------------
 @pytest.mark.integration
-def test_a_first_status_chase_is_still_answered_from_the_records() -> None:
+def test_a_status_chase_with_news_is_drafted_with_the_comparison_on_the_card() -> None:
     store = InMemoryFollowUpStore()
-    pipeline, _, llm = _pipeline(store)
-    email = sample_payment_status_email().model_copy(
-        update={
-            "body": "Any update on this?",
-            "prior_reply": PriorReply(from_email=_CAMIL, body="Pending.", colleagues=(_CAMIL,)),
-        }
-    )
+    pipeline, slack, llm = _pipeline(store, _reader("status", "Wants an update."))
+    email = _status_chase("Hi, this one is still pending - we will update you.")
 
     result = pipeline.process_email(email)
 
     assert result.outcome is Outcome.AWAITING_REVIEW, result.detail
     assert result.follow_up_action == ACTION_STATUS_UPDATE
     assert llm.calls
+    note = _summary(slack).follow_up_note
+    assert "They ask for a status update: Wants an update." in note
+    assert "New in this draft:" in note and "date 8/20" in note
     [entry] = store.history(email.thread_id)
-    assert entry.action == ACTION_STATUS_UPDATE
-    assert entry.reply == PAYMENT_STATUS_DRAFT_BODY
-    assert entry.loads == ("2462934",)
+    assert entry.action == ACTION_STATUS_UPDATE and entry.reply == PAYMENT_STATUS_DRAFT_BODY
 
 
 @pytest.mark.integration
-def test_a_second_status_chase_goes_to_a_person() -> None:
-    """Re-reading unchanged records would only produce the same reply again."""
+def test_a_status_chase_with_nothing_new_is_not_drafted() -> None:
+    """The RTS failure in its general form: the records have not moved since our reply."""
 
     store = InMemoryFollowUpStore()
-    email = sample_payment_status_email().model_copy(
-        update={
-            "message_id": "<second@x>",
-            "body": "Any update on this?",
-            "prior_reply": PriorReply(from_email=_CAMIL, body="Pending.", colleagues=(_CAMIL,)),
-        }
-    )
-    store.record(
-        email.thread_id,
-        FollowUpRecord(
-            message_id="<first@x>", ask="status", action=ACTION_STATUS_UPDATE,
-            outcome="sent",
-        ),
-    )
-    pipeline, slack, llm = _pipeline(store)
+    pipeline, slack, llm = _pipeline(store, _reader("status", "Wants an update."))
 
-    result = pipeline.process_email(email)
+    result = pipeline.process_email(_status_chase(PAYMENT_STATUS_DRAFT_BODY))
+
+    assert result.outcome is Outcome.ESCALATED
+    assert result.follow_up_action == ACTION_NOTICE
+    assert "unchanged" in result.detail and "would only repeat it" in result.detail
+    assert result.after_agent  # priced as the agent run it was, by the retry budget
+    assert slack.approvals == []
+    assert llm.calls, "the records were re-read; only the repeat was withheld"
+
+
+@pytest.mark.integration
+def test_a_payment_details_ask_tells_the_agent_what_to_give() -> None:
+    pipeline, _, llm = _pipeline(
+        InMemoryFollowUpStore(), _reader("payment_proof", "Wants the check number.")
+    )
+
+    pipeline.process_email(_status_chase("Pending."))
+
+    intake = llm.calls[0]["messages"][0].content[0].text
+    assert "What they want now: Wants the check number." in intake
+    assert "They are asking for payment details" in intake
+    assert "cannot attach a remittance document" in intake
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("kind", ["thanks", "empty"])
+def test_thanks_or_nothing_drafts_nothing(kind: str) -> None:
+    pipeline, slack, llm = _pipeline(InMemoryFollowUpStore(), _reader(kind))
+
+    result = pipeline.process_email(_jake("Thank you, Jake"))
+
+    assert result.outcome is Outcome.NO_ACTION
+    assert llm.calls == [] and slack.approvals == [] and slack.escalations == []
+
+
+# --- the reader's failures, and its memory ---------------------------------------------
+@pytest.mark.integration
+def test_an_unreadable_verdict_goes_to_a_person() -> None:
+    garbled = ScriptedLlmClient(
+        responses=[LlmResponse(stop_reason="end_turn", content=[TextBlock("no idea")])]
+    )
+    pipeline, slack, llm = _pipeline(InMemoryFollowUpStore(), garbled)
+
+    result = pipeline.process_email(_jake(_FAST_TRACK))
 
     assert result.follow_up_action == ACTION_HANDOFF
+    assert "could not be read automatically" in _summary(slack).handoff
     assert llm.calls == []
-    assert "chased again" in slack.approvals[0]["summary"].handoff  # type: ignore[attr-defined]
+
+
+@pytest.mark.integration
+def test_a_re_run_reuses_the_verdict_instead_of_asking_again() -> None:
+    """An escalated follow-up is re-processed every poll until its budget is spent."""
+
+    store = InMemoryFollowUpStore()
+    reader = _reader("pressure", "Presses for payment.")
+    pipeline, _, _ = _pipeline(store, reader, handoff_cc=())
+    email = _jake(_FAST_TRACK).model_copy(
+        update={"prior_reply": PriorReply(from_email=_CAMIL, body=_CAMIL_REPLY)}
+    )
+
+    first = pipeline.process_email(email)
+    second = pipeline.process_email(email)
+
+    assert first.outcome is second.outcome is Outcome.ESCALATED
+    assert len(reader.calls) == 1
 
 
 @pytest.mark.integration
 def test_a_handoff_with_nobody_to_copy_escalates_instead() -> None:
-    """"They are copied" must be true, or the reply cannot be sent."""
+    """ "They are copied" must be true, or the reply cannot be sent."""
 
-    store = InMemoryFollowUpStore()
-    pipeline, slack, _ = _pipeline(store, handoff_cc=())
+    pipeline, slack, _ = _pipeline(InMemoryFollowUpStore(), _reader("pressure"), handoff_cc=())
     email = _jake(_FAST_TRACK).model_copy(
         update={"prior_reply": PriorReply(from_email=_CAMIL, body=_CAMIL_REPLY)}
     )
@@ -239,11 +338,10 @@ def test_a_handoff_with_nobody_to_copy_escalates_instead() -> None:
 
 @pytest.mark.integration
 def test_a_bank_change_in_a_follow_up_still_escalates_first() -> None:
-    store = InMemoryFollowUpStore()
-    pipeline, slack, _ = _pipeline(store)
+    pipeline, slack, _ = _pipeline(InMemoryFollowUpStore(), _reader("new_info"))
 
     result = pipeline.process_email(
-        _jake("Please expedite, and update our bank account to the new routing number.")
+        _jake("Please update our bank account to the new routing number.")
     )
 
     assert result.outcome is Outcome.ESCALATED
@@ -251,37 +349,132 @@ def test_a_bank_change_in_a_follow_up_still_escalates_first() -> None:
     assert slack.approvals == []
 
 
-# --- reading the ask ---------------------------------------------------------------
+# --- a code-authored reply is never sent twice in one thread ---------------------------
+_REFERRAL = (
+    "Thank you for reaching out. The load you asked about is handled directly by:\n\n"
+    "- Ashley Wolf (ashley.wolf@circledelivers.com)\n\n"
+    "They are copied on this email and will have the most up-to-date information for you.\n\n"
+    "Circle Delivers Payments"
+)
+
+
+def _cargotel_chase(prior_body: str) -> tuple[PaymentBotPipeline, MockSlackClient, InboundEmail]:
+    pipeline, slack, _ = _pipeline(
+        InMemoryFollowUpStore(),
+        _reader("status"),
+        cargotel_referral_contacts=("Ashley Wolf <ashley.wolf@circledelivers.com>",),
+    )
+    email = InboundEmail(
+        message_id="<cgt-chase@x>",
+        thread_id="t-cgt",
+        from_email="billing@carrier.example.com",
+        subject="Re: load 301230",
+        body="Any update on load 301230?",
+        prior_reply=PriorReply(from_email=_CAMIL, body=prior_body, colleagues=(_CAMIL,)),
+    )
+    return pipeline, slack, email
+
+
+@pytest.mark.integration
+def test_the_cargotel_referral_is_never_sent_twice_in_one_thread() -> None:
+    """Live: a carrier chasing a 6-digit load was drafted the referral it already had."""
+
+    pipeline, slack, email = _cargotel_chase(_REFERRAL)
+
+    result = pipeline.process_email(email)
+
+    assert result.outcome is Outcome.ESCALATED
+    assert result.follow_up_action == ACTION_NOTICE
+    assert "repeat the cargotel_referral reply" in result.detail
+    assert "ashley.wolf@circledelivers.com" in result.detail
+    assert slack.approvals == []
+
+
+@pytest.mark.integration
+def test_the_referral_still_goes_out_when_the_carrier_never_had_it() -> None:
+    pipeline, slack, email = _cargotel_chase("Let me check on this and get back to you.")
+
+    result = pipeline.process_email(email)
+
+    assert result.outcome is Outcome.AWAITING_REVIEW, result.detail
+    assert result.draft is not None and "handled directly by" in result.draft.reply_body
+    assert len(slack.approvals) == 1
+
+
+# --- "does this draft say anything new?" --------------------------------------------------
+_RTS_DRAFT = (
+    "Hi Jake, the $3,100 line haul for load 2493116 (Aka Cargo Inc) is still showing as "
+    "pending with no payment date scheduled at this time - the load has not yet been billed."
+)
+_PORTAL = "The payment status for these loads are listed on our website - https://example.com/"
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("written", "ask"),
+    ("draft", "prior", "expected"),
     [
-        (_FAST_TRACK, FollowUpAsk.ACTION),
-        (_RECOURSE, FollowUpAsk.ESCALATION),
-        ("Can this be expedited?", FollowUpAsk.ACTION),
-        ("This is 120+ days past due, please advise", FollowUpAsk.ACTION),
-        ("We dispute the short pay on this load.", FollowUpAsk.ESCALATION),
-        ("Any update on this?", FollowUpAsk.STATUS),
-        ("URGENT - any update please", FollowUpAsk.STATUS),
-        ("Idea Expedited here - any news?", FollowUpAsk.STATUS),
-        ("Thank you!", FollowUpAsk.NONE),
+        (_RTS_DRAFT, _CAMIL_REPLY, []),  # the live repeat
+        (
+            "The $3,100 line haul is now scheduled for Thursday, October 8, 2026.",
+            _CAMIL_REPLY,
+            ["date 10/8"],
+        ),
+        (
+            "The $3,100 line haul was paid by check number 800154 on 10/02/2026.",
+            _CAMIL_REPLY,
+            ["check #800154", "date 10/2", "paid by check"],
+        ),
+        # Figures after a reply that gave none ARE news.
+        ("Load 2426838 ($1,800) is pending with no payment date yet.", _PORTAL, ["$1800.00"]),
+        # A colleague's "10/16" and the draft's "October 16" are the same date.
+        (
+            "Load 2533198 is scheduled for payment on Friday, October 16, 2026.",
+            "Good Morning, This load will be paid on 10/16.",
+            [],
+        ),
     ],
 )
-def test_what_a_follow_up_asks(written: str, ask: FollowUpAsk) -> None:
-    assert read_follow_up(written).ask is ask
+def test_what_counts_as_news(draft: str, prior: str, expected: list[str]) -> None:
+    assert new_facts(draft, prior) == expected
+
+
+# --- the reader's answer ---------------------------------------------------------------
+@pytest.mark.unit
+def test_the_reader_is_shown_both_sides_and_returns_the_verdict() -> None:
+    llm = ScriptedLlmClient(responses=[_verdict("dispute", "Says they invoiced already.")])
+
+    read = read_follow_up_with_model(
+        llm, subject="Re: loads", our_reply="We have no invoice.", their_message="Invoiced."
+    )
+
+    assert read is not None
+    assert (read.kind, read.route) == (FollowUpKind.DISPUTE, FollowUpRoute.HANDOFF)
+    prompt = llm.calls[0]["messages"][0].content[0].text
+    assert "OUR LAST REPLY:\nWe have no invoice." in prompt
+    assert "THEIR NEW MESSAGE:\nInvoiced." in prompt
 
 
 @pytest.mark.unit
-def test_the_evidence_names_what_decided_it() -> None:
-    assert read_follow_up(_FAST_TRACK).evidence == ("fast track", "over 90 days")
+def test_the_reader_accepts_json_text_from_providers_without_tool_calls() -> None:
+    llm = ScriptedLlmClient(
+        responses=[
+            LlmResponse(
+                stop_reason="end_turn",
+                content=[TextBlock('Here: {"kind": "thanks", "summary": "Says thanks."}')],
+            )
+        ]
+    )
+    read = read_follow_up_with_model(llm, subject="", our_reply="x", their_message="Thanks")
+    assert read is not None and read.kind is FollowUpKind.THANKS
 
 
 @pytest.mark.unit
-def test_a_bare_expedite_request_is_not_dropped_as_asking_nothing() -> None:
-    """The Gmail client drops follow-ups that ask nothing; "please expedite" asks plenty."""
+def test_an_invented_kind_or_a_failed_call_is_no_verdict() -> None:
+    invented = ScriptedLlmClient(responses=[_verdict("urgent_vip", "?")])
+    assert read_follow_up_with_model(invented, subject="", our_reply="", their_message="") is None
 
-    email = _jake("Please expedite.")
-    assert follow_up_asks(email)
+    exhausted = ScriptedLlmClient(responses=[])  # raises on the call
+    assert read_follow_up_with_model(exhausted, subject="", our_reply="", their_message="") is None
 
 
 # --- the gate ---------------------------------------------------------------------
@@ -355,16 +548,20 @@ def test_the_s3_record_round_trips_one_entry_per_message() -> None:
     store = S3FollowUpStore("bucket", client=s3)
 
     assert store.history(_THREAD) == []  # a thread with no record yet
-    store.record(_THREAD, FollowUpRecord("<a>", "action", ACTION_HANDOFF, "escalated"))
+    store.record(_THREAD, FollowUpRecord("<a>", "pressure", ACTION_HANDOFF, "escalated"))
     # The same message re-processed (escalations re-run every poll) updates, never appends.
-    store.record(_THREAD, FollowUpRecord("<a>", "action", ACTION_HANDOFF, "awaiting_review"))
-    store.record(_THREAD, FollowUpRecord("<b>", "escalation", ACTION_NOTICE, "escalated"))
+    store.record(
+        _THREAD,
+        FollowUpRecord("<a>", "pressure", ACTION_HANDOFF, "awaiting_review", summary="Fast track"),
+    )
+    store.record(_THREAD, FollowUpRecord("<b>", "pressure", ACTION_NOTICE, "escalated"))
 
     history = store.history(_THREAD)
     assert [(e.message_id, e.outcome) for e in history] == [
         ("<a>", "awaiting_review"),
         ("<b>", "escalated"),
     ]
+    assert history[0].summary == "Fast track"
     saved = json.loads(s3.objects[f"state/followups/{_THREAD}.json"])
     assert saved["thread_id"] == _THREAD
 

@@ -51,15 +51,20 @@ from payment_bot.clients import (
 from payment_bot.config import RolloutPhase, Settings, get_settings
 from payment_bot.domain import route_load
 from payment_bot.errors import PaymentBotError
+from payment_bot.followup_reader import (
+    FollowUpKind,
+    FollowUpRead,
+    FollowUpRoute,
+    read_follow_up_with_model,
+)
 from payment_bot.followups import (
     ACTION_HANDOFF,
     ACTION_NOTICE,
     ACTION_STATUS_UPDATE,
-    MAX_STATUS_UPDATES,
     FollowUpRecord,
     FollowUpStore,
     handed_off,
-    status_updates,
+    new_facts,
 )
 from payment_bot.gate import (
     GateResult,
@@ -69,7 +74,14 @@ from payment_bot.gate import (
 from payment_bot.grounding import GroundingLedger
 from payment_bot.id_filter import MIN_CANDIDATES, IdFilterMode, apply_filter, classify
 from payment_bot.logging import AuditSink, get_logger
-from payment_bot.models import AuthDecision, InboundEmail, Intent, SensitiveAction, System
+from payment_bot.models import (
+    AuthDecision,
+    InboundEmail,
+    Intent,
+    PriorReply,
+    SensitiveAction,
+    System,
+)
 from payment_bot.roster_candidate import append_manual_entries, build_candidate, log_candidate
 from payment_bot.tools import ToolContext, ToolRegistry, build_default_registry
 from payment_bot.tools.shared import (
@@ -77,10 +89,7 @@ from payment_bot.tools.shared import (
     ClassifyIntentOutput,
     DetectSensitiveChangeOutput,
     ExtractIdentifiersOutput,
-    FollowUpAsk,
-    FollowUpReading,
     _factor_names_match,
-    read_follow_up,
     strip_quoted,
 )
 from payment_bot.tools.submit import SubmitDraftOutput
@@ -124,9 +133,26 @@ _FOLLOWUP_HANDOFF_BODY = """Thank you for following up. {ask_line} They are copi
 
 #: The handoff's one variable sentence, by what the follow-up asked. None promises an outcome.
 _HANDOFF_ASK_LINES = {
-    FollowUpAsk.ACTION: "I have passed your request to our team to review.",
-    FollowUpAsk.ESCALATION: "I have passed your message to our team to review.",
-    FollowUpAsk.STATUS: "I have passed this to our team to look into further.",
+    FollowUpKind.PRESSURE: "I have passed your request to our team to review.",
+    FollowUpKind.NOT_RECEIVED: "I have passed this to our team to look into.",
+    FollowUpKind.DISPUTE: "I have passed your message to our team to review.",
+    FollowUpKind.PROCESS_QUESTION: "I have passed your question to our team.",
+    FollowUpKind.NEW_INFO: "I have passed this to our team.",
+}
+_HANDOFF_DEFAULT_LINE = "I have passed your message to our team to review."
+
+#: How each kind reads after "they", on a card and in an escalation reason.
+_KIND_LABELS = {
+    FollowUpKind.STATUS: "ask for a status update",
+    FollowUpKind.PAYMENT_PROOF: "ask for payment details",
+    FollowUpKind.NOT_RECEIVED: "say the payment was not received",
+    FollowUpKind.PRESSURE: "press for payment",
+    FollowUpKind.DISPUTE: "dispute or correct what we said",
+    FollowUpKind.PROCESS_QUESTION: "ask how we work",
+    FollowUpKind.NEW_INFO: "send new information",
+    FollowUpKind.THANKS: "say thanks",
+    FollowUpKind.EMPTY: "wrote nothing",
+    FollowUpKind.UNKNOWN: "wrote something that could not be read automatically",
 }
 
 #: Deterministic drafts name no load ids in their body on purpose, so the gate's
@@ -243,6 +269,40 @@ class PipelineResult:
     follow_up_action: str = ""
 
 
+def _repeats(body: str, prior: str) -> bool:
+    """True when ``prior`` already carries ``body``'s opening line.
+
+    The opening line is what makes each code-authored reply recognisably itself (the referral's
+    "The load you asked about is handled directly by", the portal's link sentence), and it
+    survives a reviewer's sign-off edits. Compared with whitespace and case folded, because the
+    copy in the thread has been through a mail client.
+    """
+
+    def fold(text: str) -> str:
+        return " ".join(text.split()).lower()
+
+    first = next((line for line in body.splitlines() if line.strip()), "")
+    return bool(first.strip()) and fold(first) in fold(prior)
+
+
+def _who(prior: PriorReply) -> str:
+    """The colleague whose reply a follow-up answers, as a reviewer knows them."""
+
+    return prior.from_name or prior.from_email
+
+
+def _when(prior: PriorReply) -> str:
+    sent = prior.sent_at
+    return f" on {sent:%a %b} {sent.day}" if sent else ""
+
+
+def _excerpt(body: str, limit: int = 160) -> str:
+    """The start of what a colleague wrote, quotes stripped, on one line."""
+
+    text = " ".join(strip_quoted(body).split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _default_follow_up_action(outcome: Outcome) -> str:
     """The action a follow-up took when no routing decision named one."""
 
@@ -269,9 +329,13 @@ class PaymentBotPipeline:
         allow_factoring: bool | None = None,
         today: date | None = None,
         followup_store: FollowUpStore | None = None,
+        followup_reader_llm: LlmClient | None = None,
     ) -> None:
         self._tp = tp
         self._llm = llm
+        # The follow-up reader's model. The drafting model unless given one — separable so a
+        # test can script the reader's verdict without scripting the agent's turns around it.
+        self._reader_llm = followup_reader_llm or llm
         # Resolved once per pipeline rather than per email so a long-running processor cannot
         # render a date under one day and judge its tense under the next. Injectable because
         # fixture data has fixed dates: a test asserting "Thursday, August 6, 2026" is only
@@ -308,17 +372,25 @@ class PaymentBotPipeline:
         )
         self._gate = PreSendGate(allow_factoring=self._allow_factoring)
         self._resolver = approval_resolver
-        # Per-thread follow-up history (state/followups/). None keeps every follow-up on the
-        # first-time path: no cap, no handoff-already-happened memory.
+        # Per-thread follow-up history (state/followups/). None: no memory across runs — no
+        # handoff-already-happened, and every re-run of a message reads it with the model again.
         self._followups = followup_store
 
     # -- public API ----------------------------------------------------------
     def process_email(self, email: InboundEmail) -> PipelineResult:
         correlation_id = email.message_id
-        # What a follow-up asks for, read once from what the sender wrote in it.
-        reading = (
-            read_follow_up(strip_quoted(email.body)) if email.prior_reply is not None else None
-        )
+        # What a follow-up wants, read once, next to the reply it answers — and handed to the
+        # agent on the email itself, so the intake can tell it what was asked.
+        reading = None
+        if email.prior_reply is not None:
+            reading = self._read_follow_up(email, correlation_id)
+            email = email.model_copy(
+                update={
+                    "prior_reply": email.prior_reply.model_copy(
+                        update={"ask_kind": reading.kind.value, "ask_summary": reading.summary}
+                    )
+                }
+            )
         try:
             result = self._process(email, correlation_id, reading)
         except PaymentBotError as exc:  # expected-but-unhandled → fail closed
@@ -339,7 +411,9 @@ class PaymentBotPipeline:
                 "follow_up_outcome",
                 extra={
                     "correlation_id": correlation_id,
-                    "ask": reading.ask.value,
+                    "ask": reading.kind.value,
+                    "ask_source": reading.source,
+                    "summary": reading.summary,
                     "action": result.follow_up_action,
                     "outcome": result.outcome.value,
                     "follow_up_to": result.follow_up_to,
@@ -354,7 +428,7 @@ class PaymentBotPipeline:
         self,
         email: InboundEmail,
         correlation_id: str,
-        reading: FollowUpReading | None = None,
+        reading: FollowUpRead | None = None,
     ) -> PipelineResult:
         ledger = GroundingLedger()
         ctx = ToolContext(
@@ -367,16 +441,14 @@ class PaymentBotPipeline:
         )
 
         # 0. A follow-up to our own reply (Settings.followup_replies) ----------
-        # Only a follow-up that ASKS for something is answered. A "thanks" after a colleague's
+        # Only a follow-up that wants something is answered. A "thanks" after a colleague's
         # answer closes the conversation, and its subject — inherited from the thread — would
         # otherwise classify it as a payment question and spend a full agent run on a draft
         # nobody wants. Left exactly as it was before follow-ups existed: with the colleague.
-        # The Gmail client already drops these before they take a processing slot; this is
-        # the backstop for every other intake path.
         if (
             email.prior_reply is not None
             and reading is not None
-            and reading.ask is FollowUpAsk.NONE
+            and reading.route is FollowUpRoute.NONE
         ):
             _log.info(
                 "follow_up_asks_nothing",
@@ -796,6 +868,32 @@ class PaymentBotPipeline:
             )
         draft = agent_result.draft
 
+        follow_up_note = ""
+        if email.prior_reply is not None:
+            # A follow-up answered from the records is only worth sending if the records say
+            # something the carrier was not already told. See followups.new_facts.
+            prior = email.prior_reply
+            fresh = new_facts(draft.reply_body, strip_quoted(prior.body))
+            if not fresh:
+                result = self._escalate(
+                    email,
+                    "review",
+                    f"carrier chased again ({prior.ask_summary or 'follow-up'}); the records "
+                    f"are unchanged since {_who(prior)}'s reply{_when(prior)} — the draft "
+                    "would only repeat it, so no email was drafted. Needs a person.",
+                    tuple(load_ids),
+                    correlation_id,
+                    after_agent=True,
+                )
+                result.follow_up_action = ACTION_NOTICE
+                return result
+            follow_up_note = (
+                f"They {_KIND_LABELS.get(FollowUpKind(prior.ask_kind or 'unknown'), 'wrote again')}"
+                f": {prior.ask_summary or '(no summary)'}\n"
+                f"Last reply ({_who(prior)}{_when(prior)}): {_excerpt(prior.body)}\n"
+                f"New in this draft: {', '.join(fresh)}"
+            )
+
         return self._finalize(
             email,
             draft,
@@ -806,6 +904,7 @@ class PaymentBotPipeline:
             noa_request_expected=bool(prenoa_loads),
             withheld_loads=tuple(withheld_named),
             candidate_load_ids=tuple(identifiers.load_ids),
+            follow_up_note=follow_up_note,
         )
 
     # -- gate → approval → send, shared by every draft path -------------------
@@ -821,6 +920,7 @@ class PaymentBotPipeline:
         withheld_loads: tuple[str, ...] = (),
         candidate_load_ids: tuple[str, ...] | None = None,
         handoff: str = "",
+        follow_up_note: str = "",
     ) -> PipelineResult:
         """Run the gate, then approval, then send or leave the draft for review.
 
@@ -832,6 +932,29 @@ class PaymentBotPipeline:
         — the universe of loads a draft may legitimately talk about. The gate's
         invented-load check compares the draft's own "load N" mentions against it.
         """
+
+        # A code-authored reply is the same words every time, so on a follow-up it may be
+        # exactly what the carrier already has. Live, the first run after the handoff fix: a
+        # carrier chasing on a 6-digit load was drafted the CargoTel referral it had already
+        # been sent ("handled directly by Ashley Wolf and Elizabeth Haussmann ... copied").
+        # Those people have the thread; the carrier does not need telling twice.
+        if (
+            email.prior_reply is not None
+            and skill_id in _NO_COVERAGE_SKILL_IDS
+            and _repeats(draft.reply_body, email.prior_reply.body)
+        ):
+            prior = email.prior_reply
+            result = self._escalate(
+                email,
+                "review",
+                f"follow-up would repeat the {skill_id} reply the carrier already has; no "
+                f"email drafted — with {', '.join(prior.colleagues or (prior.from_email,))}"
+                + (f" and {', '.join(draft.extra_cc)}" if draft.extra_cc else ""),
+                tuple(load_ids),
+                correlation_id,
+            )
+            result.follow_up_action = ACTION_NOTICE
+            return result
 
         # 4. Pre-send gate (deterministic, §5) ------------------------------
         # The bulk portal reply is code-authored and deliberately names no load, so it
@@ -874,6 +997,7 @@ class PaymentBotPipeline:
             cc=self._settings.reply_cc + tuple(draft.extra_cc),
             follow_up_to=email.prior_reply.from_email if email.prior_reply else "",
             handoff=handoff,
+            follow_up_note=follow_up_note,
         )
         self._slack.post_approval(
             self._settings.slack_approval_channel, summary, draft.reply_body, correlation_id
@@ -1091,37 +1215,66 @@ class PaymentBotPipeline:
         )
 
     # -- follow-ups (Settings.followup_replies) --------------------------------
+    def _read_follow_up(self, email: InboundEmail, correlation_id: str) -> FollowUpRead:
+        """What a follow-up wants — see :mod:`payment_bot.followup_reader`.
+
+        An earlier run's verdict for the same message is reused: a follow-up that escalates
+        is re-processed every poll until its retry budget is spent, and a thank-you the Gmail
+        filter let through is re-fetched for days, so reading it again each time would pay
+        for the same answer over and over. When the model cannot answer, the follow-up goes to
+        a person — UNKNOWN routes to a handoff, never to a guess.
+        """
+
+        prior = email.prior_reply
+        assert prior is not None  # only called for follow-ups
+        for entry in reversed(self._follow_up_history(email.thread_id)):
+            if entry.message_id == email.message_id:
+                try:
+                    return FollowUpRead(FollowUpKind(entry.ask), entry.summary, source="memo")
+                except ValueError:
+                    break  # a record from before the reader existed; read it afresh
+        read = read_follow_up_with_model(
+            self._reader_llm,
+            subject=email.subject,
+            our_reply=strip_quoted(prior.body),
+            their_message=strip_quoted(email.body),
+            correlation_id=correlation_id,
+        )
+        if read is not None:
+            return read
+        return FollowUpRead(
+            FollowUpKind.UNKNOWN, "the follow-up could not be read automatically", "fallback"
+        )
+
     def _route_follow_up(
         self,
         email: InboundEmail,
-        reading: FollowUpReading,
+        reading: FollowUpRead,
         load_ids: list[str],
         correlation_id: str,
         ctx: ToolContext,
     ) -> PipelineResult | None:
         """Hand a follow-up to a person, or ``None`` to answer it from the records.
 
-        Answered from the records only when it asks for the status AND this thread has not
-        had its one automated status answer yet. Otherwise:
+        Answered from the records when it asks for a status or for payment details — and even
+        then the draft goes out only if it says something new (see `_process`). Otherwise:
 
         * already handed off — no email; a notice card for the people who have it. The
-          carrier was told who is on it, and telling them again is the repeat being fixed;
-        * asked us to act, raised a dispute, or chased past the status answer — a handoff
-          reply copying the colleagues, who can do what the records cannot.
+          carrier was told who is on it, and telling them again is a repeat;
+        * anything else — a handoff reply copying the colleagues, who can do what the records
+          cannot: reissue, expedite, settle a dispute, take in new paperwork.
         """
 
         prior = email.prior_reply
         assert prior is not None  # only called for follow-ups
         history = self._follow_up_history(email.thread_id)
-        asked = f"{reading.ask.value}" + (
-            f" ({', '.join(reading.evidence)})" if reading.evidence else ""
-        )
+        asked = f"{_KIND_LABELS[reading.kind]}: {reading.summary or '(no summary)'}"
 
         if handed_off(history):
             result = self._escalate(
                 email,
                 "review",
-                f"carrier chased again after this thread was handed off — asked: {asked}. "
+                f"carrier chased again after this thread was handed off — they {asked}. "
                 f"No email drafted; with {', '.join(prior.colleagues) or prior.from_email}",
                 tuple(load_ids),
                 correlation_id,
@@ -1129,15 +1282,10 @@ class PaymentBotPipeline:
             result.follow_up_action = ACTION_NOTICE
             return result
 
-        if reading.ask is FollowUpAsk.ESCALATION:
-            reason = f"dispute or recourse raised ({', '.join(reading.evidence)})"
-        elif reading.ask is FollowUpAsk.ACTION:
-            reason = f"asked us to act ({', '.join(reading.evidence)})"
-        elif status_updates(history) >= MAX_STATUS_UPDATES:
-            reason = "chased again after an automated status answer — nothing new to look up"
-        else:
-            return None  # a status ask the records can answer, for the first time
+        if reading.route is FollowUpRoute.ANSWER:
+            return None
 
+        reason = f"they {asked}"
         cc = self._handoff_cc(email)
         if not cc:
             result = self._escalate(
@@ -1157,12 +1305,13 @@ class PaymentBotPipeline:
         )
         result = self._finalize(
             email,
-            self._handoff_draft(email, reading.ask, cc),
+            self._handoff_draft(email, reading.kind, cc),
             load_ids,
             correlation_id,
             ctx,
             _FOLLOWUP_HANDOFF_SKILL_ID,
             handoff=reason,
+            follow_up_note=f"Last reply ({_who(prior)}{_when(prior)}): {_excerpt(prior.body)}",
         )
         result.follow_up_action = ACTION_HANDOFF
         return result
@@ -1186,7 +1335,7 @@ class PaymentBotPipeline:
         return tuple(out)
 
     def _handoff_draft(
-        self, email: InboundEmail, ask: FollowUpAsk, cc: tuple[str, ...]
+        self, email: InboundEmail, kind: FollowUpKind, cc: tuple[str, ...]
     ) -> SubmitDraftOutput:
         """Build the handoff reply — see ``_FOLLOWUP_HANDOFF_BODY``.
 
@@ -1196,7 +1345,7 @@ class PaymentBotPipeline:
         """
 
         body = _FOLLOWUP_HANDOFF_BODY.format(
-            ask_line=_HANDOFF_ASK_LINES.get(ask, _HANDOFF_ASK_LINES[FollowUpAsk.STATUS]),
+            ask_line=_HANDOFF_ASK_LINES.get(kind, _HANDOFF_DEFAULT_LINE),
             signature=self._settings.reply_signature,
         )
         return SubmitDraftOutput(
@@ -1208,8 +1357,8 @@ class PaymentBotPipeline:
         )
 
     def _follow_up_history(self, thread_id: str) -> list[FollowUpRecord]:
-        """The thread's record, or empty. Unreadable is empty: it costs one extra status
-        answer before the cap applies, never a wrong send — a person approves every draft."""
+        """The thread's record, or empty. Unreadable is empty: it costs a repeated model read
+        or a missed "already handed off", never a wrong send — a person approves every draft."""
 
         if self._followups is None or not thread_id:
             return []
@@ -1222,7 +1371,7 @@ class PaymentBotPipeline:
             return []
 
     def _record_follow_up(
-        self, email: InboundEmail, reading: FollowUpReading, result: PipelineResult
+        self, email: InboundEmail, reading: FollowUpRead, result: PipelineResult
     ) -> None:
         """Append this follow-up to its thread's record. Never fails the run."""
 
@@ -1231,11 +1380,11 @@ class PaymentBotPipeline:
         draft = result.draft
         entry = FollowUpRecord(
             message_id=email.message_id,
-            ask=reading.ask.value,
+            ask=reading.kind.value,
+            summary=reading.summary,
             action=result.follow_up_action,
             outcome=result.outcome.value,
             after_reply_from=result.follow_up_to,
-            evidence=reading.evidence,
             loads=tuple(draft.load_ids) if draft else (),
             cc=tuple(draft.extra_cc) if draft else (),
             reply=draft.reply_body if draft else "",

@@ -169,6 +169,7 @@ def approval_card(
     action_url: str = "",
     follow_up_to: str = "",
     handoff: str = "",
+    follow_up_note: str = "",
 ) -> dict[str, Any]:
     """The approval card, shared by the poster and the callback's in-place updates.
 
@@ -181,7 +182,7 @@ def approval_card(
     the thread before approving.
     """
 
-    recipients = [
+    recipients: list[dict[str, Any]] = [
         {"decoratedText": {"topLabel": "To", "text": to or "(unknown)"}},
     ]
     if cc:
@@ -195,7 +196,9 @@ def approval_card(
             {
                 "decoratedText": {
                     "topLabel": "Follow-up",
-                    "text": f"Carrier chased after {follow_up_to} replied — check the thread",
+                    "text": follow_up_note
+                    or f"Carrier chased after {follow_up_to} replied — check the thread",
+                    "wrapText": True,
                 }
             }
         )
@@ -204,7 +207,8 @@ def approval_card(
             {
                 "decoratedText": {
                     "topLabel": "Handoff",
-                    "text": f"Needs a person: {handoff}. The colleagues are on Cc.",
+                    "text": f"Needs a person — {handoff}. The colleagues are on Cc.",
+                    "wrapText": True,
                 }
             }
         )
@@ -855,6 +859,7 @@ class GoogleChatClient:
             action_url=self._action_url,
             follow_up_to=summary.follow_up_to,
             handoff=summary.handoff,
+            follow_up_note=summary.follow_up_note,
         )
         name = self._post_card(
             card,

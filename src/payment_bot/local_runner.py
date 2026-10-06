@@ -345,9 +345,9 @@ def process_inbox(
             the draft-in-thread check can no longer provide once drafts stop living in
             the reading mailbox. ``None`` (local runs) keeps drafts in Gmail whatever
             the mode says, so chat mode cannot be half-on locally.
-        followup_store: Per-thread follow-up history (``payment_bot.followups``) — the one
-            automated status answer per thread, and whether a thread was handed off.
-            ``None`` (local runs) keeps it in memory for this run only.
+        followup_store: Per-thread follow-up history (``payment_bot.followups``) — whether a
+            thread was handed off, and the reader's verdict per message so a re-run does not
+            pay for it again. ``None`` (local runs) keeps it in memory for this run only.
     """
 
     # Force draft-only rather than trusting configuration: a local run must never send,

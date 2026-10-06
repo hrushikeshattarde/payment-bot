@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from enum import StrEnum
 from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, Field
@@ -2368,122 +2366,66 @@ _PAYMENT_SIGNALS = (
 )  # fmt: skip
 _PAPERWORK_SIGNALS = ("pod", "bol", "proof of delivery", "bill of lading", "paperwork")
 
-#: How a carrier chases an answer they were already given. Read only on a follow-up, and only
-#: from what they wrote in it — the subject is inherited from the thread ("Re: payment status
-#: 2476340") and would make a bare "thank you" look like a payment question.
-_UPDATE_SIGNALS = (
-    "update", "updates", "any news", "follow up", "following up", "follow-up", "followup",
-    "checking in", "check in", "status", "eta", "still waiting", "still not", "still no",
-    "still haven't", "still have not", "not received", "haven't received", "have not received",
-    "not yet received", "not been received", "when will", "when can", "when is", "when are",
-    "when do", "where is", "where are", "been paid", "be paid", "please advise",
-    "kindly advise", "reminder", "past due", "overdue",
-    # Requests written without a question mark — "can you check again".
-    "can you", "could you", "can someone", "please check", "please confirm", "look into",
-)  # fmt: skip
+#: A sign-off on a line of its own. Everything below it is the signature block — name, title,
+#: address, and often a standing footer. Live, Zetinos Transport closes every email with "IF WE
+#: DON'T RECEIVE A PAYMENT 30 DAYS AFTER RECEIVING YOUR INVOICE IT WILL BE AUTOMATICALLY SENT TO
+#: COLLECTIONS". Short lines only, and never one with a question in it: "Thanks, can you check
+#: again?" is the ask, not the sign-off.
+_SIGN_OFF_RE = re.compile(
+    r"^[ \t]*(?:thanks|thank you|thank you so much|thanks again|many thanks|thx|regards|"
+    r"best regards|kind regards|warm regards|best|sincerely|respectfully|cheers)\b"
+    r"(?![^\n]*\?)[^\n]{0,25}$"
+    r"|^[ \t]*--[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
-def asks_for_an_update(written: str) -> bool:
-    """True when a follow-up asks for something, rather than closing the conversation.
+def _before_sign_off(written: str) -> str:
+    """``written`` up to its first sign-off line; all of it when there is none, or when the
+    sign-off is the whole message ("Thank you!")."""
 
-    ``written`` is what the sender wrote in THIS message, quoted history stripped. "Thanks!",
-    "Received, thank you" and "Noted" ask nothing, and drafting a payment update in reply to
-    them is a card a reviewer can only reject. A question mark counts on its own: a follow-up
-    question is an ask whatever its words. Deliberately broad otherwise — a human approves
-    every follow-up draft, and a missed ask is a carrier left waiting.
+    found = _SIGN_OFF_RE.search(written)
+    if found is None:
+        return written
+    before = written[: found.start()]
+    return before if before.strip() else written
+
+
+#: A whole message that only acknowledges: optional greeting, then thanks / received / noted,
+#: then optionally "have a great day". Anchored at both ends — anything more is for the reader.
+_BARE_ACK_RE = re.compile(
+    r"^(?:(?:hi|hello|hey|good (?:morning|afternoon|evening|day))\b[^\n]{0,30}\n+)?\s*"
+    r"(?:thanks?(?: you)?(?: so much| very much| again)?"
+    r"|thank you for (?:the|your) (?:update|help|reply|response|confirmation|information|info)"
+    r"|many thanks|received(?:,? thanks?(?: you)?)?|noted|got it|ok(?:ay)?|perfect|great"
+    r"|appreciate (?:it|you)|you'?re welcome|will do|sounds good)"
+    r"[\s!.,]*(?:have a (?:great|good|nice) (?:day|one|weekend)[\s!.]*)?$",
+    re.IGNORECASE,
+)
+
+
+def is_bare_acknowledgement(written: str) -> bool:
+    """True when ``written`` (this message, quotes stripped) only says thanks.
+
+    Deliberately narrow, because it decides without the model: on 80 real follow-ups, every
+    one this matches was a thank-you, and anything with a question mark or a second clause —
+    "Thank you! Please provide payment details once available" — is left for the follow-up
+    reader, which sees it against the reply it answers.
     """
 
-    text = written.lower()
-    return (
-        "?" in text
-        or _matches_any(text, _UPDATE_SIGNALS)
-        or _matches_any(text, _PAYMENT_SIGNALS)
-        or _matches_any(text, _RATE_SIGNALS)
-    )
+    text = _before_sign_off(written).strip()
+    return bool(text) and len(text) <= 120 and "?" not in text and bool(_BARE_ACK_RE.match(text))
 
 
 def follow_up_asks(email: InboundEmail) -> bool:
-    """True when what ``email``'s sender wrote (quotes stripped) asks for anything at all.
+    """False only for a bare thank-you — see :func:`is_bare_acknowledgement`.
 
-    The Gmail client's filter, keeping a closing "thanks" from taking a processing slot every
-    run. Built on :func:`read_follow_up` rather than :func:`asks_for_an_update` alone, so a
-    bare "please expedite" — an action, not a status question — is not dropped as asking
-    nothing.
+    The Gmail client's filter, run before a follow-up takes a processing slot: the mailbox is
+    never marked read, so a closing "thanks" would otherwise retake a slot every run for days.
+    Everything else reaches the follow-up reader (``payment_bot.followup_reader``).
     """
 
-    return read_follow_up(strip_quoted(email.body)).ask is not FollowUpAsk.NONE
-
-
-#: A follow-up asking us to DO something about the payment, which no tool can do. Live, RTS
-#: Financial on load 2493116: "this invoice is over 90 days old. Can you please fast track
-#: payment and provide a status?" — and the bot restated the status it had given the day
-#: before, adding a refusal ("we are not able to expedite") that nobody had authorised.
-#: Phrases only, and verbs rather than adjectives: "urgent" and "ASAP" decorate ordinary
-#: status chases and would turn every one of them into a handoff.
-#: "Expedited" alone is a carrier name more often than a request — this inbox's own sample
-#: carrier is Idea Expedited, Inc — so only its request forms are listed.
-_ACTION_SIGNALS = (
-    "expedite", "expediting", "be expedited", "get this expedited", "get it expedited",
-    "have it expedited", "fast track", "fast-track", "fasttrack",
-    "speed up", "speed this up", "push this through", "push it through", "prioritize",
-    "prioritise", "release the payment", "release payment", "escalate", "escalating",
-    "past due", "overdue",
-)  # fmt: skip
-#: Ageing written as a count of days: "over 90 days old", "120+ days past due".
-_AGEING_RE = re.compile(
-    r"\b(?:over|more than|past|beyond|exceeding)\s+\d{2,3}\s+days\b|\b\d{2,3}\+?\s+days\s+"
-    r"(?:old|past|overdue|outstanding|late)\b",
-    re.IGNORECASE,
-)
-#: A follow-up that has become a dispute or a threat — "we will have to recourse this from
-#: our client". Never answered with a status; a person decides what happens next.
-_ESCALATION_SIGNALS = (
-    "recourse", "dispute", "disputing", "disputed", "legal action", "attorney", "lawyer",
-    "collections", "collection agency", "lien", "bond claim", "file a claim",
-)  # fmt: skip
-
-
-class FollowUpAsk(StrEnum):
-    """What a follow-up asks for, by what the sender wrote in it."""
-
-    #: "Any update?" — answerable with a fresh look at the records.
-    STATUS = "status"
-    #: Asks us to act — expedite, fast-track — or presses on the debt's age.
-    ACTION = "action"
-    #: A dispute, recourse or legal threat.
-    ESCALATION = "escalation"
-    #: Asks nothing ("thanks").
-    NONE = "none"
-
-
-@dataclass(frozen=True, slots=True)
-class FollowUpReading:
-    """:class:`FollowUpAsk` plus the phrases that decided it, for the card and the record."""
-
-    ask: FollowUpAsk
-    evidence: tuple[str, ...] = ()
-
-
-def read_follow_up(written: str) -> FollowUpReading:
-    """Classify what a follow-up asks for. ``written`` is this message, quotes stripped.
-
-    Escalation outranks action, which outranks status: "if you can expedite it, please do —
-    otherwise we will recourse" is a threat first, and a request to act before a question.
-    Only a STATUS ask is ever answered by re-reading the records; the others go to a person,
-    because nothing the bot can look up answers them.
-    """
-
-    text = written.lower()
-    escalation = tuple(p for p in _ESCALATION_SIGNALS if _matches_any(text, (p,)))
-    if escalation:
-        return FollowUpReading(FollowUpAsk.ESCALATION, escalation)
-    action = tuple(p for p in _ACTION_SIGNALS if _matches_any(text, (p,)))
-    action += tuple(m.group(0).lower() for m in _AGEING_RE.finditer(written))
-    if action:
-        return FollowUpReading(FollowUpAsk.ACTION, action)
-    if asks_for_an_update(written):
-        return FollowUpReading(FollowUpAsk.STATUS)
-    return FollowUpReading(FollowUpAsk.NONE)
+    return not is_bare_acknowledgement(strip_quoted(email.body))
 
 
 def _matches_any(text: str, phrases: tuple[str, ...]) -> bool:

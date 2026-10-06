@@ -44,7 +44,7 @@
   "AutoAddFactoringDomains": "false",
   "FollowupReplies": "false",
   "FollowupHandoffCc": "[]",
-  "_FollowupHandoffCc": "JSON list of \"Name <address>\" entries copied on every follow-up handoff (expedite / fast-track asks, disputes and recourse, or a second chase after one automated status answer), on top of the colleagues who already answered in the thread. Name whoever can actually move a payment.",
+  "_FollowupHandoffCc": "JSON list of \"Name <address>\" entries copied on every follow-up handoff (pressure for payment, a payment that never arrived, disputes, process questions, new information), on top of the colleagues who already answered in the thread. Name whoever can actually move a payment.",
   "_FollowupReplies": "Draft an update when a carrier chases in a thread a colleague already answered, instead of leaving it with that colleague. Loads are re-checked live; the colleague's reply is context for the agent, never a source. Always a human-approved draft, never auto-sent. Rollback: set false.",
   "_AutoAddFactoringDomains": "Auto-roster an unknown factoring sender and answer, instead of escalating. Left OFF here deliberately: it is the switch that turns the roster from 'domains somebody verified' into 'domains that wrote in and named a factor already on the load'. Read payment_bot.roster_candidate before enabling. An auto-added entry is marked AUTO-ADDED in factoring_domains_manual.json and logged as auto_roster_entry_added, so audit those and revoke what does not belong. IMPORTANT: this also means the roster bucket object drifts from what the generator produces — re-upload after a regeneration or auto-added entries are lost.",
   "LlmIdFilter": "shadow",

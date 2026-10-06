@@ -68,6 +68,8 @@ from payment_bot.tools.shared import (
     DetectSensitiveChangeOutput,
     ExtractIdentifiersOutput,
     _factor_names_match,
+    follow_up_asks,
+    strip_quoted,
 )
 from payment_bot.tools.submit import SubmitDraftOutput
 
@@ -276,6 +278,28 @@ class PaymentBotPipeline:
             today=self._today,
         )
 
+        # 0. A follow-up to our own reply (Settings.followup_replies) ----------
+        # Only a follow-up that ASKS for something is answered. A "thanks" after a colleague's
+        # answer closes the conversation, and its subject — inherited from the thread — would
+        # otherwise classify it as a payment question and spend a full agent run on a draft
+        # nobody wants. Left exactly as it was before follow-ups existed: with the colleague.
+        # The Gmail client already drops these before they take a processing slot; this is
+        # the backstop for every other intake path.
+        if email.prior_reply is not None and not follow_up_asks(email):
+            _log.info(
+                "follow_up_asks_nothing",
+                extra={
+                    "correlation_id": correlation_id,
+                    "after_reply_from": email.prior_reply.from_email,
+                },
+            )
+            return PipelineResult(
+                Outcome.NO_ACTION,
+                f"follow-up to {email.prior_reply.from_email}'s reply asks for nothing new; "
+                "left with them",
+                correlation_id,
+            )
+
         # 1. Shared intake & safety (deterministic, §3.3) --------------------
         # Run through the registry so every intake tool call is audited (§8.1) too.
         cls_out = self._registry.dispatch(
@@ -292,16 +316,11 @@ class PaymentBotPipeline:
         ident_out = self._registry.dispatch(
             "extract_identifiers",
             {
-                "subject": email.subject,
-                "body": email.body,
-                "thread_text": email.thread_text,
+                **self._identifier_text(email),
                 # Spreadsheet statements carry their load ids here and nowhere in the body.
                 "attachments_text": "\n".join(
                     a.extracted_text for a in email.attachments if a.extracted_text
                 ),
-                # Portal collections mail puts its invoice table in the HTML only, so the
-                # load id can exist nowhere else. See InboundEmail.html_text.
-                "html_text": email.html_text,
             },
             ctx,
         )
@@ -732,7 +751,9 @@ class PaymentBotPipeline:
             )
 
         # 5. Approval (Phase 1) or selective auto-send (Phase 2, §8.5) ------
-        if self._is_auto_sendable(skill_id, load_ids):
+        # A follow-up is never auto-sent: it answers in a conversation a colleague is part
+        # of, and only a human can judge the draft against what that colleague said.
+        if email.prior_reply is None and self._is_auto_sendable(skill_id, load_ids):
             return self._send(email, draft, draft.reply_body, correlation_id, gate_result)
 
         summary = ApprovalSummary(
@@ -743,6 +764,7 @@ class PaymentBotPipeline:
             # Per-draft recipients (the CargoTel referral's contacts) shown beside the
             # configured Cc, so the reviewer sees exactly who the send will copy.
             cc=self._settings.reply_cc + tuple(draft.extra_cc),
+            follow_up_to=email.prior_reply.from_email if email.prior_reply else "",
         )
         self._slack.post_approval(
             self._settings.slack_approval_channel, summary, draft.reply_body, correlation_id
@@ -1058,6 +1080,41 @@ class PaymentBotPipeline:
                 "id_filter_failed", extra={"correlation_id": correlation_id, "error": str(exc)}
             )
             return load_ids
+
+    @staticmethod
+    def _identifier_text(email: InboundEmail) -> dict[str, str]:
+        """Subject, body, quoted history and HTML, as ``extract_identifiers`` takes them.
+
+        An ordinary email goes in whole, as it always has. A follow-up is split: what the
+        sender wrote now is the body, and everything quoted beneath it — on a follow-up, the
+        colleague's reply — goes in as ``thread_text``, which the tool reads for load ids
+        only. Its loads are what the carrier is chasing; its amounts are ours, not theirs.
+
+        The HTML part joins the quoted side. It repeats the same history, and the quote
+        markers cannot be found reliably once tags are stripped, so reading it as "written"
+        would let the colleague's figures back in through the other door. A reply written
+        in a mail client always has a plain part; without one, ``body`` is the HTML's text.
+        """
+
+        if email.prior_reply is None:
+            return {
+                "subject": email.subject,
+                "body": email.body,
+                "thread_text": email.thread_text,
+                # Portal collections mail puts its invoice table in the HTML only, so the
+                # load id can exist nowhere else. See InboundEmail.html_text.
+                "html_text": email.html_text,
+            }
+        written = strip_quoted(email.body)
+        quoted = email.body[len(written) :]
+        return {
+            "subject": email.subject,
+            "body": written,
+            "thread_text": "\n".join(
+                p for p in (quoted, email.thread_text, email.html_text) if p
+            ),
+            "html_text": "",
+        }
 
     def _narrow_to_written(
         self, load_ids: list[str], written_load_ids: list[str], correlation_id: str

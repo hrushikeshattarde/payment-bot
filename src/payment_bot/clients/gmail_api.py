@@ -33,7 +33,10 @@ import base64
 import email
 import json
 import urllib.parse
-from email.utils import parseaddr
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from email.message import Message
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from typing import Any
 
 from payment_bot.clients.gmail import DraftMessage, SentMessage
@@ -47,7 +50,7 @@ from payment_bot.clients.mime import build_reply, parse_inbound_email, reply_sub
 from payment_bot.config import Settings, get_settings
 from payment_bot.errors import ClientError
 from payment_bot.logging import get_logger
-from payment_bot.models import InboundEmail
+from payment_bot.models import InboundEmail, PriorReply
 
 _log = get_logger("clients.gmail_api")
 
@@ -64,6 +67,20 @@ GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1"
 #: them as answered. Doubling the window doubles that pool, and starving fresh mail is the
 #: one failure this constant exists to prevent.
 _LISTING_WINDOW = 250
+
+#: Headers a ``format=metadata`` thread read asks for. From decides ownership; To and Cc tell
+#: a reply to the carrier from a note between colleagues; Message-ID locates one message.
+_THREAD_HEADERS = ("From", "To", "Cc", "Message-ID")
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplyTarget:
+    """The message to answer in one thread, and the reply of ours it follows up on, if any."""
+
+    message_id: str
+    #: Gmail id of the colleague's reply that a follow-up answers. ``None`` for a thread
+    #: nobody here has written in — the ordinary case.
+    prior_reply_id: str | None = None
 
 
 class SendingDisabledError(ClientError):
@@ -82,6 +99,8 @@ class GmailApiClient:
         mark_read: Remove the ``UNREAD`` label after fetching. Off while iterating, so the
             same mail can be reprocessed. Requires a scope permitting modify.
         transport: Injectable HTTP seam.
+        follow_ups: Answer a carrier's follow-up to a colleague's reply instead of skipping
+            every thread our side has written in (``Settings.followup_replies``).
     """
 
     def __init__(
@@ -97,6 +116,8 @@ class GmailApiClient:
         group_address: str = "",
         group_members: tuple[str, ...] = (),
         reply_to: str = "",
+        follow_ups: bool = False,
+        follow_up_asks: Callable[[InboundEmail], bool] | None = None,
     ) -> None:
         self._tokens = token_source
         self._user = user or token_source.subject
@@ -118,6 +139,15 @@ class GmailApiClient:
         #: never a colleague. Without this, every unanswered email from such a sender was
         #: skipped as "already answered by us" and the sender was invisible to the bot.
         self._group = group_address.strip().lower()
+        #: Answer a carrier's follow-up to a colleague's reply (``Settings.followup_replies``)
+        #: rather than leaving the whole thread to that colleague. Which threads qualify is
+        #: decided in :meth:`_followed_up_reply`.
+        self._follow_ups = follow_ups
+        #: Whether a follow-up asks for anything (``tools.shared.follow_up_asks``, injected by
+        #: the factory — the tools layer imports this one). One that does not is dropped here,
+        #: before it takes a processing slot: the mailbox stays unread, so a closing "thanks"
+        #: would otherwise re-take a slot every run and starve fresh mail behind it.
+        self._follow_up_asks = follow_up_asks
 
     @property
     def user(self) -> str:
@@ -179,11 +209,11 @@ class GmailApiClient:
 
         # Gmail lists newest first, so the first sighting of a thread is its newest match.
         seen_threads: set[str] = set()
-        ids: list[str] = []
+        targets: list[_ReplyTarget] = []
         skipped = 0
         for message_id, thread_id in matched:
             if not thread_id:
-                ids.append(message_id)
+                targets.append(_ReplyTarget(message_id))
                 continue
             if thread_id in seen_threads:
                 continue
@@ -192,46 +222,49 @@ class GmailApiClient:
             if target is None:
                 skipped += 1
                 continue
-            ids.append(target)
+            targets.append(target)
 
         if skipped:
             _log.info(
                 "gmail_api_threads_skipped",
                 extra={"skipped": skipped, "reason": "already answered or already drafted"},
             )
-        if len(ids) > self._limit:
+        if len(targets) > self._limit:
             _log.warning(
                 "gmail_api_backlog",
-                extra={"actionable": len(ids), "processing": self._limit},
+                extra={"actionable": len(targets), "processing": self._limit},
             )
-            ids = ids[: self._limit]
-        if not ids:
+        if not targets:
             _log.info("gmail_api_no_actionable_threads", extra={"query": query})
             return []
 
+        # Filled to the limit rather than cut to it first: a follow-up that asks for nothing
+        # is only known as one once its body is read, and it must not cost fresh mail a slot.
         emails: list[InboundEmail] = []
-        for message_id in ids:
-            record = self._get(
-                f"/users/{self._quoted_user()}/messages/{urllib.parse.quote(message_id)}",
-                {"format": "RAW"},
-            )
-            raw = record.get("raw")
-            if not isinstance(raw, str):
-                _log.warning("gmail_api_message_without_raw", extra={"id": message_id})
+        for target in targets:
+            if len(emails) >= self._limit:
+                break
+            inbound = self._fetch_message(target.message_id)
+            if inbound is None:
                 continue
-            try:
-                decoded = base64.urlsafe_b64decode(_pad_base64(raw))
-            except (ValueError, TypeError) as exc:
-                _log.warning("gmail_api_undecodable_message", extra={"id": message_id, "error": str(exc)})
-                continue
-            emails.append(
-                parse_inbound_email(
-                    email.message_from_bytes(decoded),
-                    thread_id=str(record.get("threadId") or "") or None,
-                    labels=[str(label) for label in (record.get("labelIds") or [])],
-                    group_address=self._group or None,
-                )
-            )
+            if target.prior_reply_id is not None:
+                if self._follow_up_asks is not None and not self._follow_up_asks(inbound):
+                    _log.info(
+                        "gmail_api_follow_up_asks_nothing",
+                        extra={"id": target.message_id, "thread_id": inbound.thread_id},
+                    )
+                    continue
+                prior = self._prior_reply(target.prior_reply_id)
+                if prior is None:
+                    # Without the reply it follows up on, the draft would answer blind and
+                    # could contradict it. Leave the thread with whoever answered, as before.
+                    _log.warning(
+                        "gmail_api_follow_up_without_prior_reply",
+                        extra={"id": target.message_id, "prior": target.prior_reply_id},
+                    )
+                    continue
+                inbound = inbound.model_copy(update={"prior_reply": prior})
+            emails.append(inbound)
 
         _log.info("gmail_api_fetched", extra={"count": len(emails), "query": query})
         return emails
@@ -277,6 +310,39 @@ class GmailApiClient:
     def _fetch_message(self, message_id: str) -> InboundEmail | None:
         """One message by id, or ``None`` when it cannot be decoded."""
 
+        fetched = self._fetch_raw(message_id)
+        if fetched is None:
+            return None
+        record, mime = fetched
+        return parse_inbound_email(
+            mime,
+            thread_id=str(record.get("threadId") or "") or None,
+            labels=[str(label) for label in (record.get("labelIds") or [])],
+            group_address=self._group or None,
+        )
+
+    def _prior_reply(self, message_id: str) -> PriorReply | None:
+        """The reply of ours that a follow-up answers, or ``None`` when it cannot be read."""
+
+        fetched = self._fetch_raw(message_id)
+        if fetched is None:
+            return None
+        record, mime = fetched
+        parsed = parse_inbound_email(mime, thread_id=str(record.get("threadId") or "") or None)
+        try:
+            sent_at = parsedate_to_datetime(str(mime.get("Date") or ""))
+        except (TypeError, ValueError, IndexError):
+            sent_at = None
+        return PriorReply(
+            from_email=parsed.from_email,
+            from_name=parsed.from_name,
+            sent_at=sent_at,
+            body=parsed.body,
+        )
+
+    def _fetch_raw(self, message_id: str) -> tuple[dict[str, Any], Message] | None:
+        """The ``format=RAW`` record and its parsed MIME, or ``None`` when undecodable."""
+
         record = self._get(
             f"/users/{self._quoted_user()}/messages/{urllib.parse.quote(message_id)}",
             {"format": "RAW"},
@@ -292,12 +358,7 @@ class GmailApiClient:
                 "gmail_api_undecodable_message", extra={"id": message_id, "error": str(exc)}
             )
             return None
-        return parse_inbound_email(
-            email.message_from_bytes(decoded),
-            thread_id=str(record.get("threadId") or "") or None,
-            labels=[str(label) for label in (record.get("labelIds") or [])],
-            group_address=self._group or None,
-        )
+        return record, email.message_from_bytes(decoded)
 
     def create_draft(
         self,
@@ -370,7 +431,7 @@ class GmailApiClient:
             "Accept": "application/json",
         }
 
-    def thread_state(self, thread_id: str) -> str:
+    def thread_state(self, thread_id: str, after_message_id: str = "") -> str:
         """``"handled"``, ``"drafting"`` or ``"open"`` for one thread.
 
         The tracker's labels come from here. ``fetch_new`` already collapses all three into
@@ -388,18 +449,30 @@ class GmailApiClient:
         carrier arriving through the group, not us writing out.
 
         Any read failure answers ``"open"``: an unreadable thread must never retire a row.
+
+        ``after_message_id`` (the row's own RFC ``Message-ID``) limits the question to what
+        happened AFTER that message. A follow-up's row lives in a thread a colleague already
+        answered once — that earlier answer is the reason the follow-up exists, and counting
+        it retired the row the moment it was posted. Not found in the thread, the whole
+        thread is read, which is the behaviour before follow-ups existed.
         """
 
         try:
             thread = self._get(
                 f"/users/{self._quoted_user()}/threads/{urllib.parse.quote(thread_id)}",
-                {"format": "metadata", "metadataHeaders": "From"},
+                {"format": "metadata", "metadataHeaders": list(_THREAD_HEADERS)},
             )
         except Exception as exc:
             _log.info("gmail_thread_state_unavailable", extra={"thread_id": thread_id, "error": str(exc)})
             return "open"
 
-        messages = [m for m in (thread.get("messages") or []) if isinstance(m, dict)]
+        messages = _chronological(thread)
+        if after_message_id:
+            wanted = after_message_id.strip()
+            for position, message in enumerate(messages):
+                if _header_value(message, "Message-ID").strip() == wanted:
+                    messages = messages[position + 1 :]
+                    break
         drafting = False
         for message in messages:
             if "DRAFT" in (message.get("labelIds") or []):
@@ -409,8 +482,8 @@ class GmailApiClient:
                 return "handled"
         return "drafting" if drafting else "open"
 
-    def _thread_reply_target(self, thread_id: str) -> str | None:
-        """The id of the message to answer in this thread, or ``None`` if none needs it.
+    def _thread_reply_target(self, thread_id: str) -> _ReplyTarget | None:
+        """The message to answer in this thread, or ``None`` if none needs it.
 
         Reasons a thread needs nothing:
 
@@ -429,39 +502,89 @@ class GmailApiClient:
         Otherwise the answer is the thread's newest message, which may be *newer* than the one
         the query matched — a carrier who followed up twice should get one reply to the latest.
 
+        **The one exception to ownership** is a carrier's follow-up to our answer, and only
+        with ``follow_ups`` on: the newest message is then answered too, carrying the id of the
+        reply it follows up on. See :meth:`_followed_up_reply` for the exact shape.
+
         A metadata-only thread read; it fetches no bodies.
         """
 
         thread = self._get(
             f"/users/{self._quoted_user()}/threads/{urllib.parse.quote(thread_id)}",
-            {"format": "metadata", "metadataHeaders": "From"},
+            {"format": "metadata", "metadataHeaders": list(_THREAD_HEADERS)},
         )
-        messages = [m for m in (thread.get("messages") or []) if isinstance(m, dict)]
+        messages = _chronological(thread)
         if not messages:
             return None
-
-        newest: dict[str, Any] | None = None
-        newest_at = -1
-        for message in messages:
-            if "DRAFT" in (message.get("labelIds") or []):
-                return None
-            # Any message from our side, anywhere in the thread, means a human has it.
-            if self._is_ours(_header_value(message, "From")):
-                _log.info(
-                    "gmail_api_thread_owned_by_us",
-                    extra={"thread_id": thread_id, "from": _header_value(message, "From")[:80]},
-                )
-                return None
-            try:
-                stamp = int(message.get("internalDate") or 0)
-            except (TypeError, ValueError):
-                stamp = 0
-            if stamp >= newest_at:
-                newest_at, newest = stamp, message
-        if newest is None:
+        if any("DRAFT" in (message.get("labelIds") or []) for message in messages):
             return None
 
-        return str(newest.get("id") or "") or None
+        newest_id = str(messages[-1].get("id") or "")
+        ours = [m for m in messages if self._is_ours(_header_value(m, "From"))]
+        if not ours:
+            return _ReplyTarget(newest_id) if newest_id else None
+
+        # Someone on our side has written in it, so a human has it — unless this is a
+        # carrier chasing the answer they were given.
+        prior = self._followed_up_reply(messages) if self._follow_ups else None
+        if prior is None or not newest_id:
+            _log.info(
+                "gmail_api_thread_owned_by_us",
+                extra={"thread_id": thread_id, "from": _header_value(ours[0], "From")[:80]},
+            )
+            return None
+        _log.info(
+            "gmail_api_follow_up",
+            extra={
+                "thread_id": thread_id,
+                "answering": newest_id,
+                "after_reply_from": _header_value(prior, "From")[:80],
+            },
+        )
+        return _ReplyTarget(newest_id, prior_reply_id=str(prior.get("id") or "") or None)
+
+    def _followed_up_reply(self, messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Our reply that the thread's newest message follows up on, or ``None``.
+
+        All four must hold, and each one is a way to get this wrong if it is dropped:
+
+        * **The carrier started the thread.** A thread a colleague started is outbound mail
+          with the group Cc'd — chasing paperwork, say — and the carrier's reply belongs to
+          that conversation, not to the payments queue. Most colleague mail is this shape.
+        * **Our latest message went to someone outside.** Colleagues discuss a carrier's email
+          by replying to the group alone; that is a note, not an answer, and the carrier has
+          not heard back. It stays with the humans already discussing it.
+        * **Nothing of ours came after it** — true by construction, since it is our latest.
+        * **The newest message is not ours**, i.e. the carrier wrote after that reply. Our
+          side having spoken last means the carrier is waiting on nothing.
+
+        ``messages`` must be chronological and draft-free (the caller ensures both).
+        """
+
+        if self._is_ours(_header_value(messages[0], "From")):
+            return None
+        last_ours = max(
+            (i for i, m in enumerate(messages) if self._is_ours(_header_value(m, "From"))),
+            default=None,
+        )
+        if last_ours is None or last_ours == len(messages) - 1:
+            return None
+        reply = messages[last_ours]
+        return reply if self._addressed_outside(reply) else None
+
+    def _addressed_outside(self, message: dict[str, Any]) -> bool:
+        """True when ``message`` went to anyone beyond our side and the group mailbox."""
+
+        recipients = getaddresses(
+            [_header_value(message, "To"), _header_value(message, "Cc")]
+        )
+        for _, address in recipients:
+            normalized = address.strip().lower()
+            if not normalized or normalized == self._group:
+                continue
+            if not self._is_ours(normalized):
+                return True
+        return False
 
     def _is_ours(self, from_header: str) -> bool:
         """True when a message was sent by someone on our side — a colleague or ourselves.
@@ -488,10 +611,13 @@ class GmailApiClient:
         domain = self._user.rsplit("@", 1)[-1].lower()
         return bool(domain) and normalized.endswith(f"@{domain}")
 
-    def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+    def _get(
+        self, path: str, params: Mapping[str, str | Sequence[str]] | None = None
+    ) -> dict[str, Any]:
         url = f"{GMAIL_API_ROOT}{path}"
         if params:
-            url = f"{url}?{urllib.parse.urlencode(params)}"
+            # doseq: Gmail takes a repeated parameter (metadataHeaders) once per value.
+            url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
         response = self._transport.request(
             "GET", url, headers=self._headers(), timeout=self._timeout
         )
@@ -572,6 +698,23 @@ def _header_value(message: dict[str, Any], name: str) -> str:
     return ""
 
 
+def _chronological(thread: dict[str, Any]) -> list[dict[str, Any]]:
+    """A thread's messages oldest first, by Gmail's ``internalDate``.
+
+    Stable, so messages sharing a timestamp keep the API's order and the later of them is
+    still the newest — what the per-message loop this replaced did with ties.
+    """
+
+    def stamp(message: dict[str, Any]) -> int:
+        try:
+            return int(message.get("internalDate") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    messages = [m for m in (thread.get("messages") or []) if isinstance(m, dict)]
+    return sorted(messages, key=stamp)
+
+
 def _pad_base64(value: str) -> str:
     """Restore the ``=`` padding Gmail omits from base64url payloads."""
 
@@ -583,6 +726,10 @@ def build_gmail_api_client(
     transport: HttpTransport | None = None,
 ) -> GmailApiClient:
     """Build a :class:`GmailApiClient` from ``PAYBOT_GOOGLE_*`` / ``PAYBOT_GMAIL_*`` config."""
+
+    # Imported here, not at module level: the tools layer imports the clients package, so a
+    # top-level import would be circular.
+    from payment_bot.tools.shared import follow_up_asks
 
     resolved = settings or get_settings()
     info = load_service_account_info(
@@ -610,4 +757,6 @@ def build_gmail_api_client(
         group_address=resolved.mailbox,
         group_members=resolved.gmail_group_members,
         reply_to=resolved.reply_to,
+        follow_ups=resolved.followup_replies,
+        follow_up_asks=follow_up_asks,
     )

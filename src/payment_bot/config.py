@@ -613,6 +613,21 @@ class Settings(BaseSettings):
     #: so treating it as ours would make every such carrier invisible.
     gmail_group_members: tuple[str, ...] = ()
 
+    #: Draft an update when a carrier follows up on a reply a colleague already sent.
+    #:
+    #: The shape: a carrier writes in, someone here answers them, and days later the carrier
+    #: writes again in the same thread — "any update?". Off, any message from our side
+    #: anywhere in a thread retires it for good, so that follow-up waits for whoever answered
+    #: first. On, the follow-up is answered like fresh mail — the loads are re-checked live,
+    #: so the draft carries what the records say NOW — with the colleague's reply handed to
+    #: the agent as context, never as a source. Still a human-approved draft; never auto-sent.
+    #:
+    #: Narrow on purpose. It applies only when the CARRIER started the thread, our latest
+    #: message in it was addressed to them (internal chatter is not an answer), nothing of ours
+    #: came after it, and what they just wrote asks for something. A thread a colleague started
+    #: — outbound mail with the group Cc'd — stays theirs, and a bare "thanks" drafts nothing.
+    followup_replies: bool = False
+
     #: Gmail search syntax (not IMAP): ``is:unread``, ``newer_than:2d``, ``from:…``.
     gmail_query: str = "is:unread"
     gmail_fetch_limit: int = Field(default=10, ge=1, le=200)

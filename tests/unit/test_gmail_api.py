@@ -290,12 +290,20 @@ def _thread_message(
     from_address: str,
     internal_date: str = "1000",
     labels: list[str] | None = None,
+    *,
+    to: str = "",
+    cc: str = "",
+    rfc_id: str = "",
 ) -> dict[str, Any]:
+    headers = [{"name": "From", "value": from_address}]
+    for name, value in (("To", to), ("Cc", cc), ("Message-ID", rfc_id)):
+        if value:
+            headers.append({"name": name, "value": value})
     return {
         "id": message_id,
         "internalDate": internal_date,
         "labelIds": labels if labels is not None else ["INBOX"],
-        "payload": {"headers": [{"name": "From", "value": from_address}]},
+        "payload": {"headers": headers},
     }
 
 
@@ -773,3 +781,302 @@ def test_an_all_carrier_thread_is_still_answered() -> None:
     )
     emails = _client(http).fetch_new()
     assert len(emails) == 1
+
+
+# --- follow-ups to our own reply (Settings.followup_replies) -----------------
+# A carrier writes in, a colleague answers, the carrier chases. With follow-ups off that
+# thread is the colleague's for good (the tests above); on, the chase is answered — but only
+# that exact shape, and only with the colleague's reply in hand.
+_GROUP = "paystatus@circledelivers.com"
+
+RAW_COLLEAGUE_REPLY = """\
+From: Angelica Baracao <angelica.baracao@circledelivers.com>
+To: Idea Expedited Billing <billing@ideaexpedited.com>
+Cc: paystatus@circledelivers.com
+Subject: Re: Payment status for load 2462934
+Date: Mon, 05 Oct 2026 10:15:00 -0400
+Message-ID: <reply1@circledelivers.com>
+Content-Type: text/plain; charset="utf-8"
+
+Hi, load 2462934 is waiting on the signed POD. Once we have it, payment goes out on the next run.
+
+On Fri, Oct 2, 2026 at 9:00 AM Idea Expedited Billing <billing@ideaexpedited.com> wrote:
+> Could you tell me the payment status for load 2462934?
+"""
+
+RAW_CHASE = """\
+From: Idea Expedited Billing <billing@ideaexpedited.com>
+To: paystatus@circledelivers.com
+Subject: Re: Payment status for load 2462934
+Message-ID: <chase1@mail.ideaexpedited.com>
+Content-Type: text/plain; charset="utf-8"
+
+Any update on this? We sent the POD on Monday.
+"""
+
+
+def _follow_up_client(http: FakeHttp) -> GmailApiClient:
+    return _client(http, follow_ups=True, group_address=_GROUP)
+
+
+def _answered_then_chased(to: str = _CARRIER, cc: str = _GROUP) -> dict[str, Any]:
+    """Carrier asks, a colleague answers (to the carrier unless overridden), carrier chases."""
+
+    return _thread(
+        _thread_message("c1", _CARRIER, "1000", to=_GROUP),
+        _thread_message("r2", _COLLEAGUE, "2000", to=to, cc=cc),
+        _thread_message("c3", _CARRIER, "3000", to=_GROUP),
+    )
+
+
+@pytest.mark.unit
+def test_a_chase_after_our_reply_is_answered_with_that_reply_attached() -> None:
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "c3", "threadId": "t1"}]}),
+            ("/threads/t1", 200, _answered_then_chased()),
+            ("/messages/c3", 200, {"id": "c3", "threadId": "t1", "raw": _b64(RAW_CHASE)}),
+            (
+                "/messages/r2",
+                200,
+                {"id": "r2", "threadId": "t1", "raw": _b64(RAW_COLLEAGUE_REPLY)},
+            ),
+        ]
+    )
+    emails = _follow_up_client(http).fetch_new()
+
+    assert len(emails) == 1
+    chase = emails[0]
+    assert chase.message_id == "<chase1@mail.ideaexpedited.com>"
+    assert chase.from_email == _CARRIER
+    prior = chase.prior_reply
+    assert prior is not None
+    assert prior.from_email == _COLLEAGUE
+    assert prior.from_name == "Angelica Baracao"
+    assert "waiting on the signed POD" in prior.body
+    assert prior.sent_at is not None and prior.sent_at.date().isoformat() == "2026-10-05"
+    # The thread read asked for every header the rule needs, one parameter each.
+    thread_url = next(r["url"] for r in http.requests if "/threads/t1" in r["url"])
+    for header in ("From", "To", "Cc", "Message-ID"):
+        assert f"metadataHeaders={header}" in thread_url
+
+
+@pytest.mark.unit
+def test_with_follow_ups_off_the_chase_stays_with_the_colleague() -> None:
+    """The default. Nothing about today's behaviour changes until the switch is on."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "c3", "threadId": "t1"}]}),
+            ("/threads/t1", 200, _answered_then_chased()),
+        ]
+    )
+    assert _client(http, group_address=_GROUP).fetch_new() == []
+    assert not any("format=RAW" in r["url"] for r in http.requests)
+
+
+@pytest.mark.unit
+def test_a_thread_a_colleague_started_is_still_theirs() -> None:
+    """Outbound mail with the group Cc'd: the carrier's answer belongs to that conversation."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "c2", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    _thread_message("r1", _COLLEAGUE, "1000", to=_CARRIER, cc=_GROUP),
+                    _thread_message("c2", _CARRIER, "2000", to=_COLLEAGUE, cc=_GROUP),
+                ),
+            ),
+        ]
+    )
+    assert _follow_up_client(http).fetch_new() == []
+
+
+@pytest.mark.unit
+def test_a_note_between_colleagues_is_not_an_answer() -> None:
+    """Replying to the group alone is discussion; the carrier never heard back from anyone."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "c3", "threadId": "t1"}]}),
+            ("/threads/t1", 200, _answered_then_chased(to=_GROUP, cc="priya@circledelivers.com")),
+        ]
+    )
+    assert _follow_up_client(http).fetch_new() == []
+
+
+@pytest.mark.unit
+def test_when_we_spoke_last_the_carrier_is_waiting_on_nothing() -> None:
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "c1", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    _thread_message("c1", _CARRIER, "1000", to=_GROUP),
+                    _thread_message("r2", _COLLEAGUE, "2000", to=_CARRIER),
+                ),
+            ),
+        ]
+    )
+    assert _follow_up_client(http).fetch_new() == []
+
+
+@pytest.mark.unit
+def test_a_draft_in_the_thread_still_stops_a_follow_up() -> None:
+    """Someone is already writing the answer to the chase."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "c3", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    *_answered_then_chased()["messages"],
+                    _thread_message("d4", _COLLEAGUE, "4000", labels=["DRAFT"], to=_CARRIER),
+                ),
+            ),
+        ]
+    )
+    assert _follow_up_client(http).fetch_new() == []
+
+
+@pytest.mark.unit
+def test_a_follow_up_whose_prior_reply_cannot_be_read_is_left_alone() -> None:
+    """Answering blind could contradict what the colleague said."""
+
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "c3", "threadId": "t1"}]}),
+            ("/threads/t1", 200, _answered_then_chased()),
+            ("/messages/c3", 200, {"id": "c3", "threadId": "t1", "raw": _b64(RAW_CHASE)}),
+            ("/messages/r2", 200, {"id": "r2", "threadId": "t1"}),  # no raw
+        ]
+    )
+    assert _follow_up_client(http).fetch_new() == []
+
+
+@pytest.mark.unit
+def test_the_newest_chase_is_answered_when_the_carrier_chased_twice() -> None:
+    http = FakeHttp(
+        [
+            ("/messages?", 200, {"messages": [{"id": "c3", "threadId": "t1"}]}),
+            (
+                "/threads/t1",
+                200,
+                _thread(
+                    *_answered_then_chased()["messages"],
+                    _thread_message("c4", _CARRIER, "4000", to=_GROUP),
+                ),
+            ),
+            ("/messages/c4", 200, {"id": "c4", "threadId": "t1", "raw": _b64(RAW_CHASE)}),
+            (
+                "/messages/r2",
+                200,
+                {"id": "r2", "threadId": "t1", "raw": _b64(RAW_COLLEAGUE_REPLY)},
+            ),
+        ]
+    )
+    emails = _follow_up_client(http).fetch_new()
+    assert len(emails) == 1 and emails[0].prior_reply is not None
+    assert any("/messages/c4" in r["url"] for r in http.requests)
+    assert not any("/messages/c3" in r["url"] for r in http.requests)
+
+
+@pytest.mark.unit
+def test_the_factory_passes_the_follow_up_switch(tmp_path: Any) -> None:
+    key = tmp_path / "sa.json"
+    key.write_text(
+        json.dumps({"client_email": "sa@x", "private_key": "k", "client_id": "7"}), encoding="utf-8"
+    )
+    on = Settings(google_sa_file=str(key), followup_replies=True)
+    off = Settings(google_sa_file=str(key))
+    assert build_gmail_api_client(on, transport=FakeHttp([]))._follow_ups is True
+    assert build_gmail_api_client(off, transport=FakeHttp([]))._follow_ups is False
+
+
+# --- thread_state for a follow-up's row ---------------------------------------
+@pytest.mark.unit
+def test_thread_state_ignores_the_reply_a_follow_up_is_chasing() -> None:
+    """Counting it retired every follow-up's row the moment its card was posted."""
+
+    thread = _thread(
+        _thread_message("c1", _CARRIER, "1000", rfc_id="<ask@x>"),
+        _thread_message("r2", _COLLEAGUE, "2000", to=_CARRIER),
+        _thread_message("c3", _CARRIER, "3000", rfc_id="<chase@x>"),
+    )
+    client = _client(FakeHttp([("/threads/t1", 200, thread)]))
+
+    assert client.thread_state("t1", after_message_id="<chase@x>") == "open"
+    # Without the row's message id the whole thread is read, exactly as before.
+    assert client.thread_state("t1") == "handled"
+
+
+@pytest.mark.unit
+def test_thread_state_still_retires_a_follow_up_answered_by_hand() -> None:
+    thread = _thread(
+        _thread_message("c1", _CARRIER, "1000"),
+        _thread_message("r2", _COLLEAGUE, "2000", to=_CARRIER),
+        _thread_message("c3", _CARRIER, "3000", rfc_id="<chase@x>"),
+        _thread_message("r4", _COLLEAGUE, "4000", to=_CARRIER),
+    )
+    client = _client(FakeHttp([("/threads/t1", 200, thread)]))
+    assert client.thread_state("t1", after_message_id="<chase@x>") == "handled"
+
+
+RAW_THANKS = """\
+From: Idea Expedited Billing <billing@ideaexpedited.com>
+To: paystatus@circledelivers.com
+Subject: Re: Payment status for load 2462934
+Message-ID: <thanks1@mail.ideaexpedited.com>
+Content-Type: text/plain; charset="utf-8"
+
+Thank you!
+"""
+
+
+@pytest.mark.unit
+def test_a_thanks_after_our_reply_does_not_take_fresh_mails_slot() -> None:
+    """The mailbox stays unread, so a closing "thanks" would re-take a slot every run."""
+
+    from payment_bot.tools.shared import follow_up_asks
+
+    http = FakeHttp(
+        [
+            (
+                "/messages?",
+                200,
+                {"messages": [{"id": "c3", "threadId": "t1"}, {"id": "n1", "threadId": "t2"}]},
+            ),
+            ("/threads/t1", 200, _answered_then_chased()),
+            ("/threads/t2", 200, _thread(_thread_message("n1", _CARRIER, "5000", to=_GROUP))),
+            ("/messages/c3", 200, {"id": "c3", "threadId": "t1", "raw": _b64(RAW_THANKS)}),
+            ("/messages/n1", 200, {"id": "n1", "threadId": "t2", "raw": _b64(RAW_INBOUND)}),
+        ]
+    )
+    client = _client(
+        http, follow_ups=True, group_address=_GROUP, limit=1, follow_up_asks=follow_up_asks
+    )
+
+    emails = client.fetch_new()
+
+    assert [e.message_id for e in emails] == ["<abc123@mail.ideaexpedited.com>"]
+    # Dropped before its colleague's reply was even fetched.
+    assert not any("/messages/r2" in r["url"] for r in http.requests)
+
+
+@pytest.mark.unit
+def test_the_factory_wires_the_ask_check(tmp_path: Any) -> None:
+    from payment_bot.tools.shared import follow_up_asks
+
+    key = tmp_path / "sa.json"
+    key.write_text(
+        json.dumps({"client_email": "sa@x", "private_key": "k", "client_id": "7"}), encoding="utf-8"
+    )
+    client = build_gmail_api_client(Settings(google_sa_file=str(key)), transport=FakeHttp([]))
+    assert client._follow_up_asks is follow_up_asks

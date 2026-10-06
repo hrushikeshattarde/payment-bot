@@ -48,6 +48,7 @@ POLICY_SWITCHES: dict[str, str] = {
     "noa_attachment_replies": "NoaAttachmentReplies",
     "factoring_prenoa_replies": "FactoringPrenoaReplies",
     "auto_add_factoring_domains": "AutoAddFactoringDomains",
+    "followup_replies": "FollowupReplies",
     # Not a boolean, so the auto-detection below cannot find it. Listed by hand for the same
     # reason as the rest: `off` in a deployed stack while `enforce` locally is a silent
     # behaviour difference, which is exactly the class of bug this file exists for.

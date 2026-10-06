@@ -980,7 +980,7 @@ def test_an_answered_thread_is_retired_and_an_open_one_is_not() -> None:
         def __init__(self) -> None:
             self.asked: list[str] = []
 
-        def thread_state(self, thread_id: str) -> str:
+        def thread_state(self, thread_id: str, after_message_id: str = "") -> str:
             self.asked.append(thread_id)
             return {"t-done": "handled", "t-draft": "drafting"}.get(thread_id, "open")
 
@@ -1010,13 +1010,40 @@ def test_an_answered_thread_is_retired_and_an_open_one_is_not() -> None:
 
 
 @pytest.mark.unit
+def test_only_replies_after_the_rows_own_message_are_asked_about() -> None:
+    """A follow-up's thread already holds the colleague's answer being chased.
+
+    Asking about the whole thread retired the follow-up's row the moment its card was posted.
+    """
+
+    from payment_bot.lambda_handler import _queue_states
+
+    class Gmail:
+        def __init__(self) -> None:
+            self.asked: list[tuple[str, str]] = []
+
+        def thread_state(self, thread_id: str, after_message_id: str = "") -> str:
+            self.asked.append((thread_id, after_message_id))
+            return "open"
+
+    store = InMemoryApprovalStore()
+    entry = replace(_entry("e", hours_old=10, to="a@c.com"), thread_id="t")
+    store.put_pending(entry)
+
+    gmail = Gmail()
+    _queue_states(store, gmail, [entry], _settings())
+
+    assert gmail.asked == [("t", "<e@mail>")]
+
+
+@pytest.mark.unit
 def test_a_gmail_failure_never_retires_a_row() -> None:
     """The expensive mistake would be recording a carrier as answered because a read failed."""
 
     from payment_bot.lambda_handler import _queue_states
 
     class Broken:
-        def thread_state(self, thread_id: str) -> str:
+        def thread_state(self, thread_id: str, after_message_id: str = "") -> str:
             raise RuntimeError("gmail is unwell")
 
     store = InMemoryApprovalStore()
@@ -1035,7 +1062,7 @@ def test_an_entry_with_no_thread_id_is_left_alone() -> None:
     from payment_bot.lambda_handler import _queue_states
 
     class Gmail:
-        def thread_state(self, thread_id: str) -> str:
+        def thread_state(self, thread_id: str, after_message_id: str = "") -> str:
             raise AssertionError("must not be asked without a thread id")
 
     store = InMemoryApprovalStore()
@@ -1093,7 +1120,7 @@ def test_a_fresh_cached_state_is_not_rechecked() -> None:
         def __init__(self) -> None:
             self.asked: list[str] = []
 
-        def thread_state(self, thread_id: str) -> str:
+        def thread_state(self, thread_id: str, after_message_id: str = "") -> str:
             self.asked.append(thread_id)
             return "open"
 

@@ -8,7 +8,7 @@ add fields over time — while our own tool I/O models are strict.
 from __future__ import annotations
 
 from payment_bot.models.cargotel import CargoTelDocument, CargoTelLoad
-from payment_bot.models.email import EmailAttachment, InboundEmail
+from payment_bot.models.email import EmailAttachment, InboundEmail, PriorReply
 from payment_bot.models.enums import (
     AuthDecision,
     Intent,
@@ -49,6 +49,7 @@ __all__ = [
     "Intent",
     "NoaFactoring",
     "PayBasis",
+    "PriorReply",
     "RemitTo",
     "SensitiveAction",
     "SensitiveFlag",

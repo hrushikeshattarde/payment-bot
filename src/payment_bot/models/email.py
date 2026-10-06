@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html as html_entities
 import re
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -69,6 +70,24 @@ class EmailAttachment(BaseModel):
     extracted_text: str = ""
 
 
+class PriorReply(BaseModel):
+    """Our side's last reply in a thread, which the inbound message is following up on.
+
+    Set only on a follow-up (``Settings.followup_replies``): a carrier wrote in, a colleague
+    answered them, and the carrier has written again. It is CONTEXT for the draft, never a
+    source — nothing in it is grounded, and the gate holds the reply to what the tools return
+    now. ``body`` is the message as sent, quoted history included; readers strip it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    from_email: str
+    from_name: str | None = None
+    #: From the message's own Date header, so it reads in the colleague's timezone.
+    sent_at: datetime | None = None
+    body: str = ""
+
+
 class InboundEmail(BaseModel):
     """A single inbound message to the payments inbox."""
 
@@ -84,6 +103,9 @@ class InboundEmail(BaseModel):
     thread_text: str = ""
     attachments: list[EmailAttachment] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
+    #: Present when this message follows up on a reply from our side — see
+    #: :class:`PriorReply`. ``None`` for every message in a thread nobody here has answered.
+    prior_reply: PriorReply | None = None
 
     @property
     def combined_text(self) -> str:

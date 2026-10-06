@@ -261,6 +261,17 @@ Parameters:
       rostered to another company, loads with no factor on file, and sensitive-change mail are
       refused regardless. Every auto-add is logged WARNING as auto_roster_entry_added and
       marked AUTO-ADDED in factoring_domains_manual.json so it can be revoked.
+  FollowupReplies:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Draft a fresh update when a carrier chases ("any update?") in a thread a colleague
+      already answered. Off, any message from our side retires a thread for good and the
+      follow-up waits for whoever answered first. On, the loads are re-checked live and the
+      colleague's reply is given to the agent as context; the draft goes to approval like any
+      other and is never auto-sent. Only carrier-started threads whose latest message of ours
+      went to the carrier qualify, and a follow-up that asks nothing ("thanks") drafts nothing.
   CarrierNameMatch:
     Type: String
     Default: shadow
@@ -543,6 +554,7 @@ Resources:
           PAYBOT_ESCALATION_RETRY_LIMIT: !Ref EscalationRetryLimit
           PAYBOT_AGENT_ESCALATION_RETRY_LIMIT: !Ref AgentEscalationRetryLimit
           PAYBOT_AUTO_ADD_FACTORING_DOMAINS: !Ref AutoAddFactoringDomains
+          PAYBOT_FOLLOWUP_REPLIES: !Ref FollowupReplies
 
           PAYBOT_REPLY_SIGNATURE: !Ref ReplySignature
           PAYBOT_REPLY_CC: !Ref ReplyCc

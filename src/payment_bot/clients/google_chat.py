@@ -167,6 +167,7 @@ def approval_card(
     status: str = "",
     message_id: str = "",
     action_url: str = "",
+    follow_up_to: str = "",
 ) -> dict[str, Any]:
     """The approval card, shared by the poster and the callback's in-place updates.
 
@@ -174,7 +175,9 @@ def approval_card(
     gone — what a card becomes after a click or an expiry, so the feed doubles as the
     audit trail humans read. ``message_id`` adds an "Open the email in Gmail" link
     button in every form, including terminal ones: finding the conversation is useful
-    before acting and after.
+    before acting and after. ``follow_up_to`` marks a draft answering a carrier's
+    follow-up to that colleague's reply — the one card a reviewer should read against
+    the thread before approving.
     """
 
     recipients = [
@@ -186,6 +189,15 @@ def approval_card(
         recipients.append({"decoratedText": {"topLabel": "Reply-To", "text": reply_to}})
     if subject:
         recipients.append({"decoratedText": {"topLabel": "Subject", "text": subject}})
+    if follow_up_to:
+        recipients.append(
+            {
+                "decoratedText": {
+                    "topLabel": "Follow-up",
+                    "text": f"Carrier chased after {follow_up_to} replied — check the thread",
+                }
+            }
+        )
 
     trimmed = _trim(body, _BODY_LIMIT)
     if trimmed != body:
@@ -831,6 +843,7 @@ class GoogleChatClient:
             interactive=self._interactive,
             message_id=correlation_id,
             action_url=self._action_url,
+            follow_up_to=summary.follow_up_to,
         )
         name = self._post_card(
             card,

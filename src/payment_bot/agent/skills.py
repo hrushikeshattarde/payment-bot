@@ -16,7 +16,7 @@ from payment_bot.tools import (
     PAYMENT_STATUS_TOOLS,
     RATE_VERIFICATION_TOOLS,
 )
-from payment_bot.tools.shared import StatedRate
+from payment_bot.tools.shared import StatedRate, strip_quoted
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,6 +512,7 @@ def build_cargotel_payment_status_intake(
             f"Subject: {email.subject}",
             "Body:",
             email.body.strip(),
+            *_follow_up_lines(email),
             "",
             "Deterministic intake already ran (sensitive-change check passed = none).",
             f"- Load id(s): {load_ids}",
@@ -560,6 +561,50 @@ def _cargotel_rate_lines(
             "- The sender quoted no amount, so there is nothing to compare — state ours."
         )
     return lines
+
+
+#: Cap on the colleague's reply shown to the agent. Ample for an answer about a few loads; a
+#: longer one is pasted paperwork, and the cap keeps it from crowding out the procedure.
+_PRIOR_REPLY_CHARS = 2000
+
+
+def _follow_up_lines(email: InboundEmail) -> list[str]:
+    """Tell the agent this answers a follow-up, and what our side already said.
+
+    The colleague's reply is given as CONTEXT, so the draft can say what has changed since it
+    rather than reading as though nobody had answered. It is not a source and is labelled as
+    such: the records may have moved since it was written — that is usually why the carrier
+    is asking again — and the gate holds every figure in the draft to what a tool returns now.
+    Only what the colleague wrote is shown; the history they quoted is the carrier's own mail.
+    """
+
+    prior = email.prior_reply
+    if prior is None:
+        return []
+    who = f"{prior.from_name} <{prior.from_email}>" if prior.from_name else prior.from_email
+    when = (
+        f" on {prior.sent_at:%A, %B} {prior.sent_at.day}, {prior.sent_at.year}"
+        if prior.sent_at
+        else ""
+    )
+    written = strip_quoted(prior.body).strip()
+    if len(written) > _PRIOR_REPLY_CHARS:
+        written = written[:_PRIOR_REPLY_CHARS].rstrip() + " [...]"
+    return [
+        "",
+        f"This is a FOLLOW-UP. {who} on our team already replied in this thread{when}, and "
+        "the sender has written again (the Body above). Our earlier reply, for context only:",
+        '"""',
+        written or "(no text)",
+        '"""',
+        "- Check every load again with the tools now. Status, paperwork and dates may have "
+        "changed since that reply; what the records say today is the answer.",
+        "- If the records now differ from what that reply said, say plainly what has changed "
+        "(the paperwork arrived, a pay date is now set, the payment has gone out). If nothing "
+        "has changed, say where things stand now without repeating the whole history.",
+        "- That reply is not a source. State no amount, date or status from it that a tool did "
+        "not return in this run, do not quote it, and do not comment on it or on its author.",
+    ]
 
 
 def _unlocated_line(unlocated_loads: list[str] | None) -> list[str]:
@@ -662,6 +707,7 @@ def build_payment_status_intake(
             f"Subject: {email.subject}",
             "Body:",
             email.body.strip(),
+            *_follow_up_lines(email),
             "",
             "Deterministic intake already ran (sensitive-change check passed = none).",
             f"- Load id(s): {load_ids}",
@@ -715,6 +761,7 @@ def build_rate_verification_intake(
             f"Subject: {email.subject}",
             "Body:",
             email.body.strip(),
+            *_follow_up_lines(email),
             "",
             "Deterministic intake already ran (sensitive-change check passed = none).",
             f"- Load id(s): {load_ids}",

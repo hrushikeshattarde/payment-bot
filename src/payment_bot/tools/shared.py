@@ -23,6 +23,7 @@ from payment_bot.errors import LoadCancelledError, ToolError
 from payment_bot.logging import get_logger
 from payment_bot.models import (
     AuthDecision,
+    InboundEmail,
     Intent,
     SensitiveAction,
     SensitiveFlag,
@@ -1009,6 +1010,8 @@ class StatedRate(BaseModel):
 class ExtractIdentifiersInput(BaseModel):
     subject: str = ""
     body: str = ""
+    #: Quoted history. Contributes load ids ONLY — never stated amounts, carrier names or
+    #: written ids; see ``ExtractIdentifiers.run``.
     thread_text: str = ""
     #: Text extracted from spreadsheet attachments (xlsx/csv). Carriers send statements
     #: whose load ids appear nowhere in the body; this is where they surface. Feeds
@@ -1061,17 +1064,24 @@ class ExtractIdentifiers(Tool):
 
     def run(self, params: BaseModel, ctx: ToolContext) -> ExtractIdentifiersOutput:
         assert isinstance(params, ExtractIdentifiersInput)
-        text = "\n".join(
+        # Everything except quoted history. Amounts, carrier names, the factor and column
+        # hints are read from here only.
+        surface = "\n".join(
             p
             for p in (
                 params.subject,
                 params.body,
-                params.thread_text,
                 params.attachments_text,
                 params.html_text,
             )
             if p
         )
+        # `thread_text` contributes LOAD IDS and nothing else. On a follow-up it holds our own
+        # earlier reply, quoted back: its loads are what the carrier is chasing, but its
+        # amounts are ours, and recording them as the sender's would let the draft repeat a
+        # figure no tool confirmed — `record_sender_amount` is exactly the gate's allowance
+        # for quoting the sender back to themselves.
+        text = "\n".join(p for p in (surface, params.thread_text) if p)
 
         load_ids = _dedupe(_load_ids_in(text))
         invoice_numbers = _dedupe(_INVOICE_RE.findall(text))
@@ -1083,7 +1093,7 @@ class ExtractIdentifiers(Tool):
 
         stated_rates: list[StatedRate] = []
         unbound: list[Decimal] = []
-        for line in text.splitlines():
+        for line in surface.splitlines():
             if not _MONEY_RE.search(line):
                 continue
             # Deduped: an invoice table routinely prints the same number under both an
@@ -1151,18 +1161,18 @@ class ExtractIdentifiers(Tool):
         written = set(_load_ids_in(written_text))
         written_load_ids = [lid for lid in load_ids if lid in written]
 
-        carrier_names = _dedupe(m.strip().rstrip(".") for m in _COMPANY_RE.findall(text))
+        carrier_names = _dedupe(m.strip().rstrip(".") for m in _COMPANY_RE.findall(surface))
 
         factoring_company: str | None = None
-        if re.search(r"factor", text, re.IGNORECASE):
-            for sentence in re.split(r"[.\n]", text):
+        if re.search(r"factor", surface, re.IGNORECASE):
+            for sentence in re.split(r"[.\n]", surface):
                 if "factor" in sentence.lower():
                     match = _COMPANY_RE.search(sentence)
                     if match:
                         factoring_company = match.group(1).strip().rstrip(".")
                         break
 
-        column_hints = _dedupe(m.strip() for m in _COLUMN_HINT_RE.findall(text))
+        column_hints = _dedupe(m.strip() for m in _COLUMN_HINT_RE.findall(surface))
 
         # Record the sender's own stated amounts so the reply may quote them back without
         # tripping the pre-send gate. `record_sender_amount`, not `record_amount`: these were
@@ -2355,6 +2365,50 @@ _PAYMENT_SIGNALS = (
     "payment details", "payment detail", "payment information",
 )  # fmt: skip
 _PAPERWORK_SIGNALS = ("pod", "bol", "proof of delivery", "bill of lading", "paperwork")
+
+#: How a carrier chases an answer they were already given. Read only on a follow-up, and only
+#: from what they wrote in it — the subject is inherited from the thread ("Re: payment status
+#: 2476340") and would make a bare "thank you" look like a payment question.
+_UPDATE_SIGNALS = (
+    "update", "updates", "any news", "follow up", "following up", "follow-up", "followup",
+    "checking in", "check in", "status", "eta", "still waiting", "still not", "still no",
+    "still haven't", "still have not", "not received", "haven't received", "have not received",
+    "not yet received", "not been received", "when will", "when can", "when is", "when are",
+    "when do", "where is", "where are", "been paid", "be paid", "please advise",
+    "kindly advise", "reminder", "past due", "overdue",
+    # Requests written without a question mark — "can you check again".
+    "can you", "could you", "can someone", "please check", "please confirm", "look into",
+)  # fmt: skip
+
+
+def asks_for_an_update(written: str) -> bool:
+    """True when a follow-up asks for something, rather than closing the conversation.
+
+    ``written`` is what the sender wrote in THIS message, quoted history stripped. "Thanks!",
+    "Received, thank you" and "Noted" ask nothing, and drafting a payment update in reply to
+    them is a card a reviewer can only reject. A question mark counts on its own: a follow-up
+    question is an ask whatever its words. Deliberately broad otherwise — a human approves
+    every follow-up draft, and a missed ask is a carrier left waiting.
+    """
+
+    text = written.lower()
+    return (
+        "?" in text
+        or _matches_any(text, _UPDATE_SIGNALS)
+        or _matches_any(text, _PAYMENT_SIGNALS)
+        or _matches_any(text, _RATE_SIGNALS)
+    )
+
+
+def follow_up_asks(email: InboundEmail) -> bool:
+    """:func:`asks_for_an_update` on what ``email``'s sender wrote, quoted history stripped.
+
+    The one definition both readers use: the Gmail client, to keep a closing "thanks" from
+    taking a processing slot every run, and the pipeline, as the backstop for any other
+    intake path.
+    """
+
+    return asks_for_an_update(strip_quoted(email.body))
 
 
 def _matches_any(text: str, phrases: tuple[str, ...]) -> bool:

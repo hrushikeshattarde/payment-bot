@@ -30,6 +30,9 @@ class ApprovalSummary:
     #: Reviewers to copy on the eventual reply. Configuration, never model output — the
     #: agent has no say in who receives the email.
     cc: tuple[str, ...] = ()
+    #: The colleague whose reply this draft follows up on; blank for a first answer. Shown
+    #: so the reviewer reads the draft against what that colleague already told the carrier.
+    follow_up_to: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -481,7 +481,9 @@ def _queue_states(
             except ValueError:
                 pass
         try:
-            state = str(checker(entry.thread_id))
+            # Only replies AFTER this row's message retire it. A follow-up's thread already
+            # holds the colleague's answer that the carrier is chasing.
+            state = str(checker(entry.thread_id, after_message_id=entry.message_id))
         except Exception as exc:
             _log.info(
                 "queue_state_unavailable",

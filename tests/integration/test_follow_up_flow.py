@@ -110,6 +110,27 @@ def test_a_chase_is_answered_with_the_colleagues_reply_in_the_agents_hands() -> 
 
 
 @pytest.mark.integration
+def test_a_chase_naming_no_load_finds_it_in_our_reply() -> None:
+    """Live: a carrier answered Angelica with no load in subject or body and quoted nothing.
+
+    It escalated as "no valid 6/7-digit load id found" while the load sat in her reply.
+    """
+
+    pipeline, _, _, _, audit = _pipeline(
+        ScriptedApprovalResolver(ApprovalDecision(ApprovalAction.APPROVE))
+    )
+    bare = _follow_up("Any update?").model_copy(
+        update={"subject": "Re: Payment", "body": "Any update?"}
+    )
+
+    result = pipeline.process_email(bare)
+
+    assert result.outcome is Outcome.SENT, result.detail
+    names = [e.tool_name for e in audit.for_correlation(bare.message_id)]
+    assert "tp_get_load_summary" in names
+
+
+@pytest.mark.integration
 def test_a_follow_up_that_asks_nothing_drafts_nothing() -> None:
     """A "thanks" after the colleague's answer closes the conversation."""
 
@@ -192,11 +213,26 @@ def test_a_follow_up_is_split_into_what_was_written_and_what_was_quoted() -> Non
     # The HTML repeats the quoted history, so it joins the ids-only side.
     assert parts["html_text"] == ""
     assert email.html_text in parts["thread_text"]
+    # So does the colleague's reply, which may be the only place the load is named.
+    assert email.prior_reply is not None
+    assert email.prior_reply.body in parts["thread_text"]
 
     ordinary = email.model_copy(update={"prior_reply": None})
     whole = PaymentBotPipeline._identifier_text(ordinary)
     assert whole["body"] == ordinary.body
     assert whole["html_text"] == ordinary.html_text
+
+
+@pytest.mark.unit
+def test_a_follow_up_yields_the_load_but_none_of_our_amounts(ctx: ToolContext) -> None:
+    """The colleague's reply ($4,650.00) and the quote of it ($9,999.00) both name the load."""
+
+    parts = PaymentBotPipeline._identifier_text(_follow_up("Any update?"))
+
+    found = ExtractIdentifiers().run(ExtractIdentifiersInput(**parts), ctx)
+
+    assert found.load_ids == ["2462934"]
+    assert found.stated_rates == []
 
 
 @pytest.mark.unit

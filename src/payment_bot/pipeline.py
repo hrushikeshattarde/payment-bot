@@ -594,8 +594,15 @@ class PaymentBotPipeline:
             # cancellation deserves to know it is about a number a PDF contributed.
             unwritten = [lid for lid in load_ids if lid not in written]
             if unwritten:
+                # A follow-up's unwritten ids usually come from the earlier thread (quoted
+                # history, or our own reply), not from a PDF — say which.
+                source = (
+                    "an attachment or the earlier thread"
+                    if email.prior_reply is not None
+                    else "an attachment"
+                )
                 parts.append(
-                    "id(s) the sender never wrote, contributed by an attachment: "
+                    f"id(s) the sender never wrote, contributed by {source}: "
                     f"{', '.join(unwritten)}"
                 )
             reason = "; ".join(parts) or "no load could be authorized"
@@ -1082,6 +1089,14 @@ class PaymentBotPipeline:
             # Last on purpose. MAX_CONTEXT_CHARS still truncates, and the sender's own words
             # are what disambiguate the ids they wrote; a long statement losing its tail is
             # the pre-existing cap, not a new failure.
+            #
+            # A follow-up's prior reply is a candidate source too (see `_identifier_text`),
+            # so it is shown for the same reason the attachments are.
+            prior = (
+                f"Our earlier reply in this thread:\n{email.prior_reply.body}"
+                if email.prior_reply is not None
+                else ""
+            )
             text = "\n".join(
                 p
                 for p in (
@@ -1089,6 +1104,7 @@ class PaymentBotPipeline:
                     email.body,
                     email.html_text,
                     email.thread_text,
+                    prior,
                     *(a.extracted_text for a in email.attachments if a.extracted_text),
                 )
                 if p
@@ -1114,6 +1130,12 @@ class PaymentBotPipeline:
         markers cannot be found reliably once tags are stripped, so reading it as "written"
         would let the colleague's figures back in through the other door. A reply written
         in a mail client always has a plain part; without one, ``body`` is the HTML's text.
+
+        So does the colleague's reply itself, whole — including the carrier's first message
+        quoted beneath it. A chase need not quote anything: live, a carrier wrote back to
+        Angelica's reply naming no load in subject or body, and the follow-up escalated as
+        "no valid 6/7-digit load id found" while the load sat in the reply we had already
+        fetched. Read as ``thread_text`` it can name the load and nothing more.
         """
 
         if email.prior_reply is None:
@@ -1131,7 +1153,9 @@ class PaymentBotPipeline:
             "subject": email.subject,
             "body": written,
             "thread_text": "\n".join(
-                p for p in (quoted, email.thread_text, email.html_text) if p
+                p
+                for p in (quoted, email.thread_text, email.html_text, email.prior_reply.body)
+                if p
             ),
             "html_text": "",
         }

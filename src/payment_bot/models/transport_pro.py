@@ -489,6 +489,21 @@ class AuthorizationContext(_TpModel):
     #: and the reply asked a factor to send a document sitting on the load. `pre_noa` is about
     #: whether the NOA is ON FILE; only this field answers that.
     noa_on_file: bool = False
+    #: Carriers whose every dispatch on this load was cancelled — dispatched, then taken off
+    #: it, so another carrier hauled it.
+    #:
+    #: They stay in :attr:`carrier_companies` on purpose (their question about the cancelled
+    #: leg is real), but they have no payable, and nothing about the carrier that DID haul it
+    #: is theirs to hear. Live on load 2523099: KRGA Transport's dispatch was cancelled on
+    #: 08/08, Circle Transportation delivered and was paid $1,682.20 — and KRGA's factor was
+    #: told that payment, as if it were KRGA's, and asked for an NOA on a load KRGA never ran.
+    canceled_carriers: tuple[str, ...] = ()
+
+    def has_payable(self, carrier: str) -> bool:
+        """True when ``carrier`` has a payable on this load (compared case-insensitively)."""
+
+        wanted = carrier.strip().casefold()
+        return any(c.strip().casefold() == wanted for c, _ in self.payable_parties)
 
     @property
     def carrier_label(self) -> str | None:

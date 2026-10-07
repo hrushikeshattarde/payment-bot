@@ -155,12 +155,23 @@ _KIND_LABELS = {
     FollowUpKind.UNKNOWN: "wrote something that could not be read automatically",
 }
 
+#: The reply to an email whose every load is one where nothing is owed to the sender's carrier
+#: (see ``NotPaidLoad``). Code-authored, never auto-sent, and never PAYMENT_STATUS_SKILL.id.
+_NOT_PAID_SKILL_ID = "not_paid"
+
+_NOT_PAID_BODY = """Thank you for reaching out.
+
+{facts}
+
+{signature}"""
+
 #: Deterministic drafts name no load ids in their body on purpose, so the gate's
 #: coverage check (every requested load addressed) must not be applied to them.
 _NO_COVERAGE_SKILL_IDS = (
     _BULK_PORTAL_SKILL_ID,
     _CARGOTEL_REFERRAL_SKILL_ID,
     _FOLLOWUP_HANDOFF_SKILL_ID,
+    _NOT_PAID_SKILL_ID,
 )
 
 #: Absolute cap on a derived iteration budget, however many loads an email names.
@@ -267,6 +278,33 @@ class PipelineResult:
     #: ``handoff`` (passed to the colleagues, who are copied), ``notice`` (no email, a card),
     #: or the plain outcome. Blank for first contact.
     follow_up_action: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class NotPaidLoad:
+    """A load the sender may be answered about only to say none of its money is theirs.
+
+    Every carrier they may hear about is on the load without a payable — almost always a
+    dispatch that was cancelled before another carrier hauled it. The one true answer is that,
+    and it is code-authored: written by the model from a lookup, it reported the other
+    carrier's payment as theirs (load 2523099, KRGA Transport, told Circle Transportation's
+    $1,682.20 direct deposit and asked for an NOA on a load KRGA never ran).
+    """
+
+    load_id: str
+    carriers: tuple[str, ...]
+    #: True when every one of :attr:`carriers` had its dispatch on this load cancelled.
+    cancelled: bool
+
+    @property
+    def sentence(self) -> str:
+        who = " and ".join(self.carriers)
+        if self.cancelled:
+            return (
+                f"Load {self.load_id}: the dispatch to {who} on this load was cancelled, so no "
+                f"payment is owed to {who} on it."
+            )
+        return f"Load {self.load_id}: there is no payment on record for {who} on this load."
 
 
 def _repeats(body: str, prior: str) -> bool:
@@ -438,6 +476,8 @@ class PaymentBotPipeline:
             correlation_id=correlation_id,
             settings=self._settings,
             today=self._today,
+            # Which carriers the email names — the pre-NOA authorization rule reads it.
+            email_text="\n".join(p for p in (email.subject, email.body, email.html_text) if p),
         )
 
         # 0. A follow-up to our own reply (Settings.followup_replies) ----------
@@ -705,19 +745,49 @@ class PaymentBotPipeline:
         # a phantom id that Transport Pro 400s on ate all 12 iterations retrying it and
         # produced no draft. The gate stays authoritative over what the draft actually
         # discloses; this is an efficiency measure, not a replacement.
-        unauthorized, authorized_loads, prenoa_loads, unresolved_loads, cancelled_loads = (
-            self._authorize_loads(email, load_ids, routes, ctx)
-        )
+        (
+            unauthorized,
+            authorized_loads,
+            prenoa_loads,
+            unresolved_loads,
+            cancelled_loads,
+            not_paid,
+        ) = self._authorize_loads(email, load_ids, routes, ctx)
         # POLICY: add the sender's domain for the factor already on the load, then retry once.
         # Off by default; see Settings.auto_add_factoring_domains for what this trades away and
         # the four cases it still refuses.
         if (
             not authorized_loads
+            and not not_paid
             and self._settings.auto_add_factoring_domains
             and self._auto_add_factoring_domains(email, tuple(load_ids), ctx, correlation_id)
         ):
-            unauthorized, authorized_loads, prenoa_loads, unresolved_loads, cancelled_loads = (
-                self._authorize_loads(email, load_ids, routes, ctx)
+            (
+                unauthorized,
+                authorized_loads,
+                prenoa_loads,
+                unresolved_loads,
+                cancelled_loads,
+                not_paid,
+            ) = self._authorize_loads(email, load_ids, routes, ctx)
+
+        if not authorized_loads and not_paid and not unauthorized and not cancelled_loads:
+            # Every load the sender asked about is one where nothing is owed to them. No
+            # lookup can add to that, so no agent runs: the reply is the code-authored facts.
+            _log.info(
+                "not_paid_loads_answered",
+                extra={
+                    "correlation_id": correlation_id,
+                    "loads": [n.load_id for n in not_paid],
+                },
+            )
+            return self._finalize(
+                email,
+                self._not_paid_draft(email, not_paid),
+                [n.load_id for n in not_paid],
+                correlation_id,
+                ctx,
+                _NOT_PAID_SKILL_ID,
             )
 
         if not authorized_loads:
@@ -757,6 +827,11 @@ class PaymentBotPipeline:
                     f"id(s) the sender never wrote, contributed by {source}: "
                     f"{', '.join(unwritten)}"
                 )
+            if not_paid:
+                parts.append(
+                    "no payment owed to the sender's carrier on: "
+                    + "; ".join(n.sentence for n in not_paid)
+                )
             reason = "; ".join(parts) or "no load could be authorized"
             # Assemble the roster packet BEFORE escalating, so the reviewer gets the evidence
             # in the same place as the refusal rather than having to go and find it. This
@@ -771,7 +846,7 @@ class PaymentBotPipeline:
                 tuple(load_ids),
                 correlation_id,
             )
-        if unauthorized or cancelled_loads:
+        if unauthorized or cancelled_loads or not_paid:
             # `cancelled_loads` belongs in this condition as much as `unauthorized` does.
             # When a cancelled load was the ONLY non-authorized one, `unauthorized` is empty,
             # and narrowing to `authorized_loads` was skipped — so the cancelled id stayed in
@@ -835,6 +910,7 @@ class PaymentBotPipeline:
             prenoa_loads,
             unresolved_loads,
             withheld_named,
+            not_paid_sentences=[n.sentence for n in not_paid],
         )
 
         # 3. Agent tool-use loop --------------------------------------------
@@ -902,7 +978,8 @@ class PaymentBotPipeline:
             ctx,
             skill.id,
             noa_request_expected=bool(prenoa_loads),
-            withheld_loads=tuple(withheld_named),
+            # Not-paid loads are checked like withheld ones: the reply must name each.
+            withheld_loads=tuple(withheld_named) + tuple(n.load_id for n in not_paid),
             candidate_load_ids=tuple(identifiers.load_ids),
             follow_up_note=follow_up_note,
         )
@@ -1058,6 +1135,7 @@ class PaymentBotPipeline:
         prenoa_loads: list[str],
         unlocated_loads: list[str],
         withheld_loads: list[str] | None = None,
+        not_paid_sentences: list[str] | None = None,
     ) -> tuple[Skill, str]:
         """Pick the skill + build its intake from the classified intent.
 
@@ -1134,6 +1212,7 @@ class PaymentBotPipeline:
                 documents_email=self._settings.documents_email,
                 unlocated_loads=unlocated_loads,
                 withheld_loads=withheld_loads,
+                not_paid_sentences=not_paid_sentences,
                 remit_confirmation_asked=remit_confirmation_asked,
                 rate_question=wants_rate,
                 stated_rates=identifiers.stated_rates,
@@ -1151,6 +1230,7 @@ class PaymentBotPipeline:
                 prenoa_loads=prenoa_loads,
                 unlocated_loads=unlocated_loads,
                 withheld_loads=withheld_loads,
+                not_paid_sentences=not_paid_sentences,
                 remit_confirmation_asked=remit_confirmation_asked,
             )
         return PAYMENT_STATUS_SKILL, build_payment_status_intake(
@@ -1162,6 +1242,7 @@ class PaymentBotPipeline:
             prenoa_loads=prenoa_loads,
             unlocated_loads=unlocated_loads,
             withheld_loads=withheld_loads,
+            not_paid_sentences=not_paid_sentences,
             remit_confirmation_asked=remit_confirmation_asked,
         )
 
@@ -1213,6 +1294,21 @@ class PaymentBotPipeline:
             citations=[],
             extra_cc=addresses,
         )
+
+    def _not_paid_draft(self, email: InboundEmail, not_paid: list[NotPaidLoad]) -> SubmitDraftOutput:
+        """The reply when every load asked about is one with nothing owed to the sender.
+
+        One fixed sentence per load — whose dispatch was cancelled, and that nothing is owed
+        to them on it — and nothing else: no amount, date or payee, and above all nothing
+        about the carrier that did haul it. ``load_ids`` is empty because no load's money is
+        disclosed; the sentences name the sender's own carrier, which they asked about.
+        """
+
+        body = _NOT_PAID_BODY.format(
+            facts="\n\n".join(n.sentence for n in not_paid),
+            signature=self._settings.reply_signature,
+        )
+        return SubmitDraftOutput(reply_body=body, to=email.from_email, load_ids=[], citations=[])
 
     # -- follow-ups (Settings.followup_replies) --------------------------------
     def _read_follow_up(self, email: InboundEmail, correlation_id: str) -> FollowUpRead:
@@ -1624,10 +1720,15 @@ class PaymentBotPipeline:
         load_ids: list[str],
         routes: dict[str, System],
         ctx: ToolContext,
-    ) -> tuple[list[tuple[str, str]], list[str], list[str], list[str], list[str]]:
+    ) -> tuple[
+        list[tuple[str, str]], list[str], list[str], list[str], list[str], list[NotPaidLoad]
+    ]:
         """Run the authorization pre-check over every load.
 
-        Returns ``(unauthorized, authorized, prenoa, unresolved, cancelled)``. ``cancelled``
+        Returns ``(unauthorized, authorized, prenoa, unresolved, cancelled, not_paid)``.
+        ``not_paid`` is a load the sender may be answered about, but only about carriers with
+        no payable on it — see :class:`NotPaidLoad`; it is never handed to the agent.
+        ``cancelled``
         is a load Transport Pro no longer holds a payable record for; it is neither allowed
         nor denied, because the authorization context comes from the payload that is gone.
         ``unresolved`` is kept
@@ -1646,6 +1747,7 @@ class PaymentBotPipeline:
         prenoa_loads: list[str] = []
         unresolved_loads: list[str] = []
         cancelled_loads: list[str] = []
+        not_paid: list[NotPaidLoad] = []
         for load_id in load_ids:
             auth_out = self._registry.dispatch(
                 "check_authorization",
@@ -1674,6 +1776,21 @@ class PaymentBotPipeline:
                 detail = f" ({auth.reason})" if auth.reason else ""
                 unauthorized.append((load_id, f"{auth.decision.value}{detail}"))
                 continue
+            if auth.matched_carriers and set(auth.unpaid_carriers) >= set(auth.matched_carriers):
+                # Every carrier this sender may hear about has NO payable here, so every
+                # amount, date and payee on the load belongs to someone else. Looked up, the
+                # load could only be answered with that someone else's money — live on 2523099,
+                # KRGA's factor was told Circle Transportation's $1,682.20. So it is not looked
+                # up: the reply states the one true thing, and the agent never sees the load.
+                ctx.disclosable_carriers[load_id] = auth.matched_carriers
+                not_paid.append(
+                    NotPaidLoad(
+                        load_id=load_id,
+                        carriers=auth.unpaid_carriers,
+                        cancelled=set(auth.cancelled_carriers) >= set(auth.unpaid_carriers),
+                    )
+                )
+                continue
             authorized_loads.append(load_id)
             if auth.pre_noa:
                 prenoa_loads.append(load_id)
@@ -1689,7 +1806,14 @@ class PaymentBotPipeline:
             else:
                 # A second pass after the roster widened must not inherit a stale narrowing.
                 ctx.disclosable_carriers.pop(load_id, None)
-        return unauthorized, authorized_loads, prenoa_loads, unresolved_loads, cancelled_loads
+        return (
+            unauthorized,
+            authorized_loads,
+            prenoa_loads,
+            unresolved_loads,
+            cancelled_loads,
+            not_paid,
+        )
 
     def _auto_add_factoring_domains(
         self,

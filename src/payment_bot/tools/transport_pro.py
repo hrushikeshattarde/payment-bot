@@ -143,11 +143,20 @@ class TpGetLoadSummary(Tool):
                 for p in payables
                 if p.carrier_company and p.carrier_company.strip().casefold() in in_scope
             ]
-            # Never narrow to nothing. A scope that matches no payable means the sender was
-            # authorized by something other than a payable — a dispatch contact on a leg that
-            # never settled — and withholding the whole load would answer their question with
-            # silence. Fall back to the load as a whole rather than to an empty summary.
-            payables = scoped or payables
+            # A scope that matches no payable means the sender's carrier has no money on this
+            # load — every payable here belongs to another carrier. This used to fall back to
+            # the whole load "rather than answer with silence", and that is a disclosure: live
+            # on 2523099, KRGA's dispatch was cancelled and KRGA's factor was told Circle
+            # Transportation's $1,682.20. The pipeline now answers such a load itself (that
+            # nothing is owed to them on it) and never hands it to the agent; this refusal is
+            # the backstop if the agent looks it up anyway.
+            if not scoped:
+                raise ToolError(
+                    f"load {load_id} has no payment record for "
+                    f"{', '.join(sorted(in_scope))} — every payable on it belongs to another "
+                    "carrier, which this sender may not be told about"
+                )
+            payables = scoped
 
         primary = payables[0]
         carriers: list[CarrierPayable] = []
@@ -313,9 +322,10 @@ class TpGetSettlementEntries(Tool):
                 for e in entries
                 if e.paid_carrier and e.paid_carrier.strip().casefold() in in_scope
             ]
-            # Same fallback as the summary, and for the same reason: a scope that matches no
-            # row must not turn "here is your settlement" into "there is none".
-            entries = scoped or entries
+            # No fallback to the whole load: a scope matching no row means none of this load's
+            # settlements are this sender's, and "there is none for you" is the true answer.
+            # Falling back reported another carrier's payment instead (load 2523099).
+            entries = scoped
 
         for entry in entries:
             ctx.ledger.record_amount(entry.amount, self.name, load_id=params.load_id)
@@ -567,8 +577,18 @@ class TpGetNoaFactoring(Tool):
         ]
         company: str | None = noa.factoring_company_on_file
         details: str | None = noa.details
-        # `by_carrier` is empty for a fixture that predates it, and a scope may name a carrier
-        # with no payable — those keep the client's own summary rather than falling silent.
+        if in_scope and noa.by_carrier and not scoped:
+            # The scoped carrier has no payable, so no remit-to on this load is theirs — the
+            # summary above would be another carrier's factor (see tp_get_load_summary).
+            return TpNoaFactoringOutput(
+                noa_on_file=False,
+                factoring_company_on_file=None,
+                details=(
+                    f"no payable on this load for {', '.join(sorted(in_scope))}, so nothing "
+                    "here is remitted for them"
+                ),
+            )
+        # `by_carrier` is empty for a fixture that predates it.
         if noa.by_carrier and scoped:
             factors = list(dict.fromkeys(f for _, f in scoped if f))
             company = "; ".join(factors) if factors else None

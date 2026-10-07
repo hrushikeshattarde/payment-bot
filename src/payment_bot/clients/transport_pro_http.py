@@ -558,6 +558,9 @@ class TransportProHttpClient:
 
         emails: list[str] = []
         contacts: list[tuple[str, str]] = []
+        # Per carrier, whether every one of its dispatch rows is cancelled. A carrier
+        # re-dispatched after its own cancellation has a live row and is not "cancelled".
+        cancelled_only: dict[str, tuple[str, bool]] = {}
         for row in self._dispatch_rows(load_id):
             assigned = row.get("assignedTo") or {}
             if not isinstance(assigned, dict):
@@ -570,6 +573,10 @@ class TransportProHttpClient:
                 dispatched_to = _text(carrier.get("companyName"))
                 if dispatched_to:
                     carriers.append(dispatched_to)
+                    is_cancelled = "cancel" in (_text(row.get("status")) or "").casefold()
+                    key = dispatched_to.casefold()
+                    prior = cancelled_only.get(key, (dispatched_to, True))
+                    cancelled_only[key] = (prior[0], prior[1] and is_cancelled)
             for source in sources:
                 found = _emails_from(source)
                 emails.extend(found)
@@ -603,6 +610,7 @@ class TransportProHttpClient:
             # matches only by company-domain, and FACTORING is gated by policy anyway.
             factoring_emails=(),
             noa_on_file=noa_on_file,
+            canceled_carriers=tuple(name for name, only in cancelled_only.values() if only),
         )
 
     # -- internals -----------------------------------------------------------

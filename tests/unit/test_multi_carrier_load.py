@@ -28,6 +28,7 @@ from tests.transport_pro_payloads import multi_carrier_transport, relay_transpor
 
 from payment_bot.clients.transport_pro_http import TransportProHttpClient
 from payment_bot.config import Settings
+from payment_bot.errors import ToolError
 from payment_bot.grounding import GroundingLedger
 from payment_bot.models import AuthDecision, System, split_care_of
 from payment_bot.tools.base import ToolContext
@@ -306,17 +307,17 @@ def test_an_unscoped_settlement_read_names_each_payee() -> None:
 
 
 @pytest.mark.unit
-def test_a_scope_naming_a_carrier_with_no_payable_does_not_blank_the_load() -> None:
+def test_a_scope_naming_a_carrier_with_no_payable_shows_no_other_carriers_money() -> None:
     """Victory Transit's leg was canceled, so it has no payable to narrow to.
 
-    Narrowing to nothing would answer a real question with an empty summary, which reads as
-    "this load has no payments" — worse than the over-broad answer it was avoiding.
+    This used to fall back to all three payables, on the reasoning that an empty summary
+    reads as "this load has no payments". The over-broad answer was the worse one: live on
+    2523099, KRGA's dispatch was cancelled and KRGA's factor was told Circle Transportation's
+    $1,682.20. The pipeline now answers such a load itself; the tool refuses as a backstop.
     """
 
-    out = _summary(_ctx({LOAD: ("Victory Transit Inc",)}))
-
-    assert out.multiple_carriers is True
-    assert len(out.carriers) == 3
+    with pytest.raises(ToolError, match="no payment record for victory transit inc"):
+        _summary(_ctx({LOAD: ("Victory Transit Inc",)}))
 
 
 @pytest.mark.unit

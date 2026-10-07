@@ -23,6 +23,7 @@ from payment_bot.errors import LoadCancelledError, ToolError
 from payment_bot.logging import get_logger
 from payment_bot.models import (
     AuthDecision,
+    AuthorizationContext,
     InboundEmail,
     Intent,
     SensitiveAction,
@@ -874,6 +875,61 @@ def _roster_entry_for_sender(sender_email: str, ctx: ToolContext) -> str | None:
     return None
 
 
+def _own_tokens(settings: Settings) -> set[str]:
+    """Distinctive tokens of our own name, which never identify a carrier in an email.
+
+    Every email to this inbox says "Circle" somewhere — our signature quoted back, our name in
+    the subject — so a carrier named "Circle Transportation Inc" must not count as named by it.
+    Derived from the reply signature and the mailbox domain, not hard-coded.
+    """
+
+    domain = settings.mailbox.rsplit("@", 1)[-1].split(".")[0]
+    return company_tokens(settings.reply_signature) | company_tokens(domain)
+
+
+def _carriers_named_in(carriers: tuple[str, ...], ctx: ToolContext) -> tuple[str, ...]:
+    """The carriers on a load that the sender's email names, in the load's order.
+
+    A load with one carrier needs no naming: there is no other leg to confuse it with, and
+    asking every factor to spell out its client would escalate the common case for nothing.
+    With several, a carrier counts as named when a distinctive word of its name appears in
+    the email as a whole word — "KRGA" for "KRGA TRANSPORT INC" — never one of our own words.
+    """
+
+    if len(carriers) <= 1:
+        return carriers
+    text = ctx.email_text.lower()
+    if not text:
+        return ()
+    own = _own_tokens(ctx.settings)
+    named = []
+    for carrier in carriers:
+        tokens = company_tokens(carrier) - own
+        if tokens and any(re.search(rf"\b{re.escape(tok)}\b", text) for tok in tokens):
+            named.append(carrier)
+    return tuple(named)
+
+
+def _with_payables(
+    out: CheckAuthorizationOutput, auth: AuthorizationContext
+) -> CheckAuthorizationOutput:
+    """Mark which of the matched carriers have no payable — see
+    :attr:`CheckAuthorizationOutput.unpaid_carriers`. Changes nothing else."""
+
+    if not out.authorized or not out.matched_carriers:
+        return out
+    unpaid = tuple(c for c in out.matched_carriers if not auth.has_payable(c))
+    if not unpaid:
+        return out
+    cancelled = {c.strip().casefold() for c in auth.canceled_carriers}
+    return out.model_copy(
+        update={
+            "unpaid_carriers": unpaid,
+            "cancelled_carriers": tuple(c for c in unpaid if c.strip().casefold() in cancelled),
+        }
+    )
+
+
 #: Legal-entity suffixes, dropped when building an acronym. Only these — an industry word
 #: like "group" or "capital" IS part of how a company abbreviates itself ("American Factoring
 #: Group" is AFG, not AF), which is why this cannot reuse ``_STOPWORDS``.
@@ -1707,6 +1763,15 @@ class CheckAuthorizationOutput(BaseModel):
     #: The pipeline turns this into ``ToolContext.disclosable_carriers``, which is what
     #: actually filters the tools.
     matched_carriers: tuple[str, ...] = ()
+    #: The matched carriers with NO payable on this load, i.e. nothing was or will be paid to
+    #: them on it. When this covers every matched carrier, the sender may be told that and
+    #: nothing else — there is no money of theirs on the load, and every amount on it belongs
+    #: to some other carrier. The pipeline answers such a load without looking it up.
+    unpaid_carriers: tuple[str, ...] = ()
+    #: Of :attr:`unpaid_carriers`, those whose dispatch on this load was cancelled — the
+    #: usual reason a carrier is on a load and not paid on it (load 2523099: KRGA cancelled,
+    #: Circle Transportation hauled and was paid).
+    cancelled_carriers: tuple[str, ...] = ()
     reason: str
 
 
@@ -1740,6 +1805,13 @@ class CheckAuthorization(Tool):
                 authorized=False,
                 reason=str(exc),
             )
+        return _with_payables(self._decide_transport_pro(params, ctx, auth), auth)
+
+    def _decide_transport_pro(
+        self, params: CheckAuthorizationInput, ctx: ToolContext, auth: AuthorizationContext
+    ) -> CheckAuthorizationOutput:
+        """Every Transport Pro branch. ``run`` adds what the match is owed afterwards."""
+
         sender = params.sender_email.strip().lower()
         domain = sender.split("@")[-1].replace(".", "")
 
@@ -1835,6 +1907,28 @@ class CheckAuthorization(Tool):
             # No free-mail guard here: _roster_entry_matches applies it per entry, so a
             # free-mail ADDRESS entry works and a bare free-mail domain still cannot.
             roster_name = _roster_entry_for_sender(sender, ctx)
+            # Which of this load's carriers the factor is asking about. Nothing on the load
+            # ties a pre-NOA factor to a carrier — that is what "no factor on file" means — so
+            # only the email can, and a factor names its client. Left unnarrowed this branch
+            # answered about EVERY carrier: live on 2523099, Engaged Financial asked about KRGA
+            # Transport, whose dispatch was cancelled, and was told Circle Transportation's
+            # $1,682.20 payment. Naming no carrier on the load is not answerable at all.
+            on_load_named = _carriers_named_in(auth.carrier_companies, ctx)
+            if roster_name is not None and not on_load_named:
+                return CheckAuthorizationOutput(
+                    decision=AuthDecision.DENY,
+                    authorized=False,
+                    matched_party=roster_name,
+                    reason=(
+                        "roster-verified factoring company, but no factor is on file for this "
+                        "load and the email names none of its carriers "
+                        f"({'; '.join(auth.carrier_companies) or 'none on file'}) — cannot "
+                        "tell whose leg it is asking about"
+                    ),
+                )
+            # Only a carrier with a payable can have an NOA worth requesting: asking a factor
+            # to send paperwork for a load its client never ran is how 2523099 went wrong.
+            payee_named = any(auth.has_payable(c) for c in on_load_named)
             if roster_name is not None:
                 # AUTHORIZATION is unchanged by whether the NOA is indexed — a roster-verified
                 # factor asking about a load with no factor of record is the same sender either
@@ -1851,6 +1945,7 @@ class CheckAuthorization(Tool):
                         authorized=ctx.settings.allow_factoring,
                         pre_noa=False,
                         matched_party=roster_name,
+                        matched_carriers=on_load_named,
                         reason=(
                             "roster-verified factoring company; no factor NAME on file for "
                             "this load, but its NOA is already indexed — answer the question "
@@ -1860,11 +1955,15 @@ class CheckAuthorization(Tool):
                 return CheckAuthorizationOutput(
                     decision=AuthDecision.FACTORING,
                     authorized=ctx.settings.allow_factoring,
-                    pre_noa=True,
+                    pre_noa=payee_named,
                     matched_party=roster_name,
+                    matched_carriers=on_load_named,
                     reason=(
                         "roster-verified factoring company; no factor on file for this "
                         "load — the reply should request the NOA and billing paperwork"
+                        if payee_named
+                        else "roster-verified factoring company asking about a carrier with "
+                        "no payable on this load — do NOT request an NOA"
                     ),
                 )
 

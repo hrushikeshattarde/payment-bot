@@ -506,6 +506,7 @@ def build_cargotel_payment_status_intake(
     documents_email: str = "freightpay@circledelivers.com",
     unlocated_loads: list[str] | None = None,
     withheld_loads: list[str] | None = None,
+    not_paid_sentences: list[str] | None = None,
     remit_confirmation_asked: bool = False,
     rate_question: bool = False,
     stated_rates: list[StatedRate] | None = None,
@@ -541,6 +542,7 @@ def build_cargotel_payment_status_intake(
             *_cargotel_rate_lines(rate_question, stated_rates),
             *_unlocated_line(unlocated_loads),
             *_withheld_line(withheld_loads),
+            *_not_paid_line(not_paid_sentences),
             *_remit_confirmation_line(remit_confirmation_asked),
             "",
             "Run the cargotel_payment_status procedure for the load id(s) above and submit a "
@@ -691,6 +693,26 @@ def _remit_confirmation_line(asked: bool) -> list[str]:
     ]
 
 
+def _not_paid_line(sentences: list[str] | None) -> list[str]:
+    """Loads the sender asked about where nothing is owed to their carrier.
+
+    The pipeline has already established the whole answer — every carrier this sender may
+    hear about is on the load without a payable, almost always because its dispatch was
+    cancelled — and kept the load from the agent's list. Looked up, it could only have been
+    answered with another carrier's money: live on 2523099, KRGA's factor was told Circle
+    Transportation's $1,682.20 and asked for an NOA on a load KRGA never ran.
+    """
+
+    if not sentences:
+        return []
+    return [
+        "- These loads are already answered. Put each sentence below in the reply word for "
+        "word, and say nothing else about these loads: do not look them up, and never "
+        "mention any other carrier, amount, date, payment or paperwork on them.",
+        *(f"  {sentence}" for sentence in sentences),
+    ]
+
+
 def _withheld_line(withheld_loads: list[str] | None) -> list[str]:
     """Name the loads this reply does not cover, when the sender named them first.
 
@@ -726,6 +748,7 @@ def build_payment_status_intake(
     prenoa_loads: list[str] | None = None,
     unlocated_loads: list[str] | None = None,
     withheld_loads: list[str] | None = None,
+    not_paid_sentences: list[str] | None = None,
     remit_confirmation_asked: bool = False,
 ) -> str:
     """Compose the first user turn: the email plus the deterministic intake results."""
@@ -746,6 +769,7 @@ def build_payment_status_intake(
             f"- Missing paperwork should be emailed to: {documents_email}",
             *_unlocated_line(unlocated_loads),
             *_withheld_line(withheld_loads),
+            *_not_paid_line(not_paid_sentences),
             *_remit_confirmation_line(remit_confirmation_asked),
             *(
                 [
@@ -773,6 +797,7 @@ def build_rate_verification_intake(
     prenoa_loads: list[str] | None = None,
     unlocated_loads: list[str] | None = None,
     withheld_loads: list[str] | None = None,
+    not_paid_sentences: list[str] | None = None,
     remit_confirmation_asked: bool = False,
 ) -> str:
     """Compose the first user turn for rate verification, including the stated amount(s)."""
@@ -802,6 +827,7 @@ def build_rate_verification_intake(
             f"- Missing paperwork should be emailed to: {documents_email}",
             *_unlocated_line(unlocated_loads),
             *_withheld_line(withheld_loads),
+            *_not_paid_line(not_paid_sentences),
             *_remit_confirmation_line(remit_confirmation_asked),
             *(
                 [

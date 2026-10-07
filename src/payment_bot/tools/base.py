@@ -74,6 +74,12 @@ class ToolContext:
     #: model produces one from somewhere. A rule the gate can enforce beats a rule the prompt
     #: can only ask for.
     disclosable_carriers: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: What the sender wrote — subject, body and HTML text — for the one authorization rule
+    #: that must know which carrier an email is ABOUT: a roster factor asking about a load
+    #: with no factor on file (pre-NOA) is answered only about the carriers it names. Set
+    #: by the pipeline once per email, so the pipeline's, the agent's and the gate's
+    #: ``check_authorization`` calls all decide from the same text.
+    email_text: str = ""
 
     def carriers_in_scope(self, load_id: str) -> tuple[str, ...]:
         """The carrier names this run may read on ``load_id``; empty means no restriction."""
